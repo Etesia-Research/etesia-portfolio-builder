@@ -1,0 +1,3 @@
+# Supply-chain guard: do not install any package version published less than
+# this many minutes ago (1440 = 1 day). See https://pnpm.io/settings
+minimumReleaseAge: 1440
