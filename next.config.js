@@ -1,6 +1,6 @@
 /** @type {import('next').NextConfig} */
 // Browser-side fallback so @stellar/stellar-sdk (which references Node core
-// modules) bundles cleanly on the client. Reused from a prior Stellar app.
+// modules) bundles cleanly on the client.
 const nextConfig = {
   webpack: (config, { isServer }) => {
     if (!isServer) {

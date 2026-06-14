@@ -2,8 +2,7 @@ import { produce } from "immer";
 import { create } from "zustand";
 
 // Wallet connection state, kept in sync with the Stellar Wallets Kit.
-// Pattern reused from a prior Stellar app's wallet store,
-// extended with the connecting wallet's display kind + connect status/error.
+// Includes the wallet display kind, connection status, and errors.
 export interface StellarWalletState {
   address: string | null;
   connected: boolean;

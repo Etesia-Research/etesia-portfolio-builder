@@ -6,7 +6,6 @@ import "./styles.css";
 export const metadata: Metadata = {
   title: "Etesia Research — Stellar Portfolio Builder",
   description: "Risk-parity allocation across a Stellar asset universe.",
-  // Same favicon set + wiring as etesiaLanding (public/favicon* copied from it).
   icons: {
     icon: [
       { url: "/favicon.ico", sizes: "any" },

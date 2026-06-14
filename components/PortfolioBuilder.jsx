@@ -710,9 +710,6 @@ export default function PortfolioBuilder() {
 
   return (
     <div id="root">
-      {/* Beta pill — same intent as the landing's "Platform Beta Testing Notice",
-          restyled to the atelier/newspaper language (mono, rule border). Opens
-          the beta-notice modal below. */}
       <div style={{ display: 'flex', justifyContent: 'center', margin: '2px 0 16px' }}>
         <button className="mono" onClick={() => setShowBetaNotice(true)}
           style={{ display: 'inline-flex', alignItems: 'center', gap: 8, border: '1px solid var(--rule)', borderRadius: 999, padding: '5px 16px', font: 'inherit', fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, letterSpacing: '0.18em', textTransform: 'uppercase', color: 'var(--ink-2)', background: 'var(--paper-2)', cursor: 'pointer' }}>
