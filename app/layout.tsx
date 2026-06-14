@@ -6,6 +6,15 @@ import "./styles.css";
 export const metadata: Metadata = {
   title: "Etesia Research — Stellar Portfolio Builder",
   description: "Risk-parity allocation across a Stellar asset universe.",
+  // Same favicon set + wiring as etesiaLanding (public/favicon* copied from it).
+  icons: {
+    icon: [
+      { url: "/favicon.ico", sizes: "any" },
+      { url: "/favicon-16.png", type: "image/png", sizes: "16x16" },
+      { url: "/favicon-32.png", type: "image/png", sizes: "32x32" },
+    ],
+    apple: "/apple-icon.png",
+  },
 };
 
 export default function RootLayout({
