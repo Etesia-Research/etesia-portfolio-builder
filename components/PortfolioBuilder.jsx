@@ -9,7 +9,9 @@
 //
 // Risk-model inputs (vol, sharpe, corr) are STATIC research inputs and the
 // risk-parity solver below is byte-for-byte identical to the original. Live
-// wiring (Steps 3-5) overwrites price/holding and the wallet/balance/ledger.
+// wiring: wallet (Step 3), Horizon balances (Step 4), Soroswap prices (Step 5).
+// The `holding` field in coin-data.json is the bundle's sample data and is no
+// longer read — holdings come from useBalanceStore (real Horizon balances).
 
 import { useState, useMemo, useEffect } from "react";
 import COINS from "@/data/coin-data.json";
@@ -18,6 +20,8 @@ import useStellarWalletStore from "@/stores/useStellarWalletStore";
 import { initWalletKit, connectWallet, disconnectWallet } from "@/components/stellar/walletKit";
 import usePriceStore from "@/stores/usePriceStore";
 import { fetchLivePrices } from "@/lib/prices";
+import useBalanceStore from "@/stores/useBalanceStore";
+import { fetchHoldings } from "@/lib/balances";
 
 const COIN_BY_TK = Object.fromEntries(COINS.map(c => [c.tk, c]));
 
@@ -310,10 +314,15 @@ function Sidecar({ basket, removeFromBasket }) {
 
 function FundingPanel({ wallet, basket, selectedHolding, setSelectedHolding, amount, setAmount, onBuild }) {
   const bySymbol = usePriceStore(s => s.bySymbol);
-  const holdings = useMemo(() => COINS.filter(c => c.holding > 0), []);
+  // Real onchain holdings (Horizon) — never the static sample data.
+  const balByTk = useBalanceStore(s => s.byTk);
+  const balLoaded = useBalanceStore(s => s.lastUpdated) != null;
+  const balError = useBalanceStore(s => s.error);
+  const holdingOf = (tk) => balByTk[tk] ?? 0;
+  const holdings = useMemo(() => COINS.filter(c => holdingOf(c.tk) > 0), [balByTk]);
   const selCoin = selectedHolding ? COIN_BY_TK[selectedHolding] : null;
   const usdAmount = selCoin ? (parseFloat(amount || 0) * priceOf(bySymbol, selCoin.tk)) : 0;
-  const maxHolding = selCoin ? selCoin.holding : 0;
+  const maxHolding = selCoin ? holdingOf(selCoin.tk) : 0;
   const overMax = selCoin && parseFloat(amount || 0) > maxHolding;
   const canBuild = selCoin && parseFloat(amount || 0) > 0 && !overMax && basket.length >= 2;
 
@@ -323,12 +332,15 @@ function FundingPanel({ wallet, basket, selectedHolding, setSelectedHolding, amo
         <h5>① Capital source — choose a holding to liquidate</h5>
         <div className="holding-list">
           {holdings.length === 0 && (
-            <div style={{ padding: 20, fontFamily: "'Instrument Serif', serif", fontStyle: 'italic', color: 'var(--ink-2)' }}>
-              No qualifying balances detected in this wallet.
+            <div style={{ padding: 20, fontFamily: "'Instrument Serif', serif", fontStyle: 'italic', color: balError ? 'var(--bad)' : 'var(--ink-2)' }}>
+              {balError ? `Could not read balances from Horizon (${balError}).`
+                : balLoaded ? 'No qualifying balances detected in this wallet.'
+                : 'Reading balances from Horizon…'}
             </div>
           )}
           {holdings.map(h => {
             const isSel = selectedHolding === h.tk;
+            const held = holdingOf(h.tk);
             return (
               <div key={h.tk} className={`holding-row ${isSel ? 'selected' : ''}`} onClick={() => setSelectedHolding(h.tk)}>
                 <div className="gl" style={{ background: h.color }}>{h.glyph}</div>
@@ -336,8 +348,8 @@ function FundingPanel({ wallet, basket, selectedHolding, setSelectedHolding, amo
                   <div className="tk">{h.tk}</div>
                   <div className="sub">{h.name}</div>
                 </div>
-                <div className="amt">{h.holding.toLocaleString(undefined, {maximumFractionDigits: 4})}</div>
-                <div className="usd">{fmtUsd(h.holding * priceOf(bySymbol, h.tk))}</div>
+                <div className="amt">{held.toLocaleString(undefined, {maximumFractionDigits: 4})}</div>
+                <div className="usd">{fmtUsd(held * priceOf(bySymbol, h.tk))}</div>
               </div>
             );
           })}
@@ -362,7 +374,7 @@ function FundingPanel({ wallet, basket, selectedHolding, setSelectedHolding, amo
             <div className="quick-amounts">
               {[0.25, 0.5, 0.75, 1.0].map(f => (
                 <button key={f} className="qa" disabled={!selCoin}
-                  onClick={() => selCoin && setAmount((selCoin.holding * f).toFixed(priceOf(bySymbol, selCoin.tk) > 100 ? 4 : 2))}>
+                  onClick={() => selCoin && setAmount((maxHolding * f).toFixed(priceOf(bySymbol, selCoin.tk) > 100 ? 4 : 2))}>
                   {f === 1.0 ? 'MAX' : `${f*100}%`}
                 </button>
               ))}
@@ -570,6 +582,7 @@ export default function PortfolioBuilder() {
   const connecting = useStellarWalletStore(s => s.connecting);
   const connectError = useStellarWalletStore(s => s.error);
   const setPrices = usePriceStore(s => s.set);
+  const setBalances = useBalanceStore(s => s.set);
 
   // Initialise the kit once on mount (browser-only; imports are dynamic).
   useEffect(() => { initWalletKit(); }, []);
@@ -602,10 +615,45 @@ export default function PortfolioBuilder() {
     return () => { cancelled = true; clearInterval(id); };
   }, [setPrices]);
 
-  // Masthead wallet view. balance (Σ holding × live price) is wired in Step 4;
-  // until then show "—" rather than a fabricated number.
+  // Live balances (Step 4): poll Horizon for the connected account every 30s,
+  // with cleanup; cleared on disconnect/account switch. Real onchain holdings —
+  // never the sample data shipped with the research bundle.
+  useEffect(() => {
+    if (!address) {
+      setBalances(s => { s.byTk = {}; s.loading = false; s.error = null; s.lastUpdated = null; });
+      return;
+    }
+    let cancelled = false;
+    const load = async () => {
+      setBalances(s => { s.loading = true; });
+      try {
+        const byTk = await fetchHoldings(address);
+        if (cancelled) return;
+        setBalances(s => {
+          s.byTk = byTk; s.loading = false; s.error = null; s.lastUpdated = Date.now();
+        });
+      } catch (e) {
+        if (cancelled) return;
+        setBalances(s => { s.loading = false; s.error = String((e && e.message) || e); });
+      }
+    };
+    load();
+    const id = setInterval(load, 30000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [address, setBalances]);
+
+  // Masthead wallet view (Step 4): balance = Σ real holding × price (live
+  // Soroswap price where reliable, else static research price). "—" until the
+  // first Horizon read lands — never a fabricated number.
+  const balByTk = useBalanceStore(s => s.byTk);
+  const balLoaded = useBalanceStore(s => s.lastUpdated) != null;
+  const bySymbol = usePriceStore(s => s.bySymbol);
+  const balanceUsd = useMemo(() => {
+    if (!balLoaded) return null;
+    return COINS.reduce((sum, c) => sum + (balByTk[c.tk] ?? 0) * priceOf(bySymbol, c.tk), 0);
+  }, [balLoaded, balByTk, bySymbol]);
   const wallet = connected && address
-    ? { kind: walletKind || 'Wallet', addr: truncateAddr(address), balance: null }
+    ? { kind: walletKind || 'Wallet', addr: truncateAddr(address), balance: balanceUsd }
     : null;
 
   const maxMcap = useMemo(() => Math.max(...COINS.map(c => c.mcap)), []);
@@ -753,7 +801,7 @@ export default function PortfolioBuilder() {
 
       <footer style={{ marginTop: 64, borderTop: '4px double var(--rule)', paddingTop: 18, display: 'flex', justifyContent: 'space-between', fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, color: 'var(--ink-3)', letterSpacing: '0.12em' }}>
         <span>ETESIA RESEARCH</span>
-        <span>Wallet connect + Soroswap prices are live (some assets fall back to static; marked per-asset) · balances are sample data (live feed pending) · vol/σ/ρ are static research inputs · execution is a simulated preview · not advice.</span>
+        <span>Wallet connect, Horizon balances + Soroswap prices are live (some prices fall back to static; marked per-asset) · vol/σ/ρ are static research inputs · execution is a simulated preview · not advice.</span>
         <span>portfolio.etesiar.com</span>
       </footer>
     </div>
