@@ -574,6 +574,7 @@ export default function PortfolioBuilder() {
   const [amount, setAmount] = useState('');
   const [phase, setPhase] = useState('connect'); // connect | select | allocated | executing | done
   const [weights, setWeights] = useState([]);
+  const [showBetaNotice, setShowBetaNotice] = useState(false);
 
   // ---- Live wallet (Step 3) — Stellar Wallets Kit via zustand store ----
   const address = useStellarWalletStore(s => s.address);
@@ -709,6 +710,44 @@ export default function PortfolioBuilder() {
 
   return (
     <div id="root">
+      {/* Beta pill — same intent as the landing's "Platform Beta Testing Notice",
+          restyled to the atelier/newspaper language (mono, rule border). Opens
+          the beta-notice modal below. */}
+      <div style={{ display: 'flex', justifyContent: 'center', margin: '2px 0 16px' }}>
+        <button className="mono" onClick={() => setShowBetaNotice(true)}
+          style={{ display: 'inline-flex', alignItems: 'center', gap: 8, border: '1px solid var(--rule)', borderRadius: 999, padding: '5px 16px', font: 'inherit', fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, letterSpacing: '0.18em', textTransform: 'uppercase', color: 'var(--ink-2)', background: 'var(--paper-2)', cursor: 'pointer' }}>
+          <span style={{ fontSize: 11 }}>✦</span> Platform Beta Testing Notice
+        </button>
+      </div>
+
+      {showBetaNotice && (
+        <div className="exec-overlay" onClick={() => setShowBetaNotice(false)}>
+          <div className="exec-card fade-in" onClick={e => e.stopPropagation()}>
+            <div className="mono uc" style={{ fontSize: 11, color: 'var(--ink-2)', letterSpacing: '0.2em' }}>
+              Platform Beta — Testing Notice
+            </div>
+            <h3>This app is in <em>beta</em>.</h3>
+            <div className="sub">
+              Etesia Portfolio Atelier is in a beta testing phase, provided "as is" and "as
+              available" — it may contain bugs, and figures should not be relied upon for
+              financial decisions. Know what is real and what is not:
+            </div>
+            <div className="mono" style={{ fontSize: 12, lineHeight: 2, margin: '16px 0', borderTop: '1px solid var(--rule)', borderBottom: '1px solid var(--rule)', padding: '12px 0' }}>
+              <div><span style={{ color: 'var(--good)' }}>● live</span> — wallet connection, account balances (Horizon, Stellar mainnet) and spot prices (Soroswap, where marked "live").</div>
+              <div><span style={{ color: 'var(--ink-3)' }}>● static</span> — volatility, Sharpe and correlations are fixed research inputs, not market feeds.</div>
+              <div><span style={{ color: 'var(--warn)' }}>● simulated</span> — trade execution is a dry-run preview. No transaction is signed or broadcast; funds never move.</div>
+            </div>
+            <div className="sub">
+              Your keys stay in your wallet — this app never asks you to sign anything during
+              beta. Nothing here is investment advice; use at your own risk.
+            </div>
+            <div className="exec-close">
+              <div className="receipt">beta — as is · no warranty · not advice</div>
+              <button className="btn" onClick={() => setShowBetaNotice(false)}>I understand →</button>
+            </div>
+          </div>
+        </div>
+      )}
       <Masthead wallet={wallet} onDisconnect={onDisconnect} />
       {wallet && <Ticker />}
 
