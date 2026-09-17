@@ -23,6 +23,7 @@ import { fetchLivePrices } from "@/lib/prices";
 import useBalanceStore from "@/stores/useBalanceStore";
 import { fetchHoldings } from "@/lib/balances";
 
+const EMPTY_HOLDINGS = {};
 const COIN_BY_TK = Object.fromEntries(COINS.map(c => [c.tk, c]));
 
 // Existing truncation style, e.g. GA7Q…3K2M (4 + … + 4).
@@ -133,7 +134,7 @@ function Masthead({ wallet, onDisconnect }) {
           <>
             <div className="vol">CONNECTED — {wallet.kind}</div>
             <div style={{ marginTop: 4 }}>{wallet.addr}</div>
-            <div style={{ marginTop: 4 }}>balance: {wallet.balance != null ? fmtUsd(wallet.balance, 2) : '—'} <span style={{ color: 'var(--good)' }}>●</span></div>
+            <div style={{ marginTop: 4 }}>balance: {wallet.balance != null ? fmtUsd(wallet.balance, 2) : '—'}{wallet.balanceError && (wallet.balance != null ? ' · stale (refresh failed)' : ' · balance unavailable')} <span style={{ color: wallet.balanceError ? 'var(--warn)' : 'var(--good)' }}>●</span></div>
             <button onClick={onDisconnect} className="mono" style={{ marginTop: 6, background: 'none', border: 'none', padding: 0, cursor: 'pointer', font: 'inherit', fontSize: 10, letterSpacing: '0.12em', color: 'var(--ink-3)', textDecoration: 'underline' }}>
               ↪ disconnect
             </button>
@@ -315,25 +316,26 @@ function Sidecar({ basket, removeFromBasket }) {
 function FundingPanel({ wallet, basket, selectedHolding, setSelectedHolding, amount, setAmount, onBuild }) {
   const bySymbol = usePriceStore(s => s.bySymbol);
   // Real onchain holdings (Horizon) — never the static sample data.
-  const balByTk = useBalanceStore(s => s.byTk);
-  const balLoaded = useBalanceStore(s => s.lastUpdated) != null;
-  const balError = useBalanceStore(s => s.error);
+  const address = useStellarWalletStore(s => s.address);
+  const balByTk = useBalanceStore(s => s.address === address ? s.byTk : EMPTY_HOLDINGS);
+  const balLoaded = useBalanceStore(s => s.address === address && s.lastUpdated != null);
+  const balError = useBalanceStore(s => s.address === address ? s.error : null);
   const holdingOf = (tk) => balByTk[tk] ?? 0;
   const holdings = useMemo(() => COINS.filter(c => holdingOf(c.tk) > 0), [balByTk]);
   const selCoin = selectedHolding ? COIN_BY_TK[selectedHolding] : null;
   const usdAmount = selCoin ? (parseFloat(amount || 0) * priceOf(bySymbol, selCoin.tk)) : 0;
   const maxHolding = selCoin ? holdingOf(selCoin.tk) : 0;
   const overMax = selCoin && parseFloat(amount || 0) > maxHolding;
-  const canBuild = selCoin && parseFloat(amount || 0) > 0 && !overMax && basket.length >= 2;
+  const canBuild = balLoaded && !balError && selCoin && parseFloat(amount || 0) > 0 && !overMax && basket.length >= 2;
 
   return (
     <section className="funding-panel fade-in">
       <div className="col">
         <h5>① Capital source — choose a holding to liquidate</h5>
         <div className="holding-list">
-          {holdings.length === 0 && (
+          {(balError || holdings.length === 0) && (
             <div style={{ padding: 20, fontFamily: "'Instrument Serif', serif", fontStyle: 'italic', color: balError ? 'var(--bad)' : 'var(--ink-2)' }}>
-              {balError ? `Could not read balances from Horizon (${balError}).`
+              {balError ? `Could not read balances from Horizon (${balError}).${balLoaded ? " Displayed balances are stale; construction is paused until refresh succeeds." : ""}`
                 : balLoaded ? 'No qualifying balances detected in this wallet.'
                 : 'Reading balances from Horizon…'}
             </div>
@@ -374,7 +376,8 @@ function FundingPanel({ wallet, basket, selectedHolding, setSelectedHolding, amo
             <div className="quick-amounts">
               {[0.25, 0.5, 0.75, 1.0].map(f => (
                 <button key={f} className="qa" disabled={!selCoin}
-                  onClick={() => selCoin && setAmount((maxHolding * f).toFixed(priceOf(bySymbol, selCoin.tk) > 100 ? 4 : 2))}>
+                  // Round down in stroops so quick amounts never exceed the holding.
+                  onClick={() => selCoin && setAmount((Math.floor(Math.round(maxHolding * 1e7) * f) / 1e7).toFixed(7))}>
                   {f === 1.0 ? 'MAX' : `${f*100}%`}
                 </button>
               ))}
@@ -620,10 +623,9 @@ export default function PortfolioBuilder() {
   // with cleanup; cleared on disconnect/account switch. Real onchain holdings —
   // never the sample data shipped with the research bundle.
   useEffect(() => {
-    if (!address) {
-      setBalances(s => { s.byTk = {}; s.loading = false; s.error = null; s.lastUpdated = null; });
-      return;
-    }
+    setBalances(s => { s.address = address; s.byTk = {}; s.loading = false; s.error = null; s.lastUpdated = null; });
+    setHolding(null); setAmount(''); setWeights([]); setPhase(address ? 'select' : 'connect');
+    if (!address) return;
     let cancelled = false;
     const load = async () => {
       setBalances(s => { s.loading = true; });
@@ -646,15 +648,16 @@ export default function PortfolioBuilder() {
   // Masthead wallet view (Step 4): balance = Σ real holding × price (live
   // Soroswap price where reliable, else static research price). "—" until the
   // first Horizon read lands — never a fabricated number.
-  const balByTk = useBalanceStore(s => s.byTk);
-  const balLoaded = useBalanceStore(s => s.lastUpdated) != null;
+  const balByTk = useBalanceStore(s => s.address === address ? s.byTk : EMPTY_HOLDINGS);
+  const balLoaded = useBalanceStore(s => s.address === address && s.lastUpdated != null);
+  const balError = useBalanceStore(s => s.address === address ? s.error : null);
   const bySymbol = usePriceStore(s => s.bySymbol);
   const balanceUsd = useMemo(() => {
     if (!balLoaded) return null;
     return COINS.reduce((sum, c) => sum + (balByTk[c.tk] ?? 0) * priceOf(bySymbol, c.tk), 0);
   }, [balLoaded, balByTk, bySymbol]);
   const wallet = connected && address
-    ? { kind: walletKind || 'Wallet', addr: truncateAddr(address), balance: balanceUsd }
+    ? { kind: walletKind || 'Wallet', addr: truncateAddr(address), balance: balanceUsd, balanceError: balError }
     : null;
 
   const maxMcap = useMemo(() => Math.max(...COINS.map(c => c.mcap)), []);

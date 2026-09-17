@@ -5,6 +5,7 @@ import { produce } from "immer";
 // PortfolioBuilder while a wallet is connected. byTk maps every universe
 // ticker to the connected account's real balance (0 when unheld).
 export interface BalanceState {
+  address: string | null;
   byTk: Record<string, number>;
   loading: boolean;
   error: string | null;
@@ -13,6 +14,7 @@ export interface BalanceState {
 }
 
 const useBalanceStore = create<BalanceState>((set) => ({
+  address: null,
   byTk: {},
   loading: false,
   error: null,
