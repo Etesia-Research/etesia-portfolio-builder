@@ -20,7 +20,7 @@ export function EquityChart({ points }) {
   const point = points[selected];
   return <div className="equity-chart">
     <div className="chart-legend"><span className="portfolio-key">Portfolio</span><span className="benchmark-key">XLM buy and hold</span><span>Starting equity = 100 · USD</span></div>
-    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="One-year buy-and-hold equity: allocated portfolio compared with XLM" onPointerMove={event => {
+    <svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Three years of buy-and-hold equity: allocated portfolio compared with XLM" onPointerMove={event => {
       const rect = event.currentTarget.getBoundingClientRect();
       const position = (event.clientX - rect.left) / rect.width * width;
       setCursor(Math.max(0, Math.min(points.length - 1, Math.round((position - left) / (width - left - right) * (points.length - 1)))));
@@ -51,6 +51,7 @@ export default function AllocationSimulation({ allocation }) {
     setResult(null); setError(null);
     quantRequest('builder/simulation', {
       weights: simulationWeights(allocation.positions), market_snapshot_id: allocation.market_snapshot_id,
+      ...(allocation.vault_run_id ? { vault_run_id: allocation.vault_run_id } : {}),
     }, controller.signal).then(value => {
       if (!controller.signal.aborted) setResult(value);
     }).catch(failure => {
@@ -58,11 +59,11 @@ export default function AllocationSimulation({ allocation }) {
     });
     return () => controller.abort();
   }, [allocation, retry]);
-  const rows = [['Return · 1Y', 'return_1y', percent], ['Sharpe · 1Y', 'sharpe_1y', ratio],
-    ['Max drawdown', 'max_drawdown', value => percent(value == null ? null : -value)], ['Calmar · 1Y', 'calmar', ratio]];
+  const rows = [['Return · annualized (CAGR)', 'return_annualized', percent], ['Volatility · annualized', 'volatility_annualized', percent], ['Sharpe · annualized', 'sharpe_annualized', ratio],
+    ['Max drawdown', 'max_drawdown', value => percent(value == null ? null : -value)], ['Calmar · annualized', 'calmar', ratio]];
   return <section className="portfolio-simulation" aria-label="Historical allocation simulation">
-    <h3>One-year allocation simulation</h3>
-    <p className="data-note">Today’s calculated weights, including reserves and buffers, applied at the start of the past year and held without rebalancing. Retrospective illustration · USD · 0% risk-free rate · no trading costs.</p>
+    <h3>Allocation simulation · last 3Y</h3>
+    <p className="data-note">Today’s calculated weights, including reserves and buffers, simulated over the last three years. Each allocation stays in USD cash at 0% return until its asset’s first available close, then buys and holds that asset without rebalancing. All metrics use the full three-year curve. Return is compound annual growth (CAGR). Sharpe uses the arithmetic mean of daily returns divided by their sample standard deviation, multiplied by √365; it does not use CAGR. Retrospective illustration · USD · 0% risk-free rate · no trading costs.</p>
     {error ? <div role="alert" className="data-note">{error} <button className="btn ghost" onClick={() => setRetry(value => value + 1)}>Retry simulation</button></div>
       : !result ? <p role="status" className="data-note">Calculating performance and equity curves…</p>
       : result.status !== 'available' ? <p role="status" className="data-note">Simulation unavailable: {result.reason}</p>
@@ -72,6 +73,7 @@ export default function AllocationSimulation({ allocation }) {
           <tbody>{rows.map(([label, key, format]) => <tr key={key}><th scope="row">{label}</th><td>{format(result.portfolio[key])}</td><td>{format(result.benchmark[key])}</td></tr>)}</tbody>
         </table>
         {['portfolio', 'benchmark'].map(key => <div className="data-note" key={key}>{[result[key].sharpe_reason, result[key].calmar_reason].filter(Boolean).map(reason => <div key={reason}>{key === 'portfolio' ? 'Portfolio' : 'XLM'}: {reason}</div>)}</div>)}
+        {Object.entries(result.asset_history_start || {}).filter(([token, date]) => result.weights[token] && date > result.window_start).map(([token, date]) => <p className="data-note" key={token}>{token.toUpperCase()} · cash until {date.slice(0, 10)}, then buy and hold.</p>)}
         <EquityChart points={result.equity_curve} />
       </>}
   </section>;

@@ -1,14 +1,14 @@
-import { ASSET_CONTRACTS } from "@/lib/assets";
 import type { PriceInfo } from "@/lib/prices";
 
 export type Metric = {
   status: "available" | "unavailable";
   reason: string | null;
   stale: boolean;
+  window_start: string;
   window_end: string;
   simulated: boolean;
   vault_run_id: string | null;
-  sharpe_1y?: number | null;
+  sharpe_annualized?: number | null;
   correlation?: number | null;
 };
 export type Coin = {
@@ -17,7 +17,6 @@ export type Coin = {
   marketCap: { basis?: string; stale?: boolean; as_of?: string; reason?: string };
   sharpe: number | null; analytics: Metric | null; analyticsError: string | null;
 };
-export type RouteCheck = { available: boolean; reason: string; fetchedAt: string | null };
 export type Allocation = {
   status: "valid" | "blocked";
   model_version: string; generated_at: string; market_data_as_of: string;
@@ -65,26 +64,12 @@ export async function fetchUniverse(signal?: AbortSignal) {
     const [color, glyph] = palette[token.symbol] ?? ["#5b6470", token.symbol[0]];
     return { id: token.id, tk: token.symbol, name: token.name, simulated: token.simulated,
       allocationSupported: token.allocation_supported ?? ["xlm", "aqua", "eth", "btc"].includes(token.id),
-      color, glyph, logo: ({ xlm: "/logos/xlm.svg", aqua: "/logos/aqua.png", eth: "/logos/eth.svg", btc: "/logos/btc.png", shx: "/logos/shx.png", "etesia-tf": "/logos/etesia.svg" } as Record<string, string>)[token.id] ?? null, mcap: cap?.market_cap_usd ?? null, marketCap: cap ?? { reason: "Market cap unavailable" },
-      sharpe: metric?.status === "available" ? metric.sharpe_1y : null, analytics: metric,
+      color, glyph, logo: ({ xlm: "/logos/xlm.svg", aqua: "/logos/aqua.png", eth: "/logos/eth.svg", btc: "/logos/btc.png", shx: "/logos/shx.png", usdc: "/logos/usdc.svg", eurc: "/logos/eurc.svg", ustry: "/logos/ustry.png", "etesia-tf": "/logos/etesia.svg" } as Record<string, string>)[token.id] ?? null, mcap: cap?.market_cap_usd ?? null, marketCap: cap ?? { reason: "Market cap unavailable" },
+      sharpe: metric?.status === "available" ? metric.sharpe_annualized : null, analytics: metric,
       analyticsError: analytics.status === "rejected" ? "Sharpe unavailable" : null };
   });
   return { coins, prices, cashReserveAssets: catalog.cash_reserve_assets ?? ["ustry"] };
 }
-
-export async function checkRoute(symbol: string, signal?: AbortSignal): Promise<RouteCheck> {
-  const contract = ASSET_CONTRACTS[symbol]?.contract;
-  if (!contract) return { available: false, reason: "No verified Stellar instrument", fetchedAt: null };
-  if (symbol === "USDC") return { available: true, reason: "Settlement asset", fetchedAt: null };
-  try {
-    const buy = await quantRequest("quotes", { asset_in: ASSET_CONTRACTS.USDC.contract, asset_out: contract, amount: "10000000" }, signal);
-    const sell = await quantRequest("quotes", { asset_in: contract, asset_out: ASSET_CONTRACTS.USDC.contract, amount: String(buy.quote.amountOut) }, signal);
-    return { available: true, reason: "Buy/sell routes quoted at 1 USDC; execution remains simulated", fetchedAt: sell.fetched_at };
-  } catch {
-    return { available: false, reason: "Soroswap route unavailable; refresh missing routes", fetchedAt: null };
-  }
-}
-
 
 export function simulationWeights(positions: Allocation["positions"]): Record<string, number> {
   const weights: Record<string, number> = {};

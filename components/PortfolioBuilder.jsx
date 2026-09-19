@@ -5,7 +5,8 @@ import useStellarWalletStore from "@/stores/useStellarWalletStore";
 import { initWalletKit, connectWallet, disconnectWallet } from "@/components/stellar/walletKit";
 import usePriceStore from "@/stores/usePriceStore";
 import { fundingValue, referenceValue } from "@/lib/prices";
-import { fetchUniverse, quantRequest, checkRoute } from "@/lib/quant";
+import { fetchUniverse, quantRequest } from "@/lib/quant";
+import ExecutionSimulation from "@/components/ExecutionSimulation";
 import AllocationSimulation from "@/components/AllocationSimulation";
 import useBalanceStore from "@/stores/useBalanceStore";
 import { fetchHoldings } from "@/lib/balances";
@@ -34,7 +35,7 @@ const corrColor = (c) => c < 0.15 ? 'good' : c < 0.45 ? 'warn' : 'bad';
 const fmtDate = (stamp) => stamp ? new Date(stamp).toLocaleDateString('en-US', { timeZone: 'UTC' }) : 'unavailable';
 // Stored daily closes use the following midnight UTC as their boundary.
 const fmtCloseDate = (stamp) => stamp ? fmtDate(new Date(new Date(stamp).getTime() - 86400000)) : 'unavailable';
-const metricNote = (metric, error) => error || metric?.reason || (metric ? `${metric.simulated ? 'Simulated · ' : ''}${metric.stale ? 'Stale · ' : ''}Data through close · ${fmtCloseDate(metric.window_end)}` : 'Loading…');
+const metricNote = (metric, error) => error || metric?.reason || (metric ? `${metric.simulated ? 'Simulated · ' : ''}${metric.stale ? 'Stale · ' : ''}Window · ${fmtCloseDate(metric.window_start)} to ${fmtCloseDate(metric.window_end)}` : 'Loading…');
 
 const fmtPercent = value => value == null ? '—' : `${(value * 100).toFixed(2)}%`;
 
@@ -174,7 +175,7 @@ function CoinCard({ coin, selected, correlation, correlationLoading, hasBasket, 
           <div className="stat-val">{fmtMcap(coin.mcap)}</div><div className="bar-track"><div className="bar-fill" style={{ width: `${mcapFrac * 100}%` }} /></div>
         </div>
         <div title={metricNote(coin.analytics, coin.analyticsError)}>
-          <div className="stat-label">Sharpe · 1Y{coin.simulated ? ' · simulated' : ''}</div>
+          <div className="stat-label">Sharpe · annualized{coin.simulated ? ' · simulated' : ''}</div>
           <div className="stat-val">{coin.sharpe == null ? '—' : coin.sharpe.toFixed(2)}</div>
         </div>
       </div>
@@ -196,25 +197,26 @@ function Sidecar({ basket, coins, removeFromBasket, analytics, analyticsLoading 
     {basket.length > 0 && <div className="metrics" aria-live="polite" aria-busy={analyticsLoading}>
       <div className="row"><span className="lbl">Avg. pairwise correlation</span><span className="val">{analyticsLoading ? '…' : analytics?.average_pairwise_correlation?.toFixed(2) ?? '—'}</span></div>
       {!analyticsLoading && analytics?.pairwise_reason && <div className="data-note">{analytics.pairwise_reason}</div>}
-      <div className="row"><span className="lbl">Basket SR · 1Y</span><span className="val">{analyticsLoading ? '…' : analytics?.sharpe_1y?.toFixed(2) ?? '—'}</span></div>
+      <div className="row"><span className="lbl">Basket SR · annualized</span><span className="val">{analyticsLoading ? '…' : analytics?.sharpe_annualized?.toFixed(2) ?? '—'}</span></div>
       {!analyticsLoading && analytics?.sharpe_reason && analytics.sharpe_reason !== analytics.pairwise_reason && <div className="data-note">{analytics.sharpe_reason}</div>}
-      <div className="row"><span className="lbl">Return · 1Y</span><span className="val">{analyticsLoading ? '…' : fmtPercent(analytics?.return_1y)}</span></div>
-      <div className="row"><span className="lbl">Max drawdown · 1Y</span><span className="val">{analyticsLoading ? '…' : fmtPercent(analytics?.max_drawdown == null ? null : -analytics.max_drawdown)}</span></div>
-      <div className="row"><span className="lbl">Calmar · 1Y</span><span className="val">{analyticsLoading ? '…' : analytics?.calmar?.toFixed(2) ?? '—'}</span></div>
+      <div className="row"><span className="lbl">Return · annualized (CAGR)</span><span className="val">{analyticsLoading ? '…' : fmtPercent(analytics?.return_annualized)}</span></div>
+      <div className="row"><span className="lbl">Max drawdown</span><span className="val">{analyticsLoading ? '…' : fmtPercent(analytics?.max_drawdown == null ? null : -analytics.max_drawdown)}</span></div>
+      <div className="row"><span className="lbl">Calmar · annualized</span><span className="val">{analyticsLoading ? '…' : analytics?.calmar?.toFixed(2) ?? '—'}</span></div>
       {!analyticsLoading && analytics?.calmar_reason && analytics.calmar_reason !== analytics.pairwise_reason && <div className="data-note">{analytics.calmar_reason}</div>}
-      <div className="data-note">Equal initial weights · buy and hold · USD · 0% risk-free rate. Correlation averages distinct product pairs.</div>
-      <div className="data-note">{analyticsLoading ? 'Calculating basket metrics…' : analytics?.error || (analytics?.window_end ? `Data through close · ${fmtCloseDate(analytics.window_end)}${analytics.stale ? ' · stale data' : ''}` : '')}</div>
+      <div className="data-note">Up to 3Y · equal initial weights · buy and hold · USD · 0% risk-free rate. Correlation averages distinct product pairs.</div>
+      <div className="data-note">{analyticsLoading ? 'Calculating basket metrics…' : analytics?.error || (analytics?.window_end ? `Window · ${fmtCloseDate(analytics.window_start)} to ${fmtCloseDate(analytics.window_end)}${analytics.stale ? ' · stale data' : ''}` : '')}</div>
     </div>}
-    <p className="data-note">ρ compares each product with this basket over one year, using equal capital at the start of the year and fixed quantities thereafter.</p>
-    {basket.includes('ETESIA-TF') && <p className="data-note">Basket metrics include simulated vault returns. The vault is under construction and is excluded from allocation.</p>}
+    <p className="data-note">Sharpe uses the arithmetic mean of daily portfolio returns, not CAGR or an average of product ratios. With negative returns, lower volatility can make Sharpe more negative.</p>
+    <p className="data-note">ρ compares each product with this basket over up to three years, using equal capital at the start of the window and fixed quantities thereafter.</p>
+    {basket.includes('ETESIA-TF') && <p className="data-note">Basket metrics include simulated vault returns. The vault is included in allocation using simulated history and an assumed $1 share price.</p>}
   </aside>;
 }
 
 function CashReservePanel({ selected, onChange, supported, coins }) {
   const options = [
-    { id: 'usdc', name: 'USD Coin' },
-    { id: 'eurc', name: 'Euro Coin' },
-    { id: 'ustry', name: 'USTRY' },
+    { id: 'usdc', name: 'USD Coin', logo: '/logos/usdc.svg' },
+    { id: 'eurc', name: 'Euro Coin', logo: '/logos/eurc.svg' },
+    { id: 'ustry', name: 'USTRY', logo: '/logos/ustry.png' },
   ];
   return <section className="cash-reserve-stage">
     <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">04</span><h2>Cash reserve</h2><span className="meta">Equal split across selected assets</span></div>
@@ -224,6 +226,7 @@ function CashReservePanel({ selected, onChange, supported, coins }) {
       const reason = !coin ? 'Daily data unavailable' : !supported.includes(option.id) ? 'Reserve API update required' : 'Daily history available';
       return <label key={option.id} className={`reserve-option ${selected.includes(option.id) ? 'selected' : ''}`}>
         <input type="checkbox" checked={selected.includes(option.id)} disabled={!available && !selected.includes(option.id)} onChange={() => onChange(selected.includes(option.id) ? selected.filter(id => id !== option.id) : [...selected, option.id])} />
+        <ProductLogo coin={coin || option} />
         <span><strong>{option.id.toUpperCase()}</strong><span className="data-note">{option.name} · {reason}</span></span>
         {selected.includes(option.id) && <span className="reserve-share">{(100 / selected.length).toFixed(0)}% of reserve</span>}
       </label>;
@@ -232,7 +235,7 @@ function CashReservePanel({ selected, onChange, supported, coins }) {
   </section>;
 }
 
-function FundingPanel({ coins, allocationCoins, excludedCoins, selectedHolding, setSelectedHolding, amount, setAmount, onBuild, building, error, budget, setBudget, reserveSelector, reserveValid }) {
+function FundingPanel({ coins, allocationCoins, selectedHolding, setSelectedHolding, amount, setAmount, onBuild, building, error, budget, setBudget, reserveSelector, reserveValid }) {
   const COIN_BY_TK = Object.fromEntries(coins.map(c => [c.tk, c]));
   const bySymbol = usePriceStore(s => s.bySymbol);
   // Real onchain holdings (Horizon) — never the static sample data.
@@ -247,7 +250,8 @@ function FundingPanel({ coins, allocationCoins, excludedCoins, selectedHolding, 
   const usdcAmount = selCoin ? fundingValue(bySymbol, selCoin.tk, Number(amount)) : null;
   const maxHolding = selCoin ? holdingOf(selCoin.tk) : 0;
   const overMax = selCoin && Number(amount) > maxHolding;
-  const canBuild = balLoaded && !balError && selCoin && usdcAmount != null && Number(amount) > 0 && !overMax && allocationCoins.length > 0 && Number(budget) > 0 && Number.isFinite(Number(budget)) && !building && reserveValid;
+  const unsupported = allocationCoins.filter(c => c.allocationSupported === false);
+  const canBuild = !unsupported.length && balLoaded && !balError && selCoin && usdcAmount != null && Number(amount) > 0 && !overMax && allocationCoins.length > 0 && Number(budget) > 0 && Number.isFinite(Number(budget)) && !building && reserveValid;
 
   return (
     <>
@@ -322,7 +326,7 @@ function FundingPanel({ coins, allocationCoins, excludedCoins, selectedHolding, 
       <div className="build-cta">
         <div className="note">
           <div>{allocationCoins.length ? `Allocation products: ${allocationCoins.map(c => c.tk).join(', ')}.` : 'Select a product with an available allocation model.'}</div>
-          {excludedCoins.length > 0 && <div>Analytics only in this preview: {excludedCoins.map(c => c.tk).join(', ')} (vault, settlement asset, unsupported model).</div>}
+          {unsupported.length > 0 && <div>Allocation API update required for {unsupported.map(c => c.tk).join(', ')}.</div>}
           <div>{usdcAmount == null ? 'A fresh source close and matching USDC/USD close are required.' : `Hypothetical capital: ${usdcAmount.toLocaleString(undefined, { maximumFractionDigits: 2 })} USDC, including reserves and buffers.`}</div>
           {error && <div role="alert" style={{ color: 'var(--bad)' }}>{error}</div>}
         </div>
@@ -334,9 +338,8 @@ function FundingPanel({ coins, allocationCoins, excludedCoins, selectedHolding, 
 }
 
 
-function AllocStage({ allocation, coins, onReset, routeSymbols = [], routes = {}, checkingRoutes, onRefreshRoutes }) {
-  const [executionSimulated, setExecutionSimulated] = useState(false);
-  const routesReady = !checkingRoutes && routeSymbols.every(tk => routes[tk]?.available);
+function AllocStage({ allocation, coins, onReset }) {
+  const productAllocation = allocation.requested_assets.reduce((sum, id) => sum + (allocation.positions[id]?.allocation_fraction || 0), 0);
   const ordered = Object.entries(allocation.positions || {}).filter(([, p]) => p.allocation_fraction > 0).sort((a, b) => b[1].allocation_fraction - a[1].allocation_fraction);
   const coinFor = (id) => coins.find(c => c.id === id.replace('_buffer', '').replace('_reserve', ''));
   const label = (id) => id === 'xlm_buffer' ? 'XLM fee buffer' : id.endsWith('_reserve') ? `${id.split('_')[0].toUpperCase()} reserve` : id === 'usdc' ? 'USDC buffer' : RESERVE_IDS.has(id) ? `${id.toUpperCase()} reserve` : id.toUpperCase();
@@ -359,23 +362,12 @@ function AllocStage({ allocation, coins, onReset, routeSymbols = [], routes = {}
     </div>
     <div className="trade-cta"><div className="meta-blob">
       <div><div className="lbl">Capital · USDC</div><div className="val">{allocation.portfolio_value_usdc.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div></div>
-      <div><div className="lbl">Allocated sleeve σ · annual</div><div className="val">{allocation.allocated_sleeve_volatility == null ? '—' : `${(allocation.allocated_sleeve_volatility * 100).toFixed(2)}%`}</div></div>
+      <div><div className="lbl">Selected products · allocation</div><div className="val">{(productAllocation * 100).toFixed(2)}%</div></div>
+      <div><div className="lbl">Model volatility · annual (1Y inputs)</div><div className="val">{allocation.allocated_sleeve_volatility == null ? '—' : `${(allocation.allocated_sleeve_volatility * 100).toFixed(2)}%`}</div></div>
     </div><button className="btn ghost" onClick={onReset}>← Revise basket</button></div>
-    <p className="data-note">Simulated allocation · reference quantities, no funds moved. The volatility measure applies to the selected sleeve. Reserves and buffers are shown separately.</p>
+    <p className="data-note">Simulated allocation · reference quantities, no funds moved. Product allocation and estimated volatility include every selected product, including the vault. The volatility estimate uses the current risk model’s one-year history and excludes reserves and buffers. The three-year historical metrics below include the entire portfolio.</p>
     <AllocationSimulation allocation={allocation} />
-    <div className="execution-routes">
-      <h4>Trading routes</h4>
-      <p className="data-note">Soroswap availability for the funding asset and allocated positions. Routes are needed for trading; allocation is already calculated. Execution remains simulated.</p>
-      {routeSymbols.map(tk => <div className="data-note" key={tk}>{tk} · {routes[tk]?.available ? 'Route available' : checkingRoutes ? 'Checking route…' : routes[tk]?.reason || 'Route not checked'}</div>)}
-      {!routeSymbols.length && <p className="data-note">No swaps required.</p>}
-      {routeSymbols.some(tk => !routes[tk]?.available) && <button className="btn ghost" disabled={checkingRoutes} onClick={onRefreshRoutes}>{checkingRoutes ? 'Checking routes…' : 'Refresh missing routes'}</button>}
-      <p className="data-note">Availability uses a 1 USDC buy/sell probe. Actual trades need fresh quotes for their amounts.</p>
-    </div>
-    <div className="simulated-execution">
-      <button className="btn lg" disabled={!routesReady || executionSimulated} onClick={() => setExecutionSimulated(true)}><span className="dot" />{executionSimulated ? 'Execution simulated' : 'Simulate execution'}<span>→</span></button>
-      {!routesReady && <p className="data-note">Available routes are required for the execution preview. Refresh any missing routes above.</p>}
-      {executionSimulated && <div role="status" className="simulation-receipt"><strong>Simulation complete</strong><p>Previewed {ordered.length} target positions for {allocation.portfolio_value_usdc.toLocaleString(undefined, { maximumFractionDigits: 2 })} USDC using the reference quantities shown above. No wallet signature requested, no transactions submitted, and no funds moved.</p><p className="data-note">This preview does not model fill prices, fees or slippage.</p></div>}
-    </div>
+    <ExecutionSimulation allocation={allocation} funding={allocation.funding} usdcUsd={allocation.usdcUsd} />
     {allocation.binding_constraints.length > 0 && <p className="data-note">Model limits: {allocation.binding_constraints.map(c => c.replaceAll('_', ' ')).join(' · ')}</p>}
     {allocation.diagnostics.length > 0 && <p className="data-note">{allocation.diagnostics.join(' · ')}</p>}
   </section>;
@@ -393,7 +385,6 @@ export default function PortfolioBuilder() {
   const [catalogError, setCatalogError] = useState(null);
   const [loading, setLoading] = useState(true);
   const [refresh, setRefresh] = useState(0);
-  const [routes, setRoutes] = useState({});
   const [correlations, setCorrelations] = useState({ key: '', values: {} });
   const [budget, setBudget] = useState('25');
   const [building, setBuilding] = useState(false);
@@ -401,8 +392,6 @@ export default function PortfolioBuilder() {
   const [cashReserves, setCashReserves] = useState(['ustry']);
   const [supportedReserves, setSupportedReserves] = useState(['ustry']);
   const [basketAnalytics, setBasketAnalytics] = useState({ key: '', value: null });
-  const [checkingRoutes, setCheckingRoutes] = useState(false);
-  const [routeRefresh, setRouteRefresh] = useState(0);
   const buildRequest = useRef(null);
 
   const address = useStellarWalletStore(s => s.address);
@@ -422,11 +411,7 @@ export default function PortfolioBuilder() {
   const candidateCorr = correlations.key === basketKey ? correlations.values : {};
   const correlationLoading = basket.length > 0 && correlations.key !== basketKey;
   const products = coins.filter(c => !RESERVE_IDS.has(c.id));
-  const allocationCoins = products.filter(c => basket.includes(c.tk) && c.allocationSupported);
-
-  const routeSymbols = allocation ? [...new Set([holding, ...Object.entries(allocation.positions || {})
-    .filter(([, p]) => p.allocation_fraction > 0)
-    .map(([id]) => id.replace('_buffer', '').replace('_reserve', '').toUpperCase())])].filter(tk => tk && tk !== 'USDC') : [];
+  const allocationCoins = products.filter(c => basket.includes(c.tk));
 
   useEffect(() => { initWalletKit(); }, []);
   useEffect(() => {
@@ -495,27 +480,6 @@ export default function PortfolioBuilder() {
     return () => { controller.abort(); clearTimeout(timer); };
   }, [basketKey, coins]);
 
-  useEffect(() => {
-    const controller = new AbortController();
-    if (phase !== 'allocated' || !allocation || allocation.owner !== address) {
-      setCheckingRoutes(false);
-      return () => controller.abort();
-    }
-    const missing = routeSymbols.filter(tk => !routes[tk]?.available);
-    setCheckingRoutes(missing.length > 0);
-    const load = async () => {
-      for (const tk of missing) {
-        if (controller.signal.aborted) return;
-        const route = await checkRoute(tk, controller.signal);
-        if (controller.signal.aborted) return;
-        setRoutes(current => ({ ...current, [tk]: route }));
-      }
-      if (!controller.signal.aborted) setCheckingRoutes(false);
-    };
-    load();
-    return () => controller.abort();
-  }, [allocation, address, phase, routeRefresh]);
-
   // Invalidate any pending calculation when its inputs or account change.
   useEffect(() => {
     buildRequest.current?.abort();
@@ -562,12 +526,16 @@ export default function PortfolioBuilder() {
   });
 
   const onBuild = async () => {
+    if (allocationCoins.some(c => c.allocationSupported === false)) {
+      setBuildError('The allocation API needs an update for this selection.');
+      return;
+    }
     const capital = fundingValue(bySymbol, holding, Number(amount));
     if (!reserveValid || !capital || !Number.isFinite(capital) || !allocationCoins.length || !balLoaded || balError || Number(amount) > (balByTk[holding] ?? 0)) return;
     buildRequest.current?.abort();
     const controller = new AbortController();
     buildRequest.current = controller;
-    setBuilding(true); setBuildError(null); setAllocation(null); setRoutes({});
+    setBuilding(true); setBuildError(null); setAllocation(null);
     try {
       const result = await quantRequest('builder/targets', { assets: allocationCoins.map(c => c.id), portfolio_value_usdc: capital, annual_volatility_budget: Number(budget) / 100, ...(reserveKey === 'ustry' ? {} : { cash_reserves: cashReserves }) }, controller.signal);
       if (controller.signal.aborted) return;
@@ -575,7 +543,7 @@ export default function PortfolioBuilder() {
         setBuildError(`Allocation blocked: ${result.diagnostics?.join(' · ') || 'Required inputs are unavailable'}`);
         return;
       }
-      setAllocation({ ...result, owner: address }); setPhase('allocated');
+      setAllocation({ ...result, owner: address, funding: { symbol: holding, amount }, usdcUsd: bySymbol.USDC.price }); setPhase('allocated');
     } catch (error) {
       if (!controller.signal.aborted) setBuildError(error.message);
     } finally {
@@ -594,10 +562,10 @@ export default function PortfolioBuilder() {
       <div className="two-col"><div className="coin-grid">{sortedCoins.map(c => <CoinCard key={c.tk} coin={c} selected={basket.includes(c.tk)} correlation={candidateCorr[c.tk]} correlationLoading={correlationLoading} hasBasket={basket.length > 0} onToggle={() => setBasket(current => current.includes(c.tk) ? current.filter(t => t !== c.tk) : [...current, c.tk])} maxMcap={maxMcap} />)}</div><Sidecar basket={basket} coins={coins} analytics={basketAnalytics.key === basketKey ? basketAnalytics.value : null} analyticsLoading={basket.length > 0 && basketAnalytics.key !== basketKey} removeFromBasket={tk => setBasket(current => current.filter(t => t !== tk))} /></div>
       {wallet && <>
         <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">03</span><h2>Funding — capital source &amp; amount</h2><span className="meta">Hypothetical allocation</span></div>
-        <FundingPanel coins={coins} allocationCoins={allocationCoins} excludedCoins={coins.filter(c => basket.includes(c.tk) && !allocationCoins.includes(c))} selectedHolding={holding} setSelectedHolding={setHolding} amount={amount} setAmount={setAmount} onBuild={onBuild} building={building} error={buildError} budget={budget} setBudget={setBudget} reserveValid={reserveValid} reserveSelector={<CashReservePanel selected={cashReserves} onChange={setCashReserves} supported={supportedReserves} coins={coins} />} />
+        <FundingPanel coins={coins} allocationCoins={allocationCoins} selectedHolding={holding} setSelectedHolding={setHolding} amount={amount} setAmount={setAmount} onBuild={onBuild} building={building} error={buildError} budget={budget} setBudget={setBudget} reserveValid={reserveValid} reserveSelector={<CashReservePanel selected={cashReserves} onChange={setCashReserves} supported={supportedReserves} coins={coins} />} />
       </>}
     </div>
-    {phase === 'allocated' && allocation?.owner === address && <><div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">05</span><h2>Allocation — model targets</h2><span className="meta">Simulation only</span></div><AllocStage allocation={allocation} coins={coins} routeSymbols={routeSymbols} routes={routes} checkingRoutes={checkingRoutes} onRefreshRoutes={() => setRouteRefresh(value => value + 1)} onReset={() => { setAllocation(null); setPhase('select'); }} /></>}
+    {phase === 'allocated' && allocation?.owner === address && <><div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">05</span><h2>Allocation — model targets</h2><span className="meta">Simulation only</span></div><AllocStage allocation={allocation} coins={coins} onReset={() => { setAllocation(null); setPhase('select'); }} /></>}
     <footer className="data-footer"><span>ETESIA RESEARCH</span><span>Live wallet balances · daily quant analytics · simulated vault returns · allocation preview, no funds moved</span></footer>
   </div>;
 }

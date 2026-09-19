@@ -22,7 +22,6 @@ function harness(initialState = []) {
   const effects = [];
   const requests = [];
   const quantRequests = [];
-  const routeRequests = [];
   const buildRef = { current: null };
   const intervals = new Map();
   const state = [];
@@ -39,6 +38,7 @@ function harness(initialState = []) {
       },
     },
     "@/components/AllocationSimulation": () => null,
+    "@/components/ExecutionSimulation": () => null,
     "@/stores/useStellarWalletStore": (selector) => selector(wallet),
     "@/stores/useBalanceStore": (selector) => selector(balances),
     "@/stores/usePriceStore": (selector) => selector(prices),
@@ -48,7 +48,6 @@ function harness(initialState = []) {
       fundingValue: (prices, symbol, qty) => prices[symbol]?.price == null ? null : prices[symbol].price * qty,
     },
     "@/lib/quant": {
-      checkRoute: (symbol, signal) => new Promise(resolve => routeRequests.push({ symbol, signal, resolve })),
       fetchUniverse: async () => ({ coins: [], prices: {}, cashReserveAssets: ["ustry"] }),
       quantRequest: (endpoint, body, signal) => new Promise((resolve, reject) => quantRequests.push({ endpoint, body, signal, resolve, reject })),
     },
@@ -66,9 +65,9 @@ function harness(initialState = []) {
   const render = () => { effects.length = 0; state.length = 0; return mod.exports.default(); };
   const poll = () => { render(); return effects.at(-1)(); };
   const panel = (overrides = {}) => mod.exports.FundingPanel({
-    coins: [{ tk: "USDC", name: "USD Coin" }], allocationCoins: [{ tk: "XLM" }], excludedCoins: [], reserveValid: true, budget: "20", selectedHolding: "USDC", amount: "1", ...overrides,
+    coins: [{ tk: "USDC", name: "USD Coin" }], allocationCoins: [{ tk: "XLM" }], reserveValid: true, budget: "20", selectedHolding: "USDC", amount: "1", ...overrides,
   });
-  return { ...mod.exports, wallet, balances, requests, quantRequests, routeRequests, prices, buildRef, effects, intervals, state, render, poll, panel };
+  return { ...mod.exports, wallet, balances, requests, quantRequests, prices, buildRef, effects, intervals, state, render, poll, panel };
 }
 
 function nodes(node) {
@@ -214,15 +213,14 @@ test("allocation requests carry selected products and reserves, and cancelled re
   state[2] = "1";
   state[3] = "select";
   state[5] = [{ id: "xlm", tk: "XLM", allocationSupported: true }, { id: "usdc", tk: "USDC" },
-    { id: "ustry", tk: "USTRY" }, { id: "etesia-tf", tk: "ETESIA-TF", simulated: true }];
-  state[9] = { XLM: { available: false }, USTRY: { available: false } };
+    { id: "ustry", tk: "USTRY" }, { id: "etesia-tf", tk: "ETESIA-TF", simulated: true, allocationSupported: true }];
+  state[13] = ["usdc", "ustry"];
   state[14] = ["usdc", "ustry"];
-  state[15] = ["usdc", "ustry"];
   const h = harness(state);
   const panel = nodes(h.render()).find(node => node.type === h.FundingPanel);
   assert.equal(buildButton(h.FundingPanel(panel.props)).props.disabled, false);
   const pending = panel.props.onBuild();
-  assert.deepEqual(h.quantRequests[0].body, { assets: ["xlm"], portfolio_value_usdc: 1, annual_volatility_budget: .25, cash_reserves: ["usdc", "ustry"] });
+  assert.deepEqual(h.quantRequests[0].body, { assets: ["xlm", "etesia-tf"], portfolio_value_usdc: 1, annual_volatility_budget: .25, cash_reserves: ["usdc", "ustry"] });
   h.buildRef.current.abort();
   h.quantRequests[0].resolve({ status: "valid", positions: { xlm: {} } });
   await pending;
@@ -246,27 +244,27 @@ test("funding risk-cap slider displays its percentage and updates the calculator
 test("Working basket shows pairwise correlation and buy-and-hold Sharpe with honest empty states", () => {
   const h = harness();
   const props = { basket: ["XLM", "ETESIA-TF"], coins: [], analyticsLoading: false,
-    analytics: { average_pairwise_correlation: -.1234, sharpe_1y: 1.2345, return_1y: .12, max_drawdown: .08, calmar: 1.5, window_end: "2026-09-19T00:00:00Z" } };
+    analytics: { average_pairwise_correlation: -.1234, sharpe_annualized: 1.2345, return_annualized: .12, max_drawdown: .08, calmar: 1.5, window_end: "2026-09-19T00:00:00Z" } };
   const rendered = text(h.Sidecar(props));
   assert.match(rendered, /Avg. pairwise correlation-0.12/);
-  assert.match(rendered, /Basket SR · 1Y1.23/);
-  assert.match(rendered, /Return · 1Y12.00%/);
-  assert.match(rendered, /Max drawdown · 1Y-8.00%/);
-  assert.match(rendered, /Calmar · 1Y1.50/);
+  assert.match(rendered, /Basket SR · annualized1.23/);
+  assert.match(rendered, /Return · annualized \(CAGR\)12.00%/);
+  assert.match(rendered, /Max drawdown-8.00%/);
+  assert.match(rendered, /Calmar · annualized1.50/);
   assert.ok(!rendered.includes("Cash reserve assets are selected"));
   assert.match(rendered, /buy and hold/);
   assert.match(rendered, /simulated vault returns/);
-  assert.match(rendered, /Data through close · 9\/18\/2026/);
-  const single = text(h.Sidecar({ ...props, basket: ["XLM"], analytics: { sharpe_1y: 0, pairwise_reason: "Select at least two products" } }));
+  assert.match(rendered, /Window · unavailable to 9\/18\/2026/);
+  const single = text(h.Sidecar({ ...props, basket: ["XLM"], analytics: { sharpe_annualized: 0, pairwise_reason: "Select at least two products" } }));
   assert.match(single, /correlation—/);
   assert.match(single, /Select at least two products/);
-  assert.match(single, /Basket SR · 1Y0.00/);
+  assert.match(single, /Basket SR · annualized0.00/);
   const loading = text(h.Sidecar({ ...props, analytics: null, analyticsLoading: true }));
   assert.match(loading, /Calculating basket metrics/);
   assert.ok(!loading.includes("1.23"));
   const failed = text(h.Sidecar({ ...props, analytics: { error: "Quant unavailable" } }));
   assert.match(failed, /Quant unavailable/);
-  assert.match(failed, /Basket SR · 1Y—/);
+  assert.match(failed, /Basket SR · annualized—/);
   assert.ok(!text(h.Sidecar({ ...props, basket: [] })).includes("Basket SR"));
 });
 
@@ -282,14 +280,14 @@ test("basket analytics requests follow selection and ignore cancelled results", 
   assert.equal(h.quantRequests[0].endpoint, "basket/analytics");
   assert.deepEqual(h.quantRequests[0].body, { basket: ["xlm"] });
   cleanup();
-  h.quantRequests[0].resolve({ sharpe_1y: 99 });
+  h.quantRequests[0].resolve({ sharpe_annualized: 99 });
   await flush();
-  assert.equal(h.state[16].value, null);
+  assert.equal(h.state[15].value, null);
   const cleanupCurrent = effect();
   await new Promise(resolve => setTimeout(resolve, 230));
-  h.quantRequests[1].resolve({ sharpe_1y: 1.23 });
+  h.quantRequests[1].resolve({ sharpe_annualized: 1.23 });
   await flush();
-  assert.deepEqual(h.state[16], { key: "XLM", value: { sharpe_1y: 1.23 } });
+  assert.deepEqual(h.state[15], { key: "XLM", value: { sharpe_annualized: 1.23 } });
   cleanupCurrent();
 });
 
@@ -305,83 +303,13 @@ test("close labels show the completed UTC candle date without changing price tim
   const stamp = h.prices.bySymbol.USDC.ts;
   assert.match(text(h.Ticker({ coins: [{ tk: "USDC" }] })), /close 9\/18\/2026/);
   assert.equal(h.prices.bySymbol.USDC.ts, stamp);
-  assert.equal(h.metricNote({ window_end: stamp, simulated: true, stale: true }), "Simulated · Stale · Data through close · 9/18/2026");
+  assert.equal(h.metricNote({ window_end: stamp, simulated: true, stale: true }), "Simulated · Stale · Window · unavailable to 9/18/2026");
 });
 
-test("route probing is deferred until the final step and ignores late responses after leaving", async () => {
-  const state = [];
-  state[1] = "ETH";
-  state[3] = "select";
-  const h = harness(state);
-  h.render();
-  const routeEffect = () => h.effects.find(fn => fn.toString().includes("checkRoute"));
-  routeEffect()();
-  assert.equal(h.routeRequests.length, 0);
-  state[3] = "allocated";
-  state[4] = { owner: "A", positions: { xlm: { allocation_fraction: .1 }, xlm_buffer: { allocation_fraction: .025 }, usdc: { allocation_fraction: .025 }, ustry: { allocation_fraction: .85 }, btc: { allocation_fraction: 0 } } };
-  h.render();
-  const cleanup = routeEffect()();
-  assert.equal(h.routeRequests[0].symbol, "ETH");
-  h.routeRequests[0].resolve({ available: true });
-  await flush();
-  assert.equal(h.routeRequests[1].symbol, "XLM");
-  h.routeRequests[1].resolve({ available: true });
-  await flush();
-  assert.equal(h.routeRequests[2].symbol, "USTRY");
-  cleanup();
-  h.routeRequests[2].resolve({ available: true });
-  await flush();
-  assert.deepEqual(h.state[9], { ETH: { available: true }, XLM: { available: true } });
-});
-
-test("retry probes only missing trading routes and keeps successful routes", async () => {
-  const state = [];
-  state[1] = "USDC";
-  state[3] = "allocated";
-  state[4] = { owner: "A", positions: { xlm: { allocation_fraction: .2 }, ustry: { allocation_fraction: .8 } } };
-  state[9] = { XLM: { available: true }, USTRY: { available: false } };
-  const h = harness(state);
-  h.render();
-  const effect = h.effects.find(fn => fn.toString().includes("checkRoute"));
-  const cleanup = effect();
-  assert.deepEqual(h.routeRequests.map(r => r.symbol), ["USTRY"]);
-  h.routeRequests[0].resolve({ available: true });
-  await flush();
-  assert.deepEqual(h.state[9], { XLM: { available: true }, USTRY: { available: true } });
-  assert.equal(h.state[17], false);
-  cleanup();
-});
-
-test("final allocation exposes missing-route retry without hiding model targets", () => {
+test("unsupported selected vault blocks construction instead of silently disappearing", () => {
   const h = harness();
-  let refreshed = false;
-  const tree = h.AllocStage({ allocation: { positions: {}, portfolio_value_usdc: 100, allocated_sleeve_volatility: .25,
-    binding_constraints: [], diagnostics: [] }, coins: [], routeSymbols: ["XLM", "USTRY"],
-    routes: { XLM: { available: true }, USTRY: { available: false, reason: "Route unavailable" } },
-    checkingRoutes: false, onRefreshRoutes: () => { refreshed = true; } });
-  assert.match(text(tree), /Equal Risk-Contribution Portfolio/);
-  assert.match(text(tree), /XLM · Route available/);
-  assert.match(text(tree), /USTRY · Route unavailable/);
-  const retry = nodes(tree).find(n => n.type === "button" && text(n) === "Refresh missing routes");
-  assert.equal(retry.props.disabled, false);
-  retry.props.onClick();
-  assert.equal(refreshed, true);
-});
-
-
-test("simulated execution requires routes and records only a no-transaction preview", () => {
-  const allocation = { positions: {}, portfolio_value_usdc: 100, binding_constraints: [], diagnostics: [] };
-  const h = harness();
-  const props = { allocation, coins: [], routeSymbols: ["XLM"], routes: { XLM: { available: false } } };
-  const button = tree => nodes(tree).find(n => n.type === "button" && text(n).includes("Simulate execution"));
-  assert.equal(button(h.AllocStage(props)).props.disabled, true);
-  props.routes.XLM.available = true;
-  const ready = button(h.AllocStage(props));
-  assert.equal(ready.props.disabled, false);
-  ready.props.onClick();
-  assert.equal(h.state.at(-1), true);
-  const completed = harness([true]).AllocStage(props);
-  assert.match(text(completed), /Simulation complete/);
-  assert.match(text(completed), /no transactions submitted, and no funds moved/);
-  assert.ok(!text(completed).includes("settled"));
+  const tree = h.panel({ allocationCoins: [{ tk: "XLM", allocationSupported: true }, { tk: "ETESIA-TF", allocationSupported: false }] });
+  assert.equal(buildButton(tree).props.disabled, true);
+  assert.match(text(tree), /Allocation API update required for ETESIA-TF/);
+  assert.ok(!text(tree).includes("Analytics only in this preview"));
 });
