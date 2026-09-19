@@ -38,6 +38,7 @@ function harness(initialState = []) {
         return [state[index], (next) => { state[index] = typeof next === "function" ? next(state[index]) : next; }];
       },
     },
+    "@/components/AllocationSimulation": () => null,
     "@/stores/useStellarWalletStore": (selector) => selector(wallet),
     "@/stores/useBalanceStore": (selector) => selector(balances),
     "@/stores/usePriceStore": (selector) => selector(prices),
@@ -245,10 +246,14 @@ test("funding risk-cap slider displays its percentage and updates the calculator
 test("Working basket shows pairwise correlation and buy-and-hold Sharpe with honest empty states", () => {
   const h = harness();
   const props = { basket: ["XLM", "ETESIA-TF"], coins: [], analyticsLoading: false,
-    analytics: { average_pairwise_correlation: -.1234, sharpe_1y: 1.2345, window_end: "2026-09-19T00:00:00Z" } };
+    analytics: { average_pairwise_correlation: -.1234, sharpe_1y: 1.2345, return_1y: .12, max_drawdown: .08, calmar: 1.5, window_end: "2026-09-19T00:00:00Z" } };
   const rendered = text(h.Sidecar(props));
   assert.match(rendered, /Avg. pairwise correlation-0.12/);
   assert.match(rendered, /Basket SR · 1Y1.23/);
+  assert.match(rendered, /Return · 1Y12.00%/);
+  assert.match(rendered, /Max drawdown · 1Y-8.00%/);
+  assert.match(rendered, /Calmar · 1Y1.50/);
+  assert.ok(!rendered.includes("Cash reserve assets are selected"));
   assert.match(rendered, /buy and hold/);
   assert.match(rendered, /simulated vault returns/);
   assert.match(rendered, /Data through close · 9\/18\/2026/);
@@ -361,4 +366,22 @@ test("final allocation exposes missing-route retry without hiding model targets"
   assert.equal(retry.props.disabled, false);
   retry.props.onClick();
   assert.equal(refreshed, true);
+});
+
+
+test("simulated execution requires routes and records only a no-transaction preview", () => {
+  const allocation = { positions: {}, portfolio_value_usdc: 100, binding_constraints: [], diagnostics: [] };
+  const h = harness();
+  const props = { allocation, coins: [], routeSymbols: ["XLM"], routes: { XLM: { available: false } } };
+  const button = tree => nodes(tree).find(n => n.type === "button" && text(n).includes("Simulate execution"));
+  assert.equal(button(h.AllocStage(props)).props.disabled, true);
+  props.routes.XLM.available = true;
+  const ready = button(h.AllocStage(props));
+  assert.equal(ready.props.disabled, false);
+  ready.props.onClick();
+  assert.equal(h.state.at(-1), true);
+  const completed = harness([true]).AllocStage(props);
+  assert.match(text(completed), /Simulation complete/);
+  assert.match(text(completed), /no transactions submitted, and no funds moved/);
+  assert.ok(!text(completed).includes("settled"));
 });

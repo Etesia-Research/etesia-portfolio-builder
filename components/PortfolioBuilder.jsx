@@ -6,6 +6,7 @@ import { initWalletKit, connectWallet, disconnectWallet } from "@/components/ste
 import usePriceStore from "@/stores/usePriceStore";
 import { fundingValue, referenceValue } from "@/lib/prices";
 import { fetchUniverse, quantRequest, checkRoute } from "@/lib/quant";
+import AllocationSimulation from "@/components/AllocationSimulation";
 import useBalanceStore from "@/stores/useBalanceStore";
 import { fetchHoldings } from "@/lib/balances";
 
@@ -34,6 +35,14 @@ const fmtDate = (stamp) => stamp ? new Date(stamp).toLocaleDateString('en-US', {
 // Stored daily closes use the following midnight UTC as their boundary.
 const fmtCloseDate = (stamp) => stamp ? fmtDate(new Date(new Date(stamp).getTime() - 86400000)) : 'unavailable';
 const metricNote = (metric, error) => error || metric?.reason || (metric ? `${metric.simulated ? 'Simulated · ' : ''}${metric.stale ? 'Stale · ' : ''}Data through close · ${fmtCloseDate(metric.window_end)}` : 'Loading…');
+
+const fmtPercent = value => value == null ? '—' : `${(value * 100).toFixed(2)}%`;
+
+function ProductLogo({ coin, className = 'gl' }) {
+  return <div className={className} style={{ background: coin?.logo ? '#f3eee3' : coin?.color }} aria-hidden="true">
+    {coin?.logo ? <img src={coin.logo} alt="" className="product-logo" /> : coin?.glyph}
+  </div>;
+}
 
 // ---------- Components ----------
 
@@ -151,7 +160,7 @@ function CoinCard({ coin, selected, correlation, correlationLoading, hasBasket, 
   const corr = correlation?.status === 'available' ? correlation.correlation : null;
   return (
     <button type="button" className={`coin-card ${selected ? 'selected' : ''}`} onClick={onToggle} data-tk={coin.tk} aria-pressed={selected}>
-      <div className="top"><div className="glyph" style={{ background: coin.color }}>{coin.glyph}</div><div className="check">{selected ? '✓' : ''}</div></div>
+      <div className="top"><ProductLogo coin={coin} className="glyph" /><div className="check">{selected ? '✓' : ''}</div></div>
       <div className="name-line"><div className="tk">{coin.tk}</div><div className="nm">{coin.name}</div></div>
       {coin.simulated && <div className="product-status">Under construction · simulated returns</div>}
       {!coin.simulated && !coin.allocationSupported && <div className="product-status">Analytics only · allocation API update required</div>}
@@ -180,7 +189,7 @@ function Sidecar({ basket, coins, removeFromBasket, analytics, analyticsLoading 
     <h4>Working basket — {basket.length} {basket.length === 1 ? 'asset' : 'assets'}</h4>
     {!basket.length && <div className="empty">An empty page awaits the first pick.</div>}
     {coins.filter(c => basket.includes(c.tk)).map(c => <div className="basket-row" key={c.tk}>
-      <div className="gl" style={{ background: c.color }}>{c.glyph}</div>
+      <ProductLogo coin={c} />
       <div><div className="tk">{c.tk}</div><div className="data-note">{c.simulated ? 'Under construction · simulated' : c.name}</div></div>
       <button className="rm" aria-label={`Remove ${c.tk}`} onClick={() => removeFromBasket(c.tk)}>×</button>
     </div>)}
@@ -189,12 +198,15 @@ function Sidecar({ basket, coins, removeFromBasket, analytics, analyticsLoading 
       {!analyticsLoading && analytics?.pairwise_reason && <div className="data-note">{analytics.pairwise_reason}</div>}
       <div className="row"><span className="lbl">Basket SR · 1Y</span><span className="val">{analyticsLoading ? '…' : analytics?.sharpe_1y?.toFixed(2) ?? '—'}</span></div>
       {!analyticsLoading && analytics?.sharpe_reason && analytics.sharpe_reason !== analytics.pairwise_reason && <div className="data-note">{analytics.sharpe_reason}</div>}
+      <div className="row"><span className="lbl">Return · 1Y</span><span className="val">{analyticsLoading ? '…' : fmtPercent(analytics?.return_1y)}</span></div>
+      <div className="row"><span className="lbl">Max drawdown · 1Y</span><span className="val">{analyticsLoading ? '…' : fmtPercent(analytics?.max_drawdown == null ? null : -analytics.max_drawdown)}</span></div>
+      <div className="row"><span className="lbl">Calmar · 1Y</span><span className="val">{analyticsLoading ? '…' : analytics?.calmar?.toFixed(2) ?? '—'}</span></div>
+      {!analyticsLoading && analytics?.calmar_reason && analytics.calmar_reason !== analytics.pairwise_reason && <div className="data-note">{analytics.calmar_reason}</div>}
       <div className="data-note">Equal initial weights · buy and hold · USD · 0% risk-free rate. Correlation averages distinct product pairs.</div>
       <div className="data-note">{analyticsLoading ? 'Calculating basket metrics…' : analytics?.error || (analytics?.window_end ? `Data through close · ${fmtCloseDate(analytics.window_end)}${analytics.stale ? ' · stale data' : ''}` : '')}</div>
     </div>}
     <p className="data-note">ρ compares each product with this basket over one year, using equal capital at the start of the year and fixed quantities thereafter.</p>
     {basket.includes('ETESIA-TF') && <p className="data-note">Basket metrics include simulated vault returns. The vault is under construction and is excluded from allocation.</p>}
-    <p className="data-note">Cash reserve assets are selected in their own step below. Allocation uses products with daily history; the calculator retains its caps and buffers.</p>
   </aside>;
 }
 
@@ -255,7 +267,7 @@ function FundingPanel({ coins, allocationCoins, excludedCoins, selectedHolding, 
             const held = holdingOf(h.tk);
             return (
               <div key={h.tk} className={`holding-row ${isSel ? 'selected' : ''}`} onClick={() => setSelectedHolding(h.tk)}>
-                <div className="gl" style={{ background: h.color }}>{h.glyph}</div>
+                <ProductLogo coin={h} />
                 <div>
                   <div className="tk">{h.tk}</div>
                   <div className="sub">{h.name}</div>
@@ -323,6 +335,8 @@ function FundingPanel({ coins, allocationCoins, excludedCoins, selectedHolding, 
 
 
 function AllocStage({ allocation, coins, onReset, routeSymbols = [], routes = {}, checkingRoutes, onRefreshRoutes }) {
+  const [executionSimulated, setExecutionSimulated] = useState(false);
+  const routesReady = !checkingRoutes && routeSymbols.every(tk => routes[tk]?.available);
   const ordered = Object.entries(allocation.positions || {}).filter(([, p]) => p.allocation_fraction > 0).sort((a, b) => b[1].allocation_fraction - a[1].allocation_fraction);
   const coinFor = (id) => coins.find(c => c.id === id.replace('_buffer', '').replace('_reserve', ''));
   const label = (id) => id === 'xlm_buffer' ? 'XLM fee buffer' : id.endsWith('_reserve') ? `${id.split('_')[0].toUpperCase()} reserve` : id === 'usdc' ? 'USDC buffer' : RESERVE_IDS.has(id) ? `${id.toUpperCase()} reserve` : id.toUpperCase();
@@ -335,7 +349,7 @@ function AllocStage({ allocation, coins, onReset, routeSymbols = [], routes = {}
     <div className="alloc-table">
       <div className="alloc-row head"><div></div><div>Position</div><div>Allocation</div><div>USDC</div><div>Units</div><div>Reference mark (USDC)</div></div>
       {ordered.map(([id, position]) => <div className="alloc-row" key={id}>
-        <div className="gl" style={{ background: coinFor(id)?.color }}>{coinFor(id)?.glyph}</div>
+        <ProductLogo coin={coinFor(id)} />
         <div className="nm"><div className="tk">{label(id)}</div><div className="full">{coinFor(id)?.name}</div></div>
         <div className="pct">{(position.allocation_fraction * 100).toFixed(1)}%</div>
         <div className="num">{position.notional_usdc.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
@@ -348,6 +362,7 @@ function AllocStage({ allocation, coins, onReset, routeSymbols = [], routes = {}
       <div><div className="lbl">Allocated sleeve σ · annual</div><div className="val">{allocation.allocated_sleeve_volatility == null ? '—' : `${(allocation.allocated_sleeve_volatility * 100).toFixed(2)}%`}</div></div>
     </div><button className="btn ghost" onClick={onReset}>← Revise basket</button></div>
     <p className="data-note">Simulated allocation · reference quantities, no funds moved. The volatility measure applies to the selected sleeve. Reserves and buffers are shown separately.</p>
+    <AllocationSimulation allocation={allocation} />
     <div className="execution-routes">
       <h4>Trading routes</h4>
       <p className="data-note">Soroswap availability for the funding asset and allocated positions. Routes are needed for trading; allocation is already calculated. Execution remains simulated.</p>
@@ -355,6 +370,11 @@ function AllocStage({ allocation, coins, onReset, routeSymbols = [], routes = {}
       {!routeSymbols.length && <p className="data-note">No swaps required.</p>}
       {routeSymbols.some(tk => !routes[tk]?.available) && <button className="btn ghost" disabled={checkingRoutes} onClick={onRefreshRoutes}>{checkingRoutes ? 'Checking routes…' : 'Refresh missing routes'}</button>}
       <p className="data-note">Availability uses a 1 USDC buy/sell probe. Actual trades need fresh quotes for their amounts.</p>
+    </div>
+    <div className="simulated-execution">
+      <button className="btn lg" disabled={!routesReady || executionSimulated} onClick={() => setExecutionSimulated(true)}><span className="dot" />{executionSimulated ? 'Execution simulated' : 'Simulate execution'}<span>→</span></button>
+      {!routesReady && <p className="data-note">Available routes are required for the execution preview. Refresh any missing routes above.</p>}
+      {executionSimulated && <div role="status" className="simulation-receipt"><strong>Simulation complete</strong><p>Previewed {ordered.length} target positions for {allocation.portfolio_value_usdc.toLocaleString(undefined, { maximumFractionDigits: 2 })} USDC using the reference quantities shown above. No wallet signature requested, no transactions submitted, and no funds moved.</p><p className="data-note">This preview does not model fill prices, fees or slippage.</p></div>}
     </div>
     {allocation.binding_constraints.length > 0 && <p className="data-note">Model limits: {allocation.binding_constraints.map(c => c.replaceAll('_', ' ')).join(' · ')}</p>}
     {allocation.diagnostics.length > 0 && <p className="data-note">{allocation.diagnostics.join(' · ')}</p>}

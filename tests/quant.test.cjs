@@ -85,6 +85,11 @@ test("proxy restricts endpoints, keeps credentials server-side, and sanitizes up
   assert.equal((await proxy.POST(basketRequest, context("basket/analytics"))).status, 200);
   assert.equal(calls.at(-1).url, "https://quant.example.test/v1/basket/analytics");
   assert.deepEqual(JSON.parse(calls.at(-1).options.body), { basket: ["xlm", "eth"] });
+  const simulationRequest = new Request("http://localhost/api/quant/builder/simulation", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ weights: { xlm: 1 }, market_snapshot_id: "a".repeat(64) }),
+  });
+  assert.equal((await proxy.POST(simulationRequest, context("builder/simulation"))).status, 200);
+  assert.equal(calls.at(-1).url, "https://quant.example.test/v1/builder/simulation");
   for (const endpoint of ["status", "../status", "tokens/bogus/sharpe", "https://example.org"]) {
     assert.equal((await proxy.GET(new Request("http://localhost"), context(endpoint))).status, 404);
   }
@@ -111,4 +116,13 @@ test("EURC reserve routes use Circle's mainnet Stellar asset", async () => {
   assert.equal(calls[0].asset_out, eurc.contract);
   assert.equal(calls[1].asset_in, eurc.contract);
   assert.equal(calls[1].asset_out, assets.ASSET_CONTRACTS.USDC.contract);
+});
+
+
+test("allocation simulation merges buffers and reserve positions without omitting capital", () => {
+  const quant = load("lib/quant.ts", { "@/lib/assets": assets });
+  const positions = Object.fromEntries(Object.entries({ xlm: .2, xlm_buffer: .025, usdc: .025, usdc_reserve: .25, ustry: .5, btc: 0 })
+    .map(([id, allocation_fraction]) => [id, { allocation_fraction }]));
+  assert.deepEqual(quant.simulationWeights(positions), { xlm: .225, usdc: .275, ustry: .5 });
+  assert.equal(Object.values(quant.simulationWeights(positions)).reduce((sum, weight) => sum + weight, 0), 1);
 });

@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 const TOKEN = "(?:xlm|aqua|eth|btc|shx|usdc|eurc|ustry|etesia-tf)";
 const GET_PATH = new RegExp(`^(tokens|market-caps|tokens/${TOKEN}/(?:last-close|sharpe))$`);
-const POST_PATH = /^(correlations|basket\/analytics|builder\/targets|quotes)$/;
+const POST_PATH = /^(correlations|basket\/analytics|builder\/(?:targets|simulation)|quotes)$/;
 
 async function proxy(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
   const { path } = await context.params;

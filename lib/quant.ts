@@ -13,7 +13,7 @@ export type Metric = {
 };
 export type Coin = {
   id: string; tk: string; name: string; simulated: boolean; allocationSupported: boolean;
-  color: string; glyph: string; mcap: number | null;
+  color: string; glyph: string; logo: string | null; mcap: number | null;
   marketCap: { basis?: string; stale?: boolean; as_of?: string; reason?: string };
   sharpe: number | null; analytics: Metric | null; analyticsError: string | null;
 };
@@ -65,7 +65,7 @@ export async function fetchUniverse(signal?: AbortSignal) {
     const [color, glyph] = palette[token.symbol] ?? ["#5b6470", token.symbol[0]];
     return { id: token.id, tk: token.symbol, name: token.name, simulated: token.simulated,
       allocationSupported: token.allocation_supported ?? ["xlm", "aqua", "eth", "btc"].includes(token.id),
-      color, glyph, mcap: cap?.market_cap_usd ?? null, marketCap: cap ?? { reason: "Market cap unavailable" },
+      color, glyph, logo: ({ xlm: "/logos/xlm.svg", aqua: "/logos/aqua.png", eth: "/logos/eth.svg", btc: "/logos/btc.png", shx: "/logos/shx.png", "etesia-tf": "/logos/etesia.svg" } as Record<string, string>)[token.id] ?? null, mcap: cap?.market_cap_usd ?? null, marketCap: cap ?? { reason: "Market cap unavailable" },
       sharpe: metric?.status === "available" ? metric.sharpe_1y : null, analytics: metric,
       analyticsError: analytics.status === "rejected" ? "Sharpe unavailable" : null };
   });
@@ -83,4 +83,15 @@ export async function checkRoute(symbol: string, signal?: AbortSignal): Promise<
   } catch {
     return { available: false, reason: "Soroswap route unavailable; refresh missing routes", fetchedAt: null };
   }
+}
+
+
+export function simulationWeights(positions: Allocation["positions"]): Record<string, number> {
+  const weights: Record<string, number> = {};
+  for (const [id, position] of Object.entries(positions ?? {})) {
+    if (position.allocation_fraction <= 0) continue;
+    const token = id.replace(/_(?:buffer|reserve)$/, "");
+    weights[token] = (weights[token] ?? 0) + position.allocation_fraction;
+  }
+  return weights;
 }

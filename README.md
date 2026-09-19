@@ -34,11 +34,24 @@ pnpm exec tsc --noEmit
   Sharpe and basket correlations come from the API. Missing values remain
   unavailable; no static numerical fallback or browser allocation solver exists.
 - Working basket shows average signed pairwise correlation (distinct pairs only)
-  and one-year basket Sharpe from `POST /v1/basket/analytics`. The basket starts
+  and one-year return, Sharpe, maximum drawdown and Calmar together from one
+  `POST /v1/basket/analytics` response. The basket starts
   with equal capital per selected product and holds quantities fixed for one
   year, in USD with a 0% risk-free rate. Funding, reserves and allocator weights
   do not affect these selection metrics. Single-product correlation and missing
   data show an em dash with a reason; simulated vault returns remain labeled.
+- Product icons use locally served official project assets and the supplied
+  Etesia mark; see [logo sources](public/logos/README.md).
+- After allocation, one `POST /v1/builder/simulation` request returns return,
+  Sharpe, max drawdown, Calmar and both portfolio/XLM equity curves. All calculated
+  weights, including buffers and reserves, start invested at the beginning of the
+  trailing year and drift without rebalancing. Both USD curves start at 100;
+  pointer and keyboard controls expose daily values. Today's weights applied to
+  the past are a retrospective illustration, excluding trading costs. Incomplete
+  history or a changed market snapshot shows an explicit unavailable state.
+- **Simulate execution** is restored in the final step. Available routes enable
+  an on-screen preview confirmation using model targets, with no wallet signature,
+  submitted transaction, fake transaction hash or balance mutation.
 - The vault shows **Under construction**. Its Sharpe and correlations use the
   API's simulated return series and report metadata. It has no invented share
   price and cannot receive a Builder allocation.
