@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { produce } from "immer";
 import type { PriceInfo } from "@/lib/prices";
 
-// Live (and static-fallback) prices, refreshed by polling in PortfolioBuilder.
+// Timestamped daily reference closes from the quant API.
 export interface PriceState {
   bySymbol: Record<string, PriceInfo>;
   loading: boolean;

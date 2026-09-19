@@ -9,7 +9,7 @@ const root = path.join(__dirname, "..");
 const source = fs.readFileSync(path.join(root, "components/PortfolioBuilder.jsx"), "utf8");
 // Load the actual component with controlled hooks, stores, and pending requests.
 // Named test exports keep private components out of the production API.
-const compiled = ts.transpileModule(source + "\nexport { FundingPanel, Masthead };", {
+const compiled = ts.transpileModule(source + "\nexport { FundingPanel, Masthead, CashReservePanel, CoinCard, AllocStage };", {
   compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true },
   fileName: "PortfolioBuilder.jsx",
 }).outputText;
@@ -18,19 +18,22 @@ function harness(initialState = []) {
   const wallet = { address: "A", connected: true };
   const balances = { address: "A", byTk: { USDC: 1.2356789 }, lastUpdated: 1, error: null };
   balances.set = (fn) => fn(balances);
-  const prices = { bySymbol: {}, set: () => {} };
+  const prices = { bySymbol: { USDC: { price: 1, ts: "2026-09-19T00:00:00Z", stale: false } }, set: () => {} };
   const effects = [];
   const requests = [];
+  const quantRequests = [];
+  const buildRef = { current: null };
   const intervals = new Map();
   const state = [];
   const imports = {
     react: {
       ...React,
+      useRef: () => buildRef,
       useMemo: (fn) => fn(),
       useEffect: (fn) => effects.push(fn),
       useState: (value) => {
         const index = state.length;
-        state.push(index in initialState ? initialState[index] : value);
+        state.push(index in initialState ? initialState[index] : index === 5 ? [{ id: "usdc", tk: "USDC", name: "USD Coin", mcap: null }] : value);
         return [state[index], (next) => { state[index] = next; }];
       },
     },
@@ -38,7 +41,14 @@ function harness(initialState = []) {
     "@/stores/useBalanceStore": (selector) => selector(balances),
     "@/stores/usePriceStore": (selector) => selector(prices),
     "@/components/stellar/walletKit": { initWalletKit() {} },
-    "@/lib/prices": { fetchLivePrices: async () => ({}) },
+    "@/lib/prices": {
+      referenceValue: (prices, symbol, qty) => prices[symbol]?.price == null ? null : prices[symbol].price * qty,
+      fundingValue: (prices, symbol, qty) => prices[symbol]?.price == null ? null : prices[symbol].price * qty,
+    },
+    "@/lib/quant": {
+      fetchUniverse: async () => ({ coins: [], prices: {}, cashReserveAssets: ["ustry"] }),
+      quantRequest: (endpoint, body, signal) => new Promise((resolve, reject) => quantRequests.push({ endpoint, body, signal, resolve, reject })),
+    },
     "@/lib/balances": {
       fetchHoldings: (address) => new Promise((resolve, reject) => requests.push({ address, resolve, reject })),
     },
@@ -53,9 +63,9 @@ function harness(initialState = []) {
   const render = () => { effects.length = 0; state.length = 0; return mod.exports.default(); };
   const poll = () => { render(); return effects.at(-1)(); };
   const panel = (overrides = {}) => mod.exports.FundingPanel({
-    basket: ["XLM", "USDC"], selectedHolding: "USDC", amount: "1", ...overrides,
+    coins: [{ tk: "USDC", name: "USD Coin" }], allocationCoins: [{ tk: "XLM" }], excludedCoins: [], reserveValid: true, budget: "20", selectedHolding: "USDC", amount: "1", ...overrides,
   });
-  return { ...mod.exports, wallet, balances, requests, intervals, state, render, poll, panel };
+  return { ...mod.exports, wallet, balances, requests, quantRequests, buildRef, effects, intervals, state, render, poll, panel };
 }
 
 function nodes(node) {
@@ -68,7 +78,7 @@ const buildButton = (tree) => nodes(tree).find((node) => node.type === "button" 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 test("account switch hides old holdings before the effect and clears allocation state", async () => {
-  const h = harness([["XLM", "USDC"], "USDC", "1", "allocated", [0.5, 0.5], false]);
+  const h = harness([["XLM", "USDC"], "USDC", "1", "allocated", null, []]);
   h.wallet.address = "B";
   assert.equal(buildButton(h.panel()).props.disabled, true);
   assert.ok(!text(h.panel()).includes("1.2357"));
@@ -79,7 +89,7 @@ test("account switch hides old holdings before the effect and clears allocation 
   assert.deepEqual(h.balances.byTk, {});
   assert.equal(h.balances.lastUpdated, null);
   assert.equal(h.balances.address, "B");
-  assert.deepEqual(h.state.slice(1, 5), [null, "", "select", []]);
+  assert.deepEqual(h.state.slice(1, 5), [null, "", "select", null]);
   h.requests[0].reject(new Error("Horizon 503"));
   await flush();
   assert.deepEqual(h.balances.byTk, {});
@@ -149,4 +159,80 @@ test("refresh errors remain visible with holdings and recovery enables construct
   assert.equal(h.balances.error, null);
   assert.ok(!text(h.panel()).includes("stale"));
   assert.equal(buildButton(h.panel()).props.disabled, false);
+});
+
+
+test("reserve selector rejects missing EURC data and toggles equal reserve selections", () => {
+  const h = harness();
+  let selected;
+  const tree = h.CashReservePanel({ selected: ["ustry"], onChange: value => { selected = value; },
+    supported: ["usdc", "ustry"], coins: [{ id: "usdc", tk: "USDC" }, { id: "ustry", tk: "USTRY" }],
+    routes: { USDC: { available: true }, USTRY: { available: true } } });
+  const inputs = nodes(tree).filter(node => node.type === "input");
+  assert.deepEqual(inputs.map(node => node.props.checked), [false, false, true]);
+  assert.equal(inputs[1].props.disabled, true);
+  inputs[0].props.onChange();
+  assert.deepEqual(selected, ["ustry", "usdc"]);
+  assert.match(text(tree), /Daily data unavailable/);
+  assert.match(text(tree), /100% of reserve/);
+});
+
+test("EURC reserve selection requires catalog support and a checked route", () => {
+  const h = harness();
+  let selected;
+  const props = { selected: ["usdc"], onChange: value => { selected = value; },
+    supported: ["usdc", "eurc", "ustry"], coins: [{ id: "usdc", tk: "USDC" }, { id: "eurc", tk: "EURC" }],
+    routes: { USDC: { available: true }, EURC: { available: true } } };
+  const inputs = nodes(h.CashReservePanel(props)).filter(node => node.type === "input");
+  assert.equal(inputs[1].props.disabled, false);
+  inputs[1].props.onChange();
+  assert.deepEqual(selected, ["usdc", "eurc"]);
+  const split = h.CashReservePanel({ ...props, selected });
+  assert.equal((text(split).match(/50% of reserve/g) || []).length, 2);
+  for (const override of [{ supported: ["usdc"] }, { routes: { USDC: { available: true } } }]) {
+    const unavailable = nodes(h.CashReservePanel({ ...props, ...override })).filter(node => node.type === "input");
+    assert.equal(unavailable[1].props.disabled, true);
+  }
+});
+
+test("reserve products are absent from the initial product selection", () => {
+  const state = [];
+  state[5] = ["xlm", "usdc", "ustry", "eurc", "etesia-tf"].map(id => ({ id, tk: id.toUpperCase() }));
+  const h = harness(state);
+  const cards = nodes(h.render()).filter(node => node.type === h.CoinCard);
+  assert.deepEqual(cards.map(node => node.props.coin.id), ["xlm", "etesia-tf"]);
+});
+
+test("allocation requests carry selected products and reserves, and cancelled responses are ignored", async () => {
+  const state = [];
+  state[0] = ["XLM", "ETESIA-TF"];
+  state[1] = "USDC";
+  state[2] = "1";
+  state[3] = "select";
+  state[5] = [{ id: "xlm", tk: "XLM", allocationSupported: true }, { id: "usdc", tk: "USDC" },
+    { id: "ustry", tk: "USTRY" }, { id: "etesia-tf", tk: "ETESIA-TF", simulated: true }];
+  state[9] = { XLM: { available: true }, USDC: { available: true }, USTRY: { available: true } };
+  state[14] = ["usdc", "ustry"];
+  state[15] = ["usdc", "ustry"];
+  const h = harness(state);
+  const panel = nodes(h.render()).find(node => node.type === h.FundingPanel);
+  const pending = panel.props.onBuild();
+  assert.deepEqual(h.quantRequests[0].body, { assets: ["xlm"], portfolio_value_usdc: 1, annual_volatility_budget: .25, cash_reserves: ["usdc", "ustry"] });
+  h.buildRef.current.abort();
+  h.quantRequests[0].resolve({ status: "valid", positions: { xlm: {} } });
+  await pending;
+  assert.equal(h.state[4], null);
+  assert.equal(h.state[3], "select");
+});
+
+
+test("funding risk-cap slider displays its percentage and updates the calculator budget", () => {
+  const h = harness();
+  let budget;
+  const tree = h.panel({ budget: "25", setBudget: value => { budget = value; } });
+  const slider = nodes(tree).find(node => node.type === "input" && node.props.type === "range");
+  assert.equal(slider.props.value, "25");
+  assert.equal(slider.props["aria-valuetext"], "25% annual volatility");
+  slider.props.onChange({ target: { value: "35" } });
+  assert.equal(budget, "35");
 });

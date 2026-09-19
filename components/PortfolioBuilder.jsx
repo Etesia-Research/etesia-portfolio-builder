@@ -1,103 +1,37 @@
 "use client";
 
-// Ported verbatim from the bundled Etesia builder (etesia-ui-extracted/App.jsx).
-// Only changes vs the original: "use client"; React globals -> ES imports; the
-// coin/corr data is imported statically instead of read from <script> tags via
-// document.getElementById (so it works without the browser DOM); the App
-// component is the default export wrapped in <div id="root">; the
-// ReactDOM.createRoot(...) bootstrap is removed (Next mounts it).
-//
-// Risk-model inputs (vol, sharpe, corr) are STATIC research inputs and the
-// risk-parity solver below is byte-for-byte identical to the original. Live
-// wiring: wallet (Step 3), Horizon balances (Step 4), Soroswap prices (Step 5).
-// The `holding` field in coin-data.json is the bundle's sample data and is no
-// longer read — holdings come from useBalanceStore (real Horizon balances).
-
-import { useState, useMemo, useEffect } from "react";
-import COINS from "@/data/coin-data.json";
-import CORR from "@/data/corr-data.json";
+import { useState, useMemo, useEffect, useRef } from "react";
 import useStellarWalletStore from "@/stores/useStellarWalletStore";
 import { initWalletKit, connectWallet, disconnectWallet } from "@/components/stellar/walletKit";
 import usePriceStore from "@/stores/usePriceStore";
-import { fetchLivePrices } from "@/lib/prices";
+import { fundingValue, referenceValue } from "@/lib/prices";
+import { fetchUniverse, quantRequest, checkRoute } from "@/lib/quant";
 import useBalanceStore from "@/stores/useBalanceStore";
 import { fetchHoldings } from "@/lib/balances";
 
 const EMPTY_HOLDINGS = {};
-const COIN_BY_TK = Object.fromEntries(COINS.map(c => [c.tk, c]));
+const RESERVE_IDS = new Set(['usdc', 'eurc', 'ustry']);
+
 
 // Existing truncation style, e.g. GA7Q…3K2M (4 + … + 4).
 const truncateAddr = (a) => (a && a.length > 9 ? `${a.slice(0, 4)}…${a.slice(-4)}` : a);
 
-// Live Soroswap price where reliable (store), else the static research price.
-const priceOf = (bySymbol, tk) => bySymbol[tk]?.price ?? COIN_BY_TK[tk].price;
-
 const fmtMcap = (n) => {
+  if (n == null || !Number.isFinite(n)) return "—";
   if (n >= 1e9) return `$${(n/1e9).toFixed(2)}B`;
   if (n >= 1e6) return `$${(n/1e6).toFixed(1)}M`;
   if (n >= 1e3) return `$${(n/1e3).toFixed(0)}K`;
   return `$${n.toFixed(0)}`;
 };
 const fmtUsd = (n, dp=2) => {
+  if (n == null || !Number.isFinite(n)) return "—";
   if (n >= 1e6) return `$${(n/1e6).toFixed(2)}M`;
   if (n >= 1e3) return `$${(n/1e3).toFixed(2)}K`;
   return `$${n.toLocaleString(undefined, {minimumFractionDigits: dp, maximumFractionDigits: dp})}`;
 };
-const fmtUsdK = (n) => n >= 1000 ? `$${(n/1000).toFixed(1)}K` : `$${n.toFixed(0)}`;
-const sharpeColor = (s) => s >= 1.0 ? 'good' : s >= 0.3 ? '' : s >= 0 ? 'warn' : 'bad';
 const corrColor = (c) => c < 0.15 ? 'good' : c < 0.45 ? 'warn' : 'bad';
-
-// ---------- Risk parity solver (ERC) ----------
-function riskParity(tickers) {
-  const n = tickers.length;
-  if (n === 0) return [];
-  if (n === 1) return [1];
-  const vols = tickers.map(t => COIN_BY_TK[t].vol);
-  const cov = tickers.map((ti, i) =>
-    tickers.map((tj, j) => CORR[ti][tj] * vols[i] * vols[j])
-  );
-  let w = Array(n).fill(1/n);
-  for (let iter = 0; iter < 200; iter++) {
-    const mwij = w.map((_, i) => w.reduce((s, wj, j) => s + wj * cov[i][j], 0));
-    const portVar = w.reduce((s, wi, i) => s + wi * mwij[i], 0);
-    const portVol = Math.sqrt(portVar);
-    const rc = w.map((wi, i) => wi * mwij[i] / portVol);
-    const target = portVol / n;
-    const newW = w.map((wi, i) => Math.max(1e-6, wi * target / Math.max(rc[i], 1e-8)));
-    const sumW = newW.reduce((s, x) => s + x, 0);
-    const wNorm = newW.map(x => x/sumW);
-    const delta = wNorm.reduce((s, x, i) => s + Math.abs(x - w[i]), 0);
-    w = wNorm;
-    if (delta < 1e-7) break;
-  }
-  return w;
-}
-
-// avg correlation of a new candidate vs current basket (excluding stables for cleanliness)
-function avgCorrelation(ticker, basket) {
-  if (!basket.length) return null;
-  const sum = basket.reduce((s, b) => s + Math.abs(CORR[ticker][b]), 0);
-  return sum / basket.length;
-}
-
-function portfolioVol(tickers, weights) {
-  if (!tickers.length) return 0;
-  const vols = tickers.map(t => COIN_BY_TK[t].vol);
-  let v = 0;
-  for (let i = 0; i < tickers.length; i++) {
-    for (let j = 0; j < tickers.length; j++) {
-      v += weights[i] * weights[j] * vols[i] * vols[j] * CORR[tickers[i]][tickers[j]];
-    }
-  }
-  return Math.sqrt(Math.max(0, v));
-}
-
-function portfolioSharpe(tickers, weights) {
-  // weighted avg sharpe penalised slightly by diversification (informal proxy)
-  if (!tickers.length) return 0;
-  const w = weights.reduce((s, wi, i) => s + wi * COIN_BY_TK[tickers[i]].sharpe, 0);
-  return w;
-}
+const fmtDate = (stamp) => stamp ? new Date(stamp).toLocaleDateString('en-US', { timeZone: 'UTC' }) : 'unavailable';
+const metricNote = (metric, error) => error || metric?.reason || (metric ? `${metric.simulated ? 'Simulated · ' : ''}${metric.stale ? 'Stale · ' : ''}year ending ${fmtDate(metric.window_end)}` : 'Loading…');
 
 // ---------- Components ----------
 
@@ -106,10 +40,11 @@ function Masthead({ wallet, onDisconnect }) {
   const bySymbol = usePriceStore(s => s.bySymbol);
   const pricesLoading = usePriceStore(s => s.loading);
   const lastUpdated = usePriceStore(s => s.lastUpdated);
-  const liveCount = Object.values(bySymbol).filter(p => p.live).length;
-  const pricesStatus = lastUpdated
-    ? `prices · Soroswap · ${liveCount}/12 live · ${new Date(lastUpdated).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`
-    : pricesLoading ? 'prices · loading…' : 'prices · —';
+  const staleCount = Object.values(bySymbol).filter(p => p.price != null && p.stale).length;
+  const pricesError = usePriceStore(s => s.error);
+  const pricesStatus = pricesError ? 'daily closes · refresh failed'
+    : lastUpdated ? `daily reference closes · ${staleCount ? `${staleCount} stale` : 'quant API'} · refreshed ${new Date(lastUpdated).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}`
+    : pricesLoading ? 'daily closes · loading…' : 'daily closes · —';
   return (
     <header className="masthead">
       <div className="left">
@@ -134,7 +69,7 @@ function Masthead({ wallet, onDisconnect }) {
           <>
             <div className="vol">CONNECTED — {wallet.kind}</div>
             <div style={{ marginTop: 4 }}>{wallet.addr}</div>
-            <div style={{ marginTop: 4 }}>balance: {wallet.balance != null ? fmtUsd(wallet.balance, 2) : '—'}{wallet.balanceError && (wallet.balance != null ? ' · stale (refresh failed)' : ' · balance unavailable')} <span style={{ color: wallet.balanceError ? 'var(--warn)' : 'var(--good)' }}>●</span></div>
+            <div style={{ marginTop: 4 }}>catalog value (daily close): {wallet.balance != null ? fmtUsd(wallet.balance, 2) : '—'}{wallet.balanceError && (wallet.balance != null ? ' · stale (refresh failed)' : ' · balance unavailable')} <span style={{ color: wallet.balanceError ? 'var(--warn)' : 'var(--good)' }}>●</span></div>
             <button onClick={onDisconnect} className="mono" style={{ marginTop: 6, background: 'none', border: 'none', padding: 0, cursor: 'pointer', font: 'inherit', fontSize: 10, letterSpacing: '0.12em', color: 'var(--ink-3)', textDecoration: 'underline' }}>
               ↪ disconnect
             </button>
@@ -150,27 +85,14 @@ function Masthead({ wallet, onDisconnect }) {
   );
 }
 
-function Ticker() {
-  // Soroswap gives spot price only (no 24h change) — show live price + a live/
-  // static marker, never a fabricated %. (was: chg faked from sharpe.)
+function Ticker({ coins }) {
   const bySymbol = usePriceStore(s => s.bySymbol);
-  const lane = (
-    <div className="lane">
-      {COINS.concat(COINS).map((c, i) => {
-        const pd = bySymbol[c.tk];
-        const price = pd?.price ?? c.price;
-        const live = !!pd?.live;
-        return (
-          <span key={i} className="it">
-            <strong>{c.tk}</strong>&nbsp;{fmtUsd(price, price < 1 ? 4 : 2)}&nbsp;
-            <span style={{ color: live ? 'var(--good)' : 'var(--ink-3)', fontSize: 10, letterSpacing: '0.08em' }}>
-              {live ? '● live' : 'static'}
-            </span>
-          </span>
-        );
-      })}
-    </div>
-  );
+  const lane = <div className="lane">{coins.concat(coins).map((c, i) => {
+    const price = bySymbol[c.tk];
+    return <span key={i} className="it"><strong>{c.tk}</strong>&nbsp;{fmtUsd(price?.price, price?.price < 1 ? 4 : 2)}&nbsp;
+      <span style={{ fontSize: 10 }}>{c.simulated ? 'under construction' : price?.price == null ? 'unavailable' : `${price.stale ? 'stale ' : ''}close ${fmtDate(price.ts)}`}</span>
+    </span>;
+  })}</div>;
   return <div className="ticker">{lane}{lane}</div>;
 }
 
@@ -187,11 +109,11 @@ function ConnectScreen({ onConnect, connecting, error }) {
         <div className="stamp">Step 01 — Authentication</div>
         <h3>Begin by <em>connecting</em><br/>your Stellar wallet.</h3>
         <p>
-          Etesia constructs a custodian-free, risk-parity allocation across the asset universe of
-          Soroswap. Trades route through the AMM at execution time — your keys never leave the wallet.
+          Etesia calculates risk-parity allocations from daily market data. Explore the product universe,
+          compare the simulated vault, and preview allocations using your wallet balances.
         </p>
         <p className="mono" style={{ fontSize: 11, color: 'var(--ink-3)', marginTop: 14, letterSpacing: '0.06em' }}>
-          Network · Stellar Mainnet &nbsp;·&nbsp; Router · Soroswap v2.3 &nbsp;·&nbsp; Audited
+          Network · Stellar Mainnet &nbsp;·&nbsp; Execution · Simulated
         </p>
         {connecting && (
           <p className="mono" style={{ fontSize: 11, color: 'var(--ink-2)', marginTop: 12, letterSpacing: '0.04em' }}>
@@ -222,98 +144,74 @@ function ConnectScreen({ onConnect, connecting, error }) {
   );
 }
 
-function CoinCard({ coin, selected, corrToBasket, onToggle, maxMcap }) {
-  const mcapFrac = Math.min(1, Math.log10(coin.mcap) / Math.log10(maxMcap));
+function CoinCard({ coin, selected, correlation, correlationLoading, hasBasket, onToggle, maxMcap, route }) {
+  const mcapFrac = coin.mcap > 0 && maxMcap > 1 ? Math.min(1, Math.log10(coin.mcap) / Math.log10(maxMcap)) : 0;
+  const corr = correlation?.status === 'available' ? correlation.correlation : null;
   return (
-    <div className={`coin-card ${selected ? 'selected' : ''}`} onClick={onToggle} data-tk={coin.tk}>
-      <div className="top">
-        <div className="glyph" style={{ background: coin.color }}>{coin.glyph}</div>
-        <div className="check">{selected ? '✓' : ''}</div>
-      </div>
-      <div className="name-line">
-        <div className="tk">{coin.tk}</div>
-        <div className="nm">{coin.name}</div>
-      </div>
-      {corrToBasket != null && !selected && (
-        <div className={`corr-pill ${corrColor(corrToBasket)}`}>ρ {corrToBasket.toFixed(2)}</div>
-      )}
+    <button type="button" className={`coin-card ${selected ? 'selected' : ''}`} onClick={onToggle} data-tk={coin.tk} aria-pressed={selected}>
+      <div className="top"><div className="glyph" style={{ background: coin.color }}>{coin.glyph}</div><div className="check">{selected ? '✓' : ''}</div></div>
+      <div className="name-line"><div className="tk">{coin.tk}</div><div className="nm">{coin.name}</div></div>
+      {coin.simulated && <div className="product-status">Under construction · simulated returns</div>}
+      {!coin.simulated && <div className="product-status" title={route?.reason}>{coin.id === 'usdc' ? 'Settlement buffer' : !coin.allocationSupported ? 'Analytics only · allocation API update required' : route?.available ? 'Soroswap route available' : route?.reason || 'Checking Soroswap route…'}</div>}
+      {['eth', 'btc'].includes(coin.id) && <div className="data-note">Underlying history · Ultra Capital route</div>}
+      {hasBasket && <div className={`corr-pill ${corr == null ? '' : corrColor(corr)}`} title={metricNote(correlation, correlation?.error)}>
+        {correlationLoading ? 'ρ loading…' : corr == null ? 'ρ unavailable' : `ρ ${corr.toFixed(2)}${correlation.simulated ? ' · simulated' : ''}${correlation.stale ? ' · stale' : ''}`}
+      </div>}
       <div className="stats">
-        <div>
-          <div className="stat-label">Market cap</div>
-          <div className="stat-val">{fmtMcap(coin.mcap)}</div>
-          <div className="bar-track"><div className="bar-fill" style={{ width: `${mcapFrac*100}%` }} /></div>
+        <div title={`${coin.marketCap.reason || ''} ${coin.marketCap.as_of ? fmtDate(coin.marketCap.as_of) : ''}`}>
+          <div className="stat-label">{coin.marketCap.basis === 'issuer_net_value' ? 'Issuer net value' : 'Market cap'}{coin.marketCap.stale && coin.mcap != null ? ' · stale' : ''}</div>
+          <div className="stat-val">{fmtMcap(coin.mcap)}</div><div className="bar-track"><div className="bar-fill" style={{ width: `${mcapFrac * 100}%` }} /></div>
         </div>
-        <div>
-          <div className="stat-label">Sharpe · 1Y</div>
-          <div className={`stat-val ${sharpeColor(coin.sharpe)}`} style={{ color: coin.sharpe < 0 ? 'var(--bad)' : coin.sharpe >= 1 ? 'var(--good)' : 'inherit' }}>
-            {coin.sharpe > 0 ? '+' : ''}{coin.sharpe.toFixed(2)}
-          </div>
-          <div className="bar-track">
-            <div className="bar-fill" style={{
-              width: `${Math.min(100, Math.max(4, (coin.sharpe + 0.5) * 50))}%`,
-              background: coin.sharpe < 0 ? 'var(--bad)' : coin.sharpe >= 1 ? 'var(--good)' : 'var(--accent)'
-            }} />
-          </div>
+        <div title={metricNote(coin.analytics, coin.analyticsError)}>
+          <div className="stat-label">Sharpe · 1Y{coin.simulated ? ' · simulated' : ''}</div>
+          <div className="stat-val">{coin.sharpe == null ? '—' : coin.sharpe.toFixed(2)}</div>
         </div>
       </div>
-    </div>
+      <div className="data-note">{metricNote(coin.analytics, coin.analyticsError)}</div>
+      {hasBasket && !correlationLoading && corr == null && <div className="data-note">{correlation?.reason || correlation?.error || 'Correlation unavailable'}</div>}
+    </button>
   );
 }
 
-function Sidecar({ basket, removeFromBasket }) {
-  // diagnostic metrics
-  const eqWeights = useMemo(() => basket.map(_ => 1/basket.length), [basket]);
-  const vol = useMemo(() => portfolioVol(basket, eqWeights), [basket, eqWeights]);
-  const avgPair = useMemo(() => {
-    if (basket.length < 2) return null;
-    let s = 0, n = 0;
-    for (let i = 0; i < basket.length; i++)
-      for (let j = i+1; j < basket.length; j++) { s += CORR[basket[i]][basket[j]]; n++; }
-    return s/n;
-  }, [basket]);
-
-  return (
-    <aside className="sidecar">
-      <h4>Working basket — {basket.length} {basket.length === 1 ? 'asset' : 'assets'}</h4>
-      {basket.length === 0 && (
-        <div className="empty">An empty page awaits the first pick.</div>
-      )}
-      {basket.length > 0 && basket.map(tk => {
-        const c = COIN_BY_TK[tk];
-        return (
-          <div className="basket-row" key={tk}>
-            <div className="gl" style={{ background: c.color }}>{c.glyph}</div>
-            <div>
-              <div className="tk">{c.tk}</div>
-              <div className="mono" style={{ fontSize: 10, color: 'var(--ink-3)' }}>{c.name}</div>
-            </div>
-            <button className="rm" onClick={() => removeFromBasket(tk)}>×</button>
-          </div>
-        );
-      })}
-      {basket.length >= 1 && (
-        <div className="metrics">
-          <div className="row"><span className="lbl">Equal-weight σ</span><span className="val">{(vol*100).toFixed(1)}%</span></div>
-          <div className="row"><span className="lbl">Avg pairwise ρ</span>
-            <span className="val" style={{ color: avgPair == null ? 'var(--ink-3)' : avgPair < 0.15 ? 'var(--good)' : avgPair < 0.45 ? 'var(--warn)' : 'var(--bad)' }}>
-              {avgPair == null ? '—' : avgPair.toFixed(2)}
-            </span>
-          </div>
-          <div className="row"><span className="lbl">Diversification</span>
-            <span className="val">{basket.length < 2 ? '—' : avgPair < 0.15 ? 'Excellent' : avgPair < 0.45 ? 'Adequate' : 'Concentrated'}</span>
-          </div>
-        </div>
-      )}
-      {basket.length >= 1 && (
-        <div className="mono" style={{ fontSize: 10, color: 'var(--ink-3)', marginTop: 14, lineHeight: 1.6, fontStyle: 'italic', fontFamily: "'Instrument Serif', serif" }}>
-          Pick assets with low ρ to the working basket — the system will guide you toward less correlated candidates.
-        </div>
-      )}
-    </aside>
-  );
+function Sidecar({ basket, coins, removeFromBasket }) {
+  return <aside className="sidecar">
+    <h4>Working basket — {basket.length} {basket.length === 1 ? 'asset' : 'assets'}</h4>
+    {!basket.length && <div className="empty">An empty page awaits the first pick.</div>}
+    {coins.filter(c => basket.includes(c.tk)).map(c => <div className="basket-row" key={c.tk}>
+      <div className="gl" style={{ background: c.color }}>{c.glyph}</div>
+      <div><div className="tk">{c.tk}</div><div className="data-note">{c.simulated ? 'Under construction · simulated' : c.name}</div></div>
+      <button className="rm" aria-label={`Remove ${c.tk}`} onClick={() => removeFromBasket(c.tk)}>×</button>
+    </div>)}
+    <p className="data-note">ρ compares each product with this basket over one year, using equal capital at the start of the year and fixed quantities thereafter.</p>
+    {basket.includes('ETESIA-TF') && <p className="data-note">Basket correlations include simulated vault returns. The vault is under construction and is excluded from allocation.</p>}
+    <p className="data-note">Cash reserve assets are selected in their own step below. Allocation uses products with daily history and a checked Soroswap route; the calculator retains its caps and buffers.</p>
+  </aside>;
 }
 
-function FundingPanel({ wallet, basket, selectedHolding, setSelectedHolding, amount, setAmount, onBuild }) {
+function CashReservePanel({ selected, onChange, supported, routes, coins }) {
+  const options = [
+    { id: 'usdc', name: 'USD Coin' },
+    { id: 'eurc', name: 'Euro Coin' },
+    { id: 'ustry', name: 'USTRY' },
+  ];
+  return <section className="cash-reserve-stage">
+    <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">04</span><h2>Cash reserve</h2><span className="meta">Equal split across selected assets</span></div>
+    <div className="reserve-options">{options.map(option => {
+      const coin = coins.find(c => c.id === option.id);
+      const available = !!coin && supported.includes(option.id) && routes[coin.tk]?.available;
+      const reason = !coin ? 'Daily data unavailable' : !supported.includes(option.id) ? 'Reserve API update required' : !routes[coin.tk]?.available ? 'Awaiting an available route' : 'Daily history available';
+      return <label key={option.id} className={`reserve-option ${selected.includes(option.id) ? 'selected' : ''}`}>
+        <input type="checkbox" checked={selected.includes(option.id)} disabled={!available && !selected.includes(option.id)} onChange={() => onChange(selected.includes(option.id) ? selected.filter(id => id !== option.id) : [...selected, option.id])} />
+        <span><strong>{option.id.toUpperCase()}</strong><span className="data-note">{option.name} · {reason}</span></span>
+        {selected.includes(option.id) && <span className="reserve-share">{(100 / selected.length).toFixed(0)}% of reserve</span>}
+      </label>;
+    })}</div>
+    <p className="data-note">{selected.length ? `Residual cash is split equally across ${selected.map(id => id.toUpperCase()).join(' and ')}. The 2.5% USDC and 2.5% XLM buffers are separate.` : 'Select at least one cash reserve asset to calculate an allocation.'}</p>
+  </section>;
+}
+
+function FundingPanel({ coins, allocationCoins, excludedCoins, selectedHolding, setSelectedHolding, amount, setAmount, onBuild, building, error, budget, setBudget, reserveSelector, reserveValid }) {
+  const COIN_BY_TK = Object.fromEntries(coins.map(c => [c.tk, c]));
   const bySymbol = usePriceStore(s => s.bySymbol);
   // Real onchain holdings (Horizon) — never the static sample data.
   const address = useStellarWalletStore(s => s.address);
@@ -321,17 +219,19 @@ function FundingPanel({ wallet, basket, selectedHolding, setSelectedHolding, amo
   const balLoaded = useBalanceStore(s => s.address === address && s.lastUpdated != null);
   const balError = useBalanceStore(s => s.address === address ? s.error : null);
   const holdingOf = (tk) => balByTk[tk] ?? 0;
-  const holdings = useMemo(() => COINS.filter(c => holdingOf(c.tk) > 0), [balByTk]);
+  const holdings = useMemo(() => coins.filter(c => holdingOf(c.tk) > 0), [coins, balByTk]);
   const selCoin = selectedHolding ? COIN_BY_TK[selectedHolding] : null;
-  const usdAmount = selCoin ? (parseFloat(amount || 0) * priceOf(bySymbol, selCoin.tk)) : 0;
+  const usdAmount = selCoin ? referenceValue(bySymbol, selCoin.tk, Number(amount)) : null;
+  const usdcAmount = selCoin ? fundingValue(bySymbol, selCoin.tk, Number(amount)) : null;
   const maxHolding = selCoin ? holdingOf(selCoin.tk) : 0;
-  const overMax = selCoin && parseFloat(amount || 0) > maxHolding;
-  const canBuild = balLoaded && !balError && selCoin && parseFloat(amount || 0) > 0 && !overMax && basket.length >= 2;
+  const overMax = selCoin && Number(amount) > maxHolding;
+  const canBuild = balLoaded && !balError && selCoin && usdcAmount != null && Number(amount) > 0 && !overMax && allocationCoins.length > 0 && Number(budget) > 0 && Number.isFinite(Number(budget)) && !building && reserveValid;
 
   return (
+    <>
     <section className="funding-panel fade-in">
       <div className="col">
-        <h5>① Capital source — choose a holding to liquidate</h5>
+        <h5>① Capital source — choose a reference holding</h5>
         <div className="holding-list">
           {(balError || holdings.length === 0) && (
             <div style={{ padding: 20, fontFamily: "'Instrument Serif', serif", fontStyle: 'italic', color: balError ? 'var(--bad)' : 'var(--ink-2)' }}>
@@ -351,7 +251,7 @@ function FundingPanel({ wallet, basket, selectedHolding, setSelectedHolding, amo
                   <div className="sub">{h.name}</div>
                 </div>
                 <div className="amt">{held.toLocaleString(undefined, {maximumFractionDigits: 4})}</div>
-                <div className="usd">{fmtUsd(held * priceOf(bySymbol, h.tk))}</div>
+                <div className="usd">{fmtUsd(referenceValue(bySymbol, h.tk, held))}</div>
               </div>
             );
           })}
@@ -383,190 +283,64 @@ function FundingPanel({ wallet, basket, selectedHolding, setSelectedHolding, amo
               ))}
             </div>
             <div className="mono" style={{ fontSize: 12, color: overMax ? 'var(--bad)' : 'var(--ink-2)' }}>
-              ≈ {fmtUsd(usdAmount)}
+              ≈ {fmtUsd(usdAmount)} · daily close
               {overMax && <span> · EXCEEDS BALANCE</span>}
             </div>
           </div>
         </div>
       </div>
 
+      <div className="risk-cap-control">
+        <label htmlFor="risk-cap">Risk cap <span>Annual volatility of allocated products</span></label>
+        <div className="risk-cap-input"><input id="risk-cap" type="range" min="1" max="100" step="1" value={budget} onChange={e => setBudget(e.target.value)} aria-valuetext={`${budget}% annual volatility`} /><output htmlFor="risk-cap">{budget}%</output></div>
+      </div>
+    </section>
+    {reserveSelector}
+    <section className="build-panel">
       <div className="build-cta">
         <div className="note">
-          {basket.length < 2 && <>Select at least <strong>two assets</strong> in the universe above before the optimiser can run.</>}
-          {basket.length >= 2 && !canBuild && <>Choose a source holding and an allocation amount to enable construction.</>}
-          {canBuild && <>Ready to compute. The optimiser will equalise risk contributions across the {basket.length} selected assets.</>}
+          <div>{allocationCoins.length ? `Allocation products: ${allocationCoins.map(c => c.tk).join(', ')}.` : 'Select a product with an available allocation model and Soroswap route.'}</div>
+          {excludedCoins.length > 0 && <div>Analytics only in this preview: {excludedCoins.map(c => c.tk).join(', ')} (vault, settlement asset, unsupported model or unavailable route).</div>}
+          <div>{usdcAmount == null ? 'A fresh source close and matching USDC/USD close are required.' : `Hypothetical capital: ${usdcAmount.toLocaleString(undefined, { maximumFractionDigits: 2 })} USDC, including reserves and buffers.`}</div>
+          {error && <div role="alert" style={{ color: 'var(--bad)' }}>{error}</div>}
         </div>
-        <button className="btn lg" disabled={!canBuild} onClick={onBuild}>
-          <span className="dot" />
-          Build risk-parity portfolio
-          <span>→</span>
-        </button>
+        <button className="btn lg" disabled={!canBuild} onClick={onBuild}><span className="dot" />{building ? 'Calculating…' : 'Build risk-parity portfolio'}<span>→</span></button>
       </div>
     </section>
+    </>
   );
 }
 
-function AllocStage({ basket, weights, source, amount, onTrade, onReset }) {
-  const bySymbol = usePriceStore(s => s.bySymbol);
-  const sourceCoin = COIN_BY_TK[source];
-  const usdTotal = parseFloat(amount) * priceOf(bySymbol, source);
-  const vol = portfolioVol(basket, weights);
-  const sharpe = portfolioSharpe(basket, weights);
 
-  // sort by weight desc for display
-  const ordered = basket
-    .map((tk, i) => ({ tk, w: weights[i] }))
-    .sort((a, b) => b.w - a.w);
-
-  const palette = ['#1d1a14', '#b14820', '#1f5e4a', '#3a4660', '#874422', '#5b3aa0', '#0a3b66', '#b8761a', '#3d6f4a', '#7d2a4a', '#5b6470', '#1f8fc0'];
-
-  const now = new Date();
-  const ts = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')} ${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}`;
-
-  return (
-    <section className="alloc-stage fade-in">
-      <div className="alloc-header">
-        <div>
-          <div className="mono uc" style={{ fontSize: 11, color: 'var(--ink-2)', letterSpacing: '0.2em' }}>Optimisation Result</div>
-          <h3>Equal Risk-Contribution Portfolio</h3>
-        </div>
-        <div className="ts">computed {ts} · solver ERC-Newton · 200 iter max</div>
-      </div>
-
-      <div className="alloc-bar">
-        {ordered.map((o, i) => {
-          const c = COIN_BY_TK[o.tk];
-          const pct = o.w * 100;
-          const thin = pct < 6;
-          return (
-            <div key={o.tk} className={`seg ${thin ? 'thin' : ''}`}
-              style={{ background: palette[i % palette.length], flexBasis: `${pct}%` }} title={`${c.tk} · ${pct.toFixed(1)}%`}>
-              <span className="tk">{c.tk}</span>
-              <span className="pct">{pct.toFixed(1)}%</span>
-            </div>
-          );
-        })}
-      </div>
-
-      <div className="alloc-table">
-        <div className="alloc-row head">
-          <div></div>
-          <div>Asset</div>
-          <div>Weight</div>
-          <div>USD</div>
-          <div>Units</div>
-          <div>Risk · σ contribution</div>
-        </div>
-        {ordered.map((o, i) => {
-          const c = COIN_BY_TK[o.tk];
-          const usd = o.w * usdTotal;
-          const units = usd / priceOf(bySymbol, c.tk);
-          const riskFrac = (c.vol / Math.max(...basket.map(b => COIN_BY_TK[b].vol)));
-          return (
-            <div className="alloc-row" key={o.tk}>
-              <div className="gl" style={{ background: c.color }}>{c.glyph}</div>
-              <div className="nm"><div className="tk">{c.tk}</div><div className="full">{c.name}</div></div>
-              <div className="pct">{(o.w*100).toFixed(1)}<span style={{ fontSize: 16, color: 'var(--ink-2)' }}>%</span></div>
-              <div className="num">{fmtUsdK(usd)}</div>
-              <div className="num">{units.toLocaleString(undefined, { maximumFractionDigits: priceOf(bySymbol, c.tk) < 1 ? 0 : 4 })}</div>
-              <div className="vol-bar"><div style={{ width: `${riskFrac*100}%`, background: palette[i % palette.length] }} /></div>
-            </div>
-          );
-        })}
-      </div>
-
-      <div className="trade-cta">
-        <div className="meta-blob">
-          <div>
-            <div className="lbl">Notional</div>
-            <div className="val">{fmtUsd(usdTotal)}</div>
-          </div>
-          <div>
-            <div className="lbl">Portfolio σ (1Y)</div>
-            <div className="val">{(vol*100).toFixed(1)}%</div>
-          </div>
-          <div>
-            <div className="lbl">Weighted Sharpe</div>
-            <div className="val good">{sharpe.toFixed(2)}</div>
-          </div>
-          <div>
-            <div className="lbl">Route</div>
-            <div className="val">Soroswap AMM</div>
-          </div>
-        </div>
-        <div style={{ display: 'flex', gap: 10 }}>
-          <button className="btn ghost" onClick={onReset}>← Revise basket</button>
-          <button className="btn lg" onClick={onTrade}>
-            <span className="dot" />
-            Execute trades
-            <span>→</span>
-          </button>
-        </div>
-      </div>
-    </section>
-  );
-}
-
-function ExecOverlay({ basket, weights, source, amount, onClose }) {
-  const bySymbol = usePriceStore(s => s.bySymbol);
-  const sourceCoin = COIN_BY_TK[source];
-  const usdTotal = parseFloat(amount) * priceOf(bySymbol, source);
-  const steps = useMemo(() =>
-    basket.map((tk, i) => ({
-      ix: i+1, from: source, to: tk,
-      usd: weights[i] * usdTotal,
-      units: (weights[i] * usdTotal) / priceOf(bySymbol, tk),
-    })).filter(s => s.from !== s.to)
-  , [basket, weights, source, amount, usdTotal, bySymbol]);
-
-  const [running, setRunning] = useState(0); // index currently running
-  const [done, setDone] = useState(false);
-
-  useEffect(() => {
-    if (running >= steps.length) { setDone(true); return; }
-    const t = setTimeout(() => setRunning(running + 1), 1100);
-    return () => clearTimeout(t);
-  }, [running, steps.length]);
-
-  return (
-    <div className="exec-overlay">
-      <div className="exec-card fade-in">
-        <div className="mono uc" style={{ fontSize: 11, color: 'var(--ink-2)', letterSpacing: '0.2em' }}>
-          {done ? 'Preview — Simulated (no broadcast)' : 'Simulating — preview only'}
-        </div>
-        <h3>{done ? 'Portfolio preview constructed.' : 'Simulating routing…'}</h3>
-        <div className="sub">
-          {done ? 'Dry-run preview only — no transaction was signed or broadcast and no funds moved. On-chain execution is not enabled in this build.'
-                : `Previewing a split of ${parseFloat(amount).toLocaleString()} ${source} across ${steps.length} legs (simulation — nothing is broadcast).`}
-        </div>
-        <div className="exec-list">
-          {steps.map((s, i) => {
-            const stat = i < running ? 'done' : i === running ? 'running' : 'pending';
-            return (
-              <div className={`exec-step ${stat}`} key={i}>
-                <div className="ix">LEG {String(s.ix).padStart(2, '0')}</div>
-                <div className="desc">
-                  Swap <span className="tk">{s.from}</span> → <span className="tk">{s.to}</span>
-                  &nbsp;·&nbsp; {fmtUsd(s.usd)} &nbsp;·&nbsp; {s.units.toLocaleString(undefined, { maximumFractionDigits: priceOf(bySymbol, s.to) < 1 ? 0 : 4 })} {s.to}
-                </div>
-                <div className="stat">
-                  {stat === 'pending' && '◌ queued'}
-                  {stat === 'running' && <><span className="spin"></span>simulating</>}
-                  {stat === 'done' && '✓ simulated'}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-        <div className="exec-close">
-          <div className="receipt">{done ? 'simulated — no on-chain transaction' : 'simulating…'}</div>
-          <button className="btn" disabled={!done} onClick={onClose}>
-            {done ? 'Done →' : 'Working…'}
-          </button>
-        </div>
-      </div>
+function AllocStage({ allocation, coins, onReset }) {
+  const ordered = Object.entries(allocation.positions || {}).filter(([, p]) => p.allocation_fraction > 0).sort((a, b) => b[1].allocation_fraction - a[1].allocation_fraction);
+  const coinFor = (id) => coins.find(c => c.id === id.replace('_buffer', '').replace('_reserve', ''));
+  const label = (id) => id === 'xlm_buffer' ? 'XLM fee buffer' : id.endsWith('_reserve') ? `${id.split('_')[0].toUpperCase()} reserve` : id === 'usdc' ? 'USDC buffer' : RESERVE_IDS.has(id) ? `${id.toUpperCase()} reserve` : id.toUpperCase();
+  return <section className="alloc-stage fade-in">
+    <div className="alloc-header"><div><div className="mono uc">Quant allocation preview</div><h3>Equal Risk-Contribution Portfolio</h3></div>
+      <div className="ts">{allocation.model_version} · data through {fmtDate(allocation.market_data_as_of)}</div></div>
+    <div className="alloc-bar">{ordered.map(([id, position]) => <div key={id} className={`seg ${position.allocation_fraction < .06 ? 'thin' : ''}`} style={{ background: coinFor(id)?.color || '#5b6470', flexBasis: `${position.allocation_fraction * 100}%` }} title={`${label(id)} ${(position.allocation_fraction * 100).toFixed(2)}%`}>
+      <span className="tk">{label(id)}</span><span className="pct">{(position.allocation_fraction * 100).toFixed(1)}%</span>
+    </div>)}</div>
+    <div className="alloc-table">
+      <div className="alloc-row head"><div></div><div>Position</div><div>Allocation</div><div>USDC</div><div>Units</div><div>Reference mark (USDC)</div></div>
+      {ordered.map(([id, position]) => <div className="alloc-row" key={id}>
+        <div className="gl" style={{ background: coinFor(id)?.color }}>{coinFor(id)?.glyph}</div>
+        <div className="nm"><div className="tk">{label(id)}</div><div className="full">{coinFor(id)?.name}</div></div>
+        <div className="pct">{(position.allocation_fraction * 100).toFixed(1)}%</div>
+        <div className="num">{position.notional_usdc.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div>
+        <div className="num">{position.quantity.toLocaleString(undefined, { maximumFractionDigits: 7 })}</div>
+        <div className="num">{position.mark_usdc?.toLocaleString(undefined, { maximumSignificantDigits: 6 }) ?? '—'}</div>
+      </div>)}
     </div>
-  );
+    <div className="trade-cta"><div className="meta-blob">
+      <div><div className="lbl">Capital · USDC</div><div className="val">{allocation.portfolio_value_usdc.toLocaleString(undefined, { maximumFractionDigits: 2 })}</div></div>
+      <div><div className="lbl">Allocated sleeve σ · annual</div><div className="val">{allocation.allocated_sleeve_volatility == null ? '—' : `${(allocation.allocated_sleeve_volatility * 100).toFixed(2)}%`}</div></div>
+    </div><button className="btn ghost" onClick={onReset}>← Revise basket</button></div>
+    <p className="data-note">Simulated allocation · reference quantities, no funds moved. The volatility measure applies to the selected sleeve. Reserves and buffers are shown separately.</p>
+    {allocation.binding_constraints.length > 0 && <p className="data-note">Model limits: {allocation.binding_constraints.map(c => c.replaceAll('_', ' ')).join(' · ')}</p>}
+    {allocation.diagnostics.length > 0 && <p className="data-note">{allocation.diagnostics.join(' · ')}</p>}
+  </section>;
 }
 
 // ---------- App ----------
@@ -575,11 +349,21 @@ export default function PortfolioBuilder() {
   const [basket, setBasket] = useState([]);
   const [holding, setHolding] = useState(null);
   const [amount, setAmount] = useState('');
-  const [phase, setPhase] = useState('connect'); // connect | select | allocated | executing | done
-  const [weights, setWeights] = useState([]);
-  const [showBetaNotice, setShowBetaNotice] = useState(false);
+  const [phase, setPhase] = useState('connect');
+  const [allocation, setAllocation] = useState(null);
+  const [coins, setCoins] = useState([]);
+  const [catalogError, setCatalogError] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [refresh, setRefresh] = useState(0);
+  const [routes, setRoutes] = useState({});
+  const [correlations, setCorrelations] = useState({ key: '', values: {} });
+  const [budget, setBudget] = useState('25');
+  const [building, setBuilding] = useState(false);
+  const [buildError, setBuildError] = useState(null);
+  const [cashReserves, setCashReserves] = useState(['ustry']);
+  const [supportedReserves, setSupportedReserves] = useState(['ustry']);
+  const buildRequest = useRef(null);
 
-  // ---- Live wallet (Step 3) — Stellar Wallets Kit via zustand store ----
   const address = useStellarWalletStore(s => s.address);
   const connected = useStellarWalletStore(s => s.connected);
   const walletKind = useStellarWalletStore(s => s.walletKind);
@@ -587,44 +371,89 @@ export default function PortfolioBuilder() {
   const connectError = useStellarWalletStore(s => s.error);
   const setPrices = usePriceStore(s => s.set);
   const setBalances = useBalanceStore(s => s.set);
+  const bySymbol = usePriceStore(s => s.bySymbol);
+  const balByTk = useBalanceStore(s => s.address === address ? s.byTk : EMPTY_HOLDINGS);
+  const balLoaded = useBalanceStore(s => s.address === address && s.lastUpdated != null);
+  const balError = useBalanceStore(s => s.address === address ? s.error : null);
+  const basketKey = [...basket].sort().join(',');
+  const reserveKey = [...cashReserves].sort().join(',');
+  const reserveValid = cashReserves.length > 0 && cashReserves.every(id => supportedReserves.includes(id) && coins.some(c => c.id === id && routes[c.tk]?.available));
+  const candidateCorr = correlations.key === basketKey ? correlations.values : {};
+  const correlationLoading = basket.length > 0 && correlations.key !== basketKey;
+  const products = coins.filter(c => !RESERVE_IDS.has(c.id));
+  const allocationCoins = products.filter(c => basket.includes(c.tk) && c.allocationSupported && routes[c.tk]?.available);
 
-  // Initialise the kit once on mount (browser-only; imports are dynamic).
   useEffect(() => { initWalletKit(); }, []);
-
-  // Advance past the connect screen once a real wallet is connected.
   useEffect(() => {
     if (connected && phase === 'connect') setPhase('select');
   }, [connected, phase]);
 
-  // Live prices (Step 5): poll Soroswap via our server proxy every 45s, with
-  // cleanup. Static research price is used as fallback where Soroswap is
-  // unreliable/missing (see lib/prices.ts).
   useEffect(() => {
-    let cancelled = false;
+    const controller = new AbortController();
     const load = async () => {
+      setLoading(true);
       setPrices(s => { s.loading = true; });
       try {
-        const bySymbol = await fetchLivePrices();
-        if (cancelled) return;
-        setPrices(s => {
-          s.bySymbol = bySymbol; s.loading = false; s.error = null; s.lastUpdated = Date.now();
-        });
-      } catch (e) {
-        if (cancelled) return;
-        setPrices(s => { s.loading = false; s.error = String((e && e.message) || e); });
+        const data = await fetchUniverse(controller.signal);
+        if (controller.signal.aborted) return;
+        setCoins(data.coins);
+        setSupportedReserves(data.cashReserveAssets);
+        setBasket(current => current.filter(tk => data.coins.some(c => c.tk === tk && !RESERVE_IDS.has(c.id))));
+        setCatalogError(null);
+        setPrices(s => { s.bySymbol = data.prices; s.loading = false; s.error = null; s.lastUpdated = Date.now(); });
+        setRoutes({});
+        setLoading(false);
+        for (const coin of data.coins.filter(c => !c.simulated)) {
+          if (controller.signal.aborted) return;
+          const route = await checkRoute(coin.tk, controller.signal);
+          if (!controller.signal.aborted) setRoutes(current => ({ ...current, [coin.tk]: route }));
+        }
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setCatalogError(error.message);
+        setCoins([]);
+        setRoutes({});
+        setLoading(false);
+        setPrices(s => { s.bySymbol = {}; s.loading = false; s.error = error.message; });
       }
     };
     load();
-    const id = setInterval(load, 45000);
-    return () => { cancelled = true; clearInterval(id); };
-  }, [setPrices]);
+    const interval = setInterval(load, 300000);
+    return () => { controller.abort(); clearInterval(interval); };
+  }, [setPrices, refresh]);
 
-  // Live balances (Step 4): poll Horizon for the connected account every 30s,
-  // with cleanup; cleared on disconnect/account switch. Real onchain holdings —
-  // never the sample data shipped with the research bundle.
+  useEffect(() => {
+    const controller = new AbortController();
+    setCorrelations({ key: '', values: {} });
+    if (!basket.length || !coins.length) return () => controller.abort();
+    const timer = setTimeout(async () => {
+      const ids = coins.filter(c => basket.includes(c.tk)).map(c => c.id);
+      const entries = await Promise.all(coins.map(async c => {
+        try {
+          return [c.tk, await quantRequest('correlations', { basket: ids, token: c.id }, controller.signal)];
+        } catch (error) {
+          return [c.tk, { status: 'unavailable', error: error.message }];
+        }
+      }));
+      if (!controller.signal.aborted) setCorrelations({ key: basketKey, values: Object.fromEntries(entries) });
+    }, 200);
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [basketKey, coins]);
+
+  // Invalidate any pending calculation when its inputs or account change.
+  useEffect(() => {
+    buildRequest.current?.abort();
+    setBuilding(false);
+    setBuildError(null);
+    setAllocation(null);
+    setPhase(address ? 'select' : 'connect');
+    return () => buildRequest.current?.abort();
+  }, [address, basketKey, holding, amount, budget, reserveKey]);
+
+  // Keep account ownership checks: a late result must never cross wallets.
   useEffect(() => {
     setBalances(s => { s.address = address; s.byTk = {}; s.loading = false; s.error = null; s.lastUpdated = null; });
-    setHolding(null); setAmount(''); setWeights([]); setPhase(address ? 'select' : 'connect');
+    setHolding(null); setAmount(''); setAllocation(null); setPhase(address ? 'select' : 'connect');
     if (!address) return;
     let cancelled = false;
     const load = async () => {
@@ -632,217 +461,67 @@ export default function PortfolioBuilder() {
       try {
         const byTk = await fetchHoldings(address);
         if (cancelled) return;
-        setBalances(s => {
-          s.byTk = byTk; s.loading = false; s.error = null; s.lastUpdated = Date.now();
-        });
-      } catch (e) {
-        if (cancelled) return;
-        setBalances(s => { s.loading = false; s.error = String((e && e.message) || e); });
+        setBalances(s => { s.byTk = byTk; s.loading = false; s.error = null; s.lastUpdated = Date.now(); });
+      } catch (error) {
+        if (!cancelled) setBalances(s => { s.loading = false; s.error = error.message; });
       }
     };
     load();
-    const id = setInterval(load, 30000);
-    return () => { cancelled = true; clearInterval(id); };
+    const interval = setInterval(load, 30000);
+    return () => { cancelled = true; clearInterval(interval); };
   }, [address, setBalances]);
 
-  // Masthead wallet view (Step 4): balance = Σ real holding × price (live
-  // Soroswap price where reliable, else static research price). "—" until the
-  // first Horizon read lands — never a fabricated number.
-  const balByTk = useBalanceStore(s => s.address === address ? s.byTk : EMPTY_HOLDINGS);
-  const balLoaded = useBalanceStore(s => s.address === address && s.lastUpdated != null);
-  const balError = useBalanceStore(s => s.address === address ? s.error : null);
-  const bySymbol = usePriceStore(s => s.bySymbol);
   const balanceUsd = useMemo(() => {
-    if (!balLoaded) return null;
-    return COINS.reduce((sum, c) => sum + (balByTk[c.tk] ?? 0) * priceOf(bySymbol, c.tk), 0);
-  }, [balLoaded, balByTk, bySymbol]);
-  const wallet = connected && address
-    ? { kind: walletKind || 'Wallet', addr: truncateAddr(address), balance: balanceUsd, balanceError: balError }
-    : null;
+    if (!balLoaded || !coins.length) return null;
+    const values = coins.filter(c => (balByTk[c.tk] ?? 0) > 0).map(c => referenceValue(bySymbol, c.tk, balByTk[c.tk]));
+    return values.some(v => v == null) ? null : values.reduce((sum, value) => sum + value, 0);
+  }, [balLoaded, balByTk, bySymbol, coins]);
+  const wallet = connected && address ? { kind: walletKind || 'Wallet', addr: truncateAddr(address), balance: balanceUsd, balanceError: balError } : null;
+  const maxMcap = Math.max(1, ...coins.map(c => c.mcap ?? 0));
+  const sortedCoins = [...products].sort((a, b) => {
+    const selected = Number(basket.includes(b.tk)) - Number(basket.includes(a.tk));
+    if (selected) return selected;
+    if (basket.length) return (candidateCorr[a.tk]?.correlation ?? 2) - (candidateCorr[b.tk]?.correlation ?? 2);
+    return (b.mcap ?? -1) - (a.mcap ?? -1);
+  });
 
-  const maxMcap = useMemo(() => Math.max(...COINS.map(c => c.mcap)), []);
-
-  const onConnect = (kind) => { connectWallet(kind).catch(() => {}); };
-  const onDisconnect = () => {
-    disconnectWallet();
-    setBasket([]); setHolding(null); setAmount(''); setWeights([]); setPhase('connect');
-  };
-
-  const toggle = (tk) => {
-    setBasket(b => b.includes(tk) ? b.filter(x => x !== tk) : [...b, tk]);
-  };
-  const remove = (tk) => setBasket(b => b.filter(x => x !== tk));
-
-  const onBuild = () => {
-    const w = riskParity(basket);
-    setWeights(w);
-    setPhase('allocated');
-    setTimeout(() => {
-      const el = document.querySelector('.alloc-stage');
-      if (el) el.scrollIntoView ? null : null; // never use scrollIntoView per project rules; rely on layout
-    }, 50);
-  };
-
-  const onTrade = () => setPhase('executing');
-  const onCloseExec = () => setPhase('done');
-  const onReset = () => setPhase('select');
-
-  // candidate correlations to current basket
-  const candidateCorr = useMemo(() => {
-    const m = {};
-    COINS.forEach(c => {
-      m[c.tk] = avgCorrelation(c.tk, basket);
-    });
-    return m;
-  }, [basket]);
-
-  // sort coins: selected first; then by lowest avg corr if basket has picks; else by mcap desc
-  const sortedCoins = useMemo(() => {
-    return [...COINS].sort((a, b) => {
-      const aSel = basket.includes(a.tk), bSel = basket.includes(b.tk);
-      if (aSel && !bSel) return -1;
-      if (!aSel && bSel) return 1;
-      if (basket.length > 0) {
-        return (candidateCorr[a.tk] ?? 1) - (candidateCorr[b.tk] ?? 1);
+  const onBuild = async () => {
+    const capital = fundingValue(bySymbol, holding, Number(amount));
+    if (!reserveValid || !capital || !Number.isFinite(capital) || !allocationCoins.length || !balLoaded || balError || Number(amount) > (balByTk[holding] ?? 0)) return;
+    buildRequest.current?.abort();
+    const controller = new AbortController();
+    buildRequest.current = controller;
+    setBuilding(true); setBuildError(null); setAllocation(null);
+    try {
+      const result = await quantRequest('builder/targets', { assets: allocationCoins.map(c => c.id), portfolio_value_usdc: capital, annual_volatility_budget: Number(budget) / 100, ...(reserveKey === 'ustry' ? {} : { cash_reserves: cashReserves }) }, controller.signal);
+      if (controller.signal.aborted) return;
+      if (result.status !== 'valid' || !result.positions) {
+        setBuildError(`Allocation blocked: ${result.diagnostics?.join(' · ') || 'Required inputs are unavailable'}`);
+        return;
       }
-      return b.mcap - a.mcap;
-    });
-  }, [basket, candidateCorr]);
+      setAllocation({ ...result, owner: address }); setPhase('allocated');
+    } catch (error) {
+      if (!controller.signal.aborted) setBuildError(error.message);
+    } finally {
+      if (!controller.signal.aborted) setBuilding(false);
+    }
+  };
 
-  const lockedClass = phase === 'allocated' || phase === 'executing' || phase === 'done' ? 'locked' : '';
-
-  return (
-    <div id="root">
-      <div style={{ display: 'flex', justifyContent: 'center', margin: '2px 0 16px' }}>
-        <button className="mono" onClick={() => setShowBetaNotice(true)}
-          style={{ display: 'inline-flex', alignItems: 'center', gap: 8, border: '1px solid var(--rule)', borderRadius: 999, padding: '5px 16px', font: 'inherit', fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, letterSpacing: '0.18em', textTransform: 'uppercase', color: 'var(--ink-2)', background: 'var(--paper-2)', cursor: 'pointer' }}>
-          <span style={{ fontSize: 11 }}>✦</span> Platform Beta Testing Notice
-        </button>
-      </div>
-
-      {showBetaNotice && (
-        <div className="exec-overlay" onClick={() => setShowBetaNotice(false)}>
-          <div className="exec-card fade-in" onClick={e => e.stopPropagation()}>
-            <div className="mono uc" style={{ fontSize: 11, color: 'var(--ink-2)', letterSpacing: '0.2em' }}>
-              Platform Beta — Testing Notice
-            </div>
-            <h3>This app is in <em>beta</em>.</h3>
-            <div className="sub">
-              Etesia Portfolio Atelier is in a beta testing phase, provided "as is" and "as
-              available" — it may contain bugs, and figures should not be relied upon for
-              financial decisions. Know what is real and what is not:
-            </div>
-            <div className="mono" style={{ fontSize: 12, lineHeight: 2, margin: '16px 0', borderTop: '1px solid var(--rule)', borderBottom: '1px solid var(--rule)', padding: '12px 0' }}>
-              <div><span style={{ color: 'var(--good)' }}>● live</span> — wallet connection, account balances (Horizon, Stellar mainnet) and spot prices (Soroswap, where marked "live").</div>
-              <div><span style={{ color: 'var(--ink-3)' }}>● static</span> — volatility, Sharpe and correlations are fixed research inputs, not market feeds.</div>
-              <div><span style={{ color: 'var(--warn)' }}>● simulated</span> — trade execution is a dry-run preview. No transaction is signed or broadcast; funds never move.</div>
-            </div>
-            <div className="sub">
-              Your keys stay in your wallet — this app never asks you to sign anything during
-              beta. Nothing here is investment advice; use at your own risk.
-            </div>
-            <div className="exec-close">
-              <div className="receipt">beta — as is · no warranty · not advice</div>
-              <button className="btn" onClick={() => setShowBetaNotice(false)}>I understand →</button>
-            </div>
-          </div>
-        </div>
-      )}
-      <Masthead wallet={wallet} onDisconnect={onDisconnect} />
-      {wallet && <Ticker />}
-
-      {phase === 'connect' && <ConnectScreen onConnect={onConnect} connecting={connecting} error={connectError} />}
-
-      {phase !== 'connect' && (
-        <div className={lockedClass}>
-          {/* Step 2: select coins */}
-          <div className="section-bar">
-            <span className="num-mark">02</span>
-            <h2>Universe — pick the candidates</h2>
-            <span className="meta">
-              {basket.length === 0 && 'Select one asset to begin'}
-              {basket.length === 1 && '1 asset · pick more to evaluate correlation'}
-              {basket.length >= 2 && `${basket.length} assets · ρ-ordered, lowest first`}
-            </span>
-          </div>
-
-          <div className="two-col">
-            <div className="coin-grid">
-              {sortedCoins.map(c => (
-                <CoinCard
-                  key={c.tk}
-                  coin={c}
-                  selected={basket.includes(c.tk)}
-                  corrToBasket={candidateCorr[c.tk]}
-                  onToggle={() => toggle(c.tk)}
-                  maxMcap={maxMcap}
-                />
-              ))}
-            </div>
-            <Sidecar basket={basket} removeFromBasket={remove} />
-          </div>
-
-          {/* Step 3: fund */}
-          <div className="section-bar" style={{ marginTop: 36 }}>
-            <span className="num-mark">03</span>
-            <h2>Funding — capital source & amount</h2>
-            <span className={`meta ${basket.length < 2 ? 'locked' : ''}`}>
-              {basket.length < 2 ? 'Awaiting basket — at least 2 assets required' : 'Ready'}
-            </span>
-          </div>
-
-          <FundingPanel
-            wallet={wallet}
-            basket={basket}
-            selectedHolding={holding}
-            setSelectedHolding={setHolding}
-            amount={amount}
-            setAmount={setAmount}
-            onBuild={onBuild}
-          />
-        </div>
-      )}
-
-      {(phase === 'allocated' || phase === 'executing' || phase === 'done') && (
-        <>
-          <div className="section-bar" style={{ marginTop: 36 }}>
-            <span className="num-mark">04</span>
-            <h2>Allocation — risk-parity weights</h2>
-            <span className="meta">solver · equal-risk-contribution (Newton)</span>
-          </div>
-          <AllocStage
-            basket={basket}
-            weights={weights}
-            source={holding}
-            amount={amount}
-            onTrade={onTrade}
-            onReset={onReset}
-          />
-        </>
-      )}
-
-      {phase === 'executing' && (
-        <ExecOverlay basket={basket} weights={weights} source={holding} amount={amount}
-          onClose={onCloseExec} />
-      )}
-
-      {phase === 'done' && (
-        <div className="fade-in" style={{ marginTop: 24, padding: '18px 22px', border: '1px solid var(--good)', background: 'rgba(31,94,74,0.08)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-          <div>
-            <div className="mono uc" style={{ fontSize: 11, color: 'var(--good)', letterSpacing: '0.2em' }}>Preview complete</div>
-            <div className="serif" style={{ fontSize: 22, marginTop: 2 }}>Risk-parity allocation preview ready — simulation only, no funds moved.</div>
-          </div>
-          <button className="btn ghost" onClick={() => {
-            setBasket([]); setHolding(null); setAmount(''); setWeights([]); setPhase('select');
-          }}>Construct another →</button>
-        </div>
-      )}
-
-      <footer style={{ marginTop: 64, borderTop: '4px double var(--rule)', paddingTop: 18, display: 'flex', justifyContent: 'space-between', fontFamily: "'IBM Plex Mono', monospace", fontSize: 10, color: 'var(--ink-3)', letterSpacing: '0.12em' }}>
-        <span>ETESIA RESEARCH</span>
-        <span>Wallet connect, Horizon balances + Soroswap prices are live (some prices fall back to static; marked per-asset) · vol/σ/ρ are static research inputs · execution is a simulated preview · not advice.</span>
-        <span>portfolio.etesiar.com</span>
-      </footer>
+  return <div id="root">
+    <div className="data-banner">Beta · Quant market data and allocation · Vault returns and execution are simulated</div>
+    <Masthead wallet={wallet} onDisconnect={() => { buildRequest.current?.abort(); disconnectWallet(); setBasket([]); setHolding(null); setAmount(''); setAllocation(null); setPhase('connect'); }} />
+    <Ticker coins={products} />
+    {phase === 'connect' && <ConnectScreen onConnect={kind => connectWallet(kind).catch(() => {})} connecting={connecting} error={connectError} />}
+    <div className={phase === 'allocated' ? 'locked' : ''}>
+      <div className="section-bar"><span className="num-mark">02</span><h2>Universe — pick the candidates</h2><span className="meta">{basket.length ? `${basket.length} selected · lowest correlation first` : 'Select products to compare'}</span></div>
+      <div className="data-toolbar"><span role="status">{loading ? 'Loading quant market data…' : catalogError ? `Market data unavailable: ${catalogError}` : `${products.length} products from the quant universe · daily reference data`}</span><button className="btn ghost" disabled={loading} onClick={() => setRefresh(v => v + 1)}>Refresh data</button></div>
+      <div className="two-col"><div className="coin-grid">{sortedCoins.map(c => <CoinCard key={c.tk} coin={c} selected={basket.includes(c.tk)} correlation={candidateCorr[c.tk]} correlationLoading={correlationLoading} hasBasket={basket.length > 0} onToggle={() => setBasket(current => current.includes(c.tk) ? current.filter(t => t !== c.tk) : [...current, c.tk])} maxMcap={maxMcap} route={routes[c.tk]} />)}</div><Sidecar basket={basket} coins={coins} removeFromBasket={tk => setBasket(current => current.filter(t => t !== tk))} /></div>
+      {wallet && <>
+        <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">03</span><h2>Funding — capital source &amp; amount</h2><span className="meta">Hypothetical allocation</span></div>
+        <FundingPanel coins={coins} allocationCoins={allocationCoins} excludedCoins={coins.filter(c => basket.includes(c.tk) && !allocationCoins.includes(c))} selectedHolding={holding} setSelectedHolding={setHolding} amount={amount} setAmount={setAmount} onBuild={onBuild} building={building} error={buildError} budget={budget} setBudget={setBudget} reserveValid={reserveValid} reserveSelector={<CashReservePanel selected={cashReserves} onChange={setCashReserves} supported={supportedReserves} routes={routes} coins={coins} />} />
+      </>}
     </div>
-  );
+    {phase === 'allocated' && allocation?.owner === address && <><div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">05</span><h2>Allocation — model targets</h2><span className="meta">Simulation only</span></div><AllocStage allocation={allocation} coins={coins} onReset={() => { setAllocation(null); setPhase('select'); }} /></>}
+    <footer className="data-footer"><span>ETESIA RESEARCH</span><span>Live wallet balances · daily quant analytics · simulated vault returns · allocation preview, no funds moved</span></footer>
+  </div>;
 }

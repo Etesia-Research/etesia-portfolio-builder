@@ -9,11 +9,11 @@
 //   fetch works — no server proxy and no SDK import needed for one GET.
 //   Unknown/unfunded account -> 404 (account does not exist on the ledger).
 //
-// Holdings are matched to the 12-asset universe by BOTH code AND issuer
+// Holdings are matched to the catalog instrument identities by BOTH code AND issuer
 // (a code alone can be a different/scam asset); XLM is the native balance.
 // Assets in the wallet but outside the universe are ignored. Unheld -> 0.
 
-import { ASSET_CONTRACTS } from "@/lib/prices";
+import { ASSET_CONTRACTS } from "@/lib/assets";
 
 const HORIZON = "https://horizon.stellar.org";
 
