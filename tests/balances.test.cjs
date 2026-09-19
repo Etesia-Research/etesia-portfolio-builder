@@ -9,7 +9,7 @@ const root = path.join(__dirname, "..");
 const source = fs.readFileSync(path.join(root, "components/PortfolioBuilder.jsx"), "utf8");
 // Load the actual component with controlled hooks, stores, and pending requests.
 // Named test exports keep private components out of the production API.
-const compiled = ts.transpileModule(source + "\nexport { FundingPanel, Masthead, CashReservePanel, CoinCard, AllocStage };", {
+const compiled = ts.transpileModule(source + "\nexport { FundingPanel, Masthead, CashReservePanel, CoinCard, AllocStage, Sidecar };", {
   compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true },
   fileName: "PortfolioBuilder.jsx",
 }).outputText;
@@ -235,4 +235,51 @@ test("funding risk-cap slider displays its percentage and updates the calculator
   assert.equal(slider.props["aria-valuetext"], "25% annual volatility");
   slider.props.onChange({ target: { value: "35" } });
   assert.equal(budget, "35");
+});
+
+
+test("Working basket shows pairwise correlation and buy-and-hold Sharpe with honest empty states", () => {
+  const h = harness();
+  const props = { basket: ["XLM", "ETESIA-TF"], coins: [], analyticsLoading: false,
+    analytics: { average_pairwise_correlation: -.1234, sharpe_1y: 1.2345, window_end: "2026-09-19T00:00:00Z" } };
+  const rendered = text(h.Sidecar(props));
+  assert.match(rendered, /Avg. pairwise correlation-0.12/);
+  assert.match(rendered, /Basket SR · 1Y1.23/);
+  assert.match(rendered, /buy and hold/);
+  assert.match(rendered, /simulated vault returns/);
+  assert.match(rendered, /Year ending 2026-09-19/);
+  const single = text(h.Sidecar({ ...props, basket: ["XLM"], analytics: { sharpe_1y: 0, pairwise_reason: "Select at least two products" } }));
+  assert.match(single, /correlation—/);
+  assert.match(single, /Select at least two products/);
+  assert.match(single, /Basket SR · 1Y0.00/);
+  const loading = text(h.Sidecar({ ...props, analytics: null, analyticsLoading: true }));
+  assert.match(loading, /Calculating basket metrics/);
+  assert.ok(!loading.includes("1.23"));
+  const failed = text(h.Sidecar({ ...props, analytics: { error: "Quant unavailable" } }));
+  assert.match(failed, /Quant unavailable/);
+  assert.match(failed, /Basket SR · 1Y—/);
+  assert.ok(!text(h.Sidecar({ ...props, basket: [] })).includes("Basket SR"));
+});
+
+test("basket analytics requests follow selection and ignore cancelled results", async () => {
+  const state = [];
+  state[0] = ["XLM"];
+  state[5] = [{ id: "xlm", tk: "XLM" }];
+  const h = harness(state);
+  h.render();
+  const effect = h.effects.find(fn => fn.toString().includes("basket/analytics"));
+  const cleanup = effect();
+  await new Promise(resolve => setTimeout(resolve, 230));
+  assert.equal(h.quantRequests[0].endpoint, "basket/analytics");
+  assert.deepEqual(h.quantRequests[0].body, { basket: ["xlm"] });
+  cleanup();
+  h.quantRequests[0].resolve({ sharpe_1y: 99 });
+  await flush();
+  assert.equal(h.state[16].value, null);
+  const cleanupCurrent = effect();
+  await new Promise(resolve => setTimeout(resolve, 230));
+  h.quantRequests[1].resolve({ sharpe_1y: 1.23 });
+  await flush();
+  assert.deepEqual(h.state[16], { key: "XLM", value: { sharpe_1y: 1.23 } });
+  cleanupCurrent();
 });

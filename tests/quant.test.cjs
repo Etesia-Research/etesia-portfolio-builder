@@ -79,6 +79,12 @@ test("proxy restricts endpoints, keeps credentials server-side, and sanitizes up
     assert.equal((await proxy.GET(new Request("http://localhost"), context(endpoint))).status, 200);
     assert.equal(calls.at(-1).url, `https://quant.example.test/v1/${endpoint}`);
   }
+  const basketRequest = new Request("http://localhost/api/quant/basket/analytics", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ basket: ["xlm", "eth"] }),
+  });
+  assert.equal((await proxy.POST(basketRequest, context("basket/analytics"))).status, 200);
+  assert.equal(calls.at(-1).url, "https://quant.example.test/v1/basket/analytics");
+  assert.deepEqual(JSON.parse(calls.at(-1).options.body), { basket: ["xlm", "eth"] });
   for (const endpoint of ["status", "../status", "tokens/bogus/sharpe", "https://example.org"]) {
     assert.equal((await proxy.GET(new Request("http://localhost"), context(endpoint))).status, 404);
   }

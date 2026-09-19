@@ -173,7 +173,7 @@ function CoinCard({ coin, selected, correlation, correlationLoading, hasBasket, 
   );
 }
 
-function Sidecar({ basket, coins, removeFromBasket }) {
+function Sidecar({ basket, coins, removeFromBasket, analytics, analyticsLoading }) {
   return <aside className="sidecar">
     <h4>Working basket — {basket.length} {basket.length === 1 ? 'asset' : 'assets'}</h4>
     {!basket.length && <div className="empty">An empty page awaits the first pick.</div>}
@@ -182,8 +182,16 @@ function Sidecar({ basket, coins, removeFromBasket }) {
       <div><div className="tk">{c.tk}</div><div className="data-note">{c.simulated ? 'Under construction · simulated' : c.name}</div></div>
       <button className="rm" aria-label={`Remove ${c.tk}`} onClick={() => removeFromBasket(c.tk)}>×</button>
     </div>)}
+    {basket.length > 0 && <div className="metrics" aria-live="polite" aria-busy={analyticsLoading}>
+      <div className="row"><span className="lbl">Avg. pairwise correlation</span><span className="val">{analyticsLoading ? '…' : analytics?.average_pairwise_correlation?.toFixed(2) ?? '—'}</span></div>
+      {!analyticsLoading && analytics?.pairwise_reason && <div className="data-note">{analytics.pairwise_reason}</div>}
+      <div className="row"><span className="lbl">Basket SR · 1Y</span><span className="val">{analyticsLoading ? '…' : analytics?.sharpe_1y?.toFixed(2) ?? '—'}</span></div>
+      {!analyticsLoading && analytics?.sharpe_reason && analytics.sharpe_reason !== analytics.pairwise_reason && <div className="data-note">{analytics.sharpe_reason}</div>}
+      <div className="data-note">Equal initial weights · buy and hold · USD · 0% risk-free rate. Correlation averages distinct product pairs.</div>
+      <div className="data-note">{analyticsLoading ? 'Calculating basket metrics…' : analytics?.error || (analytics?.window_end ? `Year ending ${analytics.window_end.slice(0, 10)}${analytics.stale ? ' · stale data' : ''}` : '')}</div>
+    </div>}
     <p className="data-note">ρ compares each product with this basket over one year, using equal capital at the start of the year and fixed quantities thereafter.</p>
-    {basket.includes('ETESIA-TF') && <p className="data-note">Basket correlations include simulated vault returns. The vault is under construction and is excluded from allocation.</p>}
+    {basket.includes('ETESIA-TF') && <p className="data-note">Basket metrics include simulated vault returns. The vault is under construction and is excluded from allocation.</p>}
     <p className="data-note">Cash reserve assets are selected in their own step below. Allocation uses products with daily history and a checked Soroswap route; the calculator retains its caps and buffers.</p>
   </aside>;
 }
@@ -362,6 +370,7 @@ export default function PortfolioBuilder() {
   const [buildError, setBuildError] = useState(null);
   const [cashReserves, setCashReserves] = useState(['ustry']);
   const [supportedReserves, setSupportedReserves] = useState(['ustry']);
+  const [basketAnalytics, setBasketAnalytics] = useState({ key: '', value: null });
   const buildRequest = useRef(null);
 
   const address = useStellarWalletStore(s => s.address);
@@ -436,6 +445,23 @@ export default function PortfolioBuilder() {
         }
       }));
       if (!controller.signal.aborted) setCorrelations({ key: basketKey, values: Object.fromEntries(entries) });
+    }, 200);
+    return () => { controller.abort(); clearTimeout(timer); };
+  }, [basketKey, coins]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setBasketAnalytics({ key: '', value: null });
+    if (!basket.length || !coins.length) return () => controller.abort();
+    const timer = setTimeout(async () => {
+      const ids = coins.filter(c => basket.includes(c.tk)).map(c => c.id);
+      let value;
+      try {
+        value = await quantRequest('basket/analytics', { basket: ids }, controller.signal);
+      } catch (error) {
+        value = { error: error.message };
+      }
+      if (!controller.signal.aborted) setBasketAnalytics({ key: basketKey, value });
     }, 200);
     return () => { controller.abort(); clearTimeout(timer); };
   }, [basketKey, coins]);
@@ -515,7 +541,7 @@ export default function PortfolioBuilder() {
     <div className={phase === 'allocated' ? 'locked' : ''}>
       <div className="section-bar"><span className="num-mark">02</span><h2>Universe — pick the candidates</h2><span className="meta">{basket.length ? `${basket.length} selected · lowest correlation first` : 'Select products to compare'}</span></div>
       <div className="data-toolbar"><span role="status">{loading ? 'Loading quant market data…' : catalogError ? `Market data unavailable: ${catalogError}` : `${products.length} products from the quant universe · daily reference data`}</span><button className="btn ghost" disabled={loading} onClick={() => setRefresh(v => v + 1)}>Refresh data</button></div>
-      <div className="two-col"><div className="coin-grid">{sortedCoins.map(c => <CoinCard key={c.tk} coin={c} selected={basket.includes(c.tk)} correlation={candidateCorr[c.tk]} correlationLoading={correlationLoading} hasBasket={basket.length > 0} onToggle={() => setBasket(current => current.includes(c.tk) ? current.filter(t => t !== c.tk) : [...current, c.tk])} maxMcap={maxMcap} route={routes[c.tk]} />)}</div><Sidecar basket={basket} coins={coins} removeFromBasket={tk => setBasket(current => current.filter(t => t !== tk))} /></div>
+      <div className="two-col"><div className="coin-grid">{sortedCoins.map(c => <CoinCard key={c.tk} coin={c} selected={basket.includes(c.tk)} correlation={candidateCorr[c.tk]} correlationLoading={correlationLoading} hasBasket={basket.length > 0} onToggle={() => setBasket(current => current.includes(c.tk) ? current.filter(t => t !== c.tk) : [...current, c.tk])} maxMcap={maxMcap} route={routes[c.tk]} />)}</div><Sidecar basket={basket} coins={coins} analytics={basketAnalytics.key === basketKey ? basketAnalytics.value : null} analyticsLoading={basket.length > 0 && basketAnalytics.key !== basketKey} removeFromBasket={tk => setBasket(current => current.filter(t => t !== tk))} /></div>
       {wallet && <>
         <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">03</span><h2>Funding — capital source &amp; amount</h2><span className="meta">Hypothetical allocation</span></div>
         <FundingPanel coins={coins} allocationCoins={allocationCoins} excludedCoins={coins.filter(c => basket.includes(c.tk) && !allocationCoins.includes(c))} selectedHolding={holding} setSelectedHolding={setHolding} amount={amount} setAmount={setAmount} onBuild={onBuild} building={building} error={buildError} budget={budget} setBudget={setBudget} reserveValid={reserveValid} reserveSelector={<CashReservePanel selected={cashReserves} onChange={setCashReserves} supported={supportedReserves} routes={routes} coins={coins} />} />

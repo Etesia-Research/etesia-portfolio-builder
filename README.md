@@ -30,6 +30,12 @@ pnpm exec tsc --noEmit
 - Prices are dated daily USD closes, not live swap marks. Market caps, one-year
   Sharpe and basket correlations come from the API. Missing values remain
   unavailable; no static numerical fallback or browser allocation solver exists.
+- Working basket shows average signed pairwise correlation (distinct pairs only)
+  and one-year basket Sharpe from `POST /v1/basket/analytics`. The basket starts
+  with equal capital per selected product and holds quantities fixed for one
+  year, in USD with a 0% risk-free rate. Funding, reserves and allocator weights
+  do not affect these selection metrics. Single-product correlation and missing
+  data show an em dash with a reason; simulated vault returns remain labeled.
 - The vault shows **Under construction**. Its Sharpe and correlations use the
   API's simulated return series and report metadata. It has no invented share
   price and cannot receive a Builder allocation.
