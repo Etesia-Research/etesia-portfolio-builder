@@ -5,10 +5,13 @@ const TOKEN = "(?:xlm|aqua|eth|btc|shx|usdc|eurc|ustry|etesia-tf)";
 const GET_PATH = new RegExp(`^(tokens|market-caps|tokens/${TOKEN}/(?:last-close|sharpe))$`);
 const POST_PATH = /^(correlations|basket\/analytics|builder\/(?:targets|simulation)|quotes)$/;
 
+const REPORT_PATH = /^vault\/backtests\/([a-f0-9]{20})\/files\/(pdf|xlsx)$/;
+
 async function proxy(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
   const { path } = await context.params;
   const endpoint = path.join("/");
-  if (!(request.method === "GET" ? GET_PATH : POST_PATH).test(endpoint)) {
+  const report = request.method === "GET" ? REPORT_PATH.exec(endpoint) : null;
+  if (!report && !(request.method === "GET" ? GET_PATH : POST_PATH).test(endpoint)) {
     return NextResponse.json({ error: "Unknown quant endpoint" }, { status: 404 });
   }
   const configured = process.env.ETESIA_API_URL?.trim();
@@ -41,6 +44,14 @@ async function proxy(request: NextRequest, context: { params: Promise<{ path: st
         : response.status === 404 ? "Quant data is unavailable"
         : "Quant service is temporarily unavailable";
       return NextResponse.json({ error }, { status: response.status === 401 ? 502 : response.status });
+    }
+    if (report) {
+      return new NextResponse(response.body, { headers: {
+        "Content-Type": report[2] === "pdf" ? "application/pdf" : "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "Content-Disposition": `attachment; filename="etesia-tf-${report[1]}.${report[2]}"`,
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+      } });
     }
     return NextResponse.json(await response.json(), { headers: { "Cache-Control": "no-store" } });
   } catch (error) {

@@ -161,6 +161,7 @@ function CoinCard({ coin, selected, correlation, correlationLoading, hasBasket, 
   const mcapFrac = coin.mcap > 0 && maxMcap > 1 ? Math.min(1, Math.log10(coin.mcap) / Math.log10(maxMcap)) : 0;
   const corr = correlation?.status === 'available' ? correlation.correlation : null;
   return (
+    <div className={`product-card-wrap ${selected ? 'is-selected' : ''}`}>
     <button type="button" className={`coin-card ${selected ? 'selected' : ''}`} onClick={onToggle} data-tk={coin.tk} aria-pressed={selected}>
       <div className="top"><ProductLogo coin={coin} className="glyph" /><div className="check">{selected ? '✓' : ''}</div></div>
       <div className="name-line"><div className="tk">{coin.tk}</div><div className="nm">{coin.name}</div></div>
@@ -183,6 +184,8 @@ function CoinCard({ coin, selected, correlation, correlationLoading, hasBasket, 
       <div className="data-note">{metricNote(coin.analytics, coin.analyticsError)}</div>
       {hasBasket && !correlationLoading && corr == null && <div className="data-note">{correlation?.reason || correlation?.error || 'Correlation unavailable'}</div>}
     </button>
+    {coin.id === 'etesia-tf' && <a className="product-info" href="/stellar_tf_vault" aria-label="Etesia-TF strategy factsheet"><span aria-hidden="true">ⓘ</span> Strategy factsheet <span aria-hidden="true">↗</span></a>}
+    </div>
   );
 }
 

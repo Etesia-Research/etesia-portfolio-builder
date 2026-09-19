@@ -149,3 +149,30 @@ mean divided by annualized sample volatility at a 0% risk-free rate; CAGR divide
 by volatility is not the displayed Sharpe. The one-year covariance model estimate
 and full three-year historical portfolio volatility use different windows, weights
 and scopes and are labeled separately.
+
+
+## Etesia-TF factsheet
+
+The Etesia-TF product's info link opens `/stellar_tf_vault`, a public, responsive
+strategy factsheet requiring no wallet. It shows the fixed XLM/AQUA/ETH/BTC
+universe, monthly risk-parity weights, daily target capital allocations including
+reserves/buffers, and the latest published backtest metrics. Trend signals are
+omitted by user request. Investor copy describes the approach without formulas
+or calibration parameters; allocations and performance are explicitly simulated.
+
+The server reads authenticated `vault/weights` and `vault/backtests/latest` using
+the existing configuration, without exposing their full research payloads.
+Missing/blocked allocations remain unavailable; report availability is independent
+and stale reports retain their dates and warning. PDF and XLSX downloads use
+`/api/quant/vault/backtests/{run_id}/files/{pdf|xlsx}`. This GET-only proxy validates
+the 20-character hexadecimal run ID and format, streams the original binary,
+and keeps the bearer key server-side. Both links are bound to the displayed run.
+
+Local verification on 2026-09-19: production build, TypeScript and 30 tests passed.
+Desktop (1440px) and mobile (390px) browser checks passed selection/info navigation,
+layout without horizontal overflow, binary PDF/XLSX downloads, unknown-run and
+invalid-path rejection, with no browser runtime errors. Tests cover blocked and
+unavailable allocations, zero holdings, null metrics, stale reports, independent
+report failures and private-payload exclusion. Real report `70c32c0f372438da9738`
+was read through the existing backend; no backend change or frontend deployment
+was performed.

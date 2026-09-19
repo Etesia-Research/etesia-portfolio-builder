@@ -95,3 +95,33 @@ test("allocation simulation merges buffers and reserve positions without omittin
   assert.deepEqual(quant.simulationWeights(positions), { xlm: .225, usdc: .275, ustry: .5 });
   assert.equal(Object.values(quant.simulationWeights(positions)).reduce((sum, weight) => sum + weight, 0), 1);
 });
+
+test("vault downloads preserve binary bytes, bind filenames to a run, and reject other paths and methods", async () => {
+  const run = "a".repeat(20);
+  const context = endpoint => ({ params: Promise.resolve({ path: endpoint.split("/") }) });
+  const bytes = new Uint8Array([0x50, 0x4b, 0, 255, 128, 13, 10]);
+  let calls = 0;
+  const proxy = load("app/api/quant/[...path]/route.ts", {}, {
+    process: { env: { ETESIA_API_URL: "quant.example.test", ETESIA_API_KEY: "private-test-key" } },
+    fetch: async (url, options) => {
+      calls++;
+      assert.equal(options.headers.Authorization, "Bearer private-test-key");
+      assert.match(String(url), new RegExp(`/v1/vault/backtests/${run}/files/(pdf|xlsx)$`));
+      return new Response(bytes, { headers: { "X-Private": "private-test-key" } });
+    },
+  });
+  for (const format of ["pdf", "xlsx"]) {
+    const result = await proxy.GET(new Request("http://localhost"), context(`vault/backtests/${run}/files/${format}`));
+    assert.equal(result.status, 200);
+    assert.deepEqual(new Uint8Array(await result.arrayBuffer()), bytes);
+    assert.equal(result.headers.get("Content-Disposition"), `attachment; filename="etesia-tf-${run}.${format}"`);
+    assert.match(result.headers.get("Content-Type"), format === "pdf" ? /application\/pdf/ : /spreadsheetml/);
+    assert.equal(result.headers.get("Cache-Control"), "no-store");
+    assert.equal(result.headers.get("X-Private"), null);
+  }
+  for (const endpoint of ["vault/weights", "vault/backtests/latest", "vault/backtests/../files/pdf", `vault/backtests/${run}/files/json`, `vault/backtests/${run}/files/pdf/extra`]) {
+    assert.equal((await proxy.GET(new Request("http://localhost"), context(endpoint))).status, 404);
+  }
+  assert.equal((await proxy.POST(new Request("http://localhost", { method: "POST" }), context(`vault/backtests/${run}/files/pdf`))).status, 404);
+  assert.equal(calls, 2);
+});
