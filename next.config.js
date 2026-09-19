@@ -1,3 +1,5 @@
+const { PHASE_DEVELOPMENT_SERVER } = require("next/constants");
+
 /** @type {import('next').NextConfig} */
 // Browser-side fallback so @stellar/stellar-sdk (which references Node core
 // modules) bundles cleanly on the client.
@@ -17,4 +19,8 @@ const nextConfig = {
   },
 };
 
-module.exports = nextConfig;
+// Keep production builds from replacing files used by a running dev server.
+module.exports = (phase) => ({
+  ...nextConfig,
+  distDir: phase === PHASE_DEVELOPMENT_SERVER ? ".next-dev" : ".next",
+});

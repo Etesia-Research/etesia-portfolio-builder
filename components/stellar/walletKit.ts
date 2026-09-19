@@ -8,10 +8,9 @@
 //   init({modules}) once, setWallet(id) to pick a wallet, fetchAddress() to
 //   prompt it, on(KitEventType.*) for state changes, disconnect().
 //
-// Per-wallet connect (Etesia's 4 cards map to specific wallets) =
-//   setWallet(ID) -> fetchAddress(). Network is mainnet (Networks.PUBLIC); it
-//   only matters for signing (we don't sign — execution stays simulated), but
-//   we set it for correctness.
+// The connect cards open the kit's wallet picker. Network is mainnet
+// (Networks.PUBLIC); it only matters for signing (we don't sign — execution
+// stays simulated), but we set it for correctness.
 //
 // All kit imports are dynamic so nothing touches `window` until called in the
 // browser (the builder is already rendered ssr:false, this is belt-and-braces).
@@ -19,7 +18,7 @@
 import useStellarWalletStore from "@/stores/useStellarWalletStore";
 
 // Display name on Etesia's connect cards -> resolved at load time to kit ids.
-export const WALLET_KINDS = ["Freighter", "Albedo", "xBull", "Lobstr Vault"] as const;
+export const WALLET_KINDS = ["Freighter", "Albedo", "xBull", "Lobstr Vault", "HOT Wallet"] as const;
 export type WalletKind = (typeof WALLET_KINDS)[number];
 
 let kitPromise: Promise<{ kit: any }> | null = null;
@@ -27,13 +26,14 @@ let idByKind: Record<string, string> = {};
 let subscribed = false;
 
 async function loadKit(): Promise<{ kit: any }> {
-  const [sdk, types, fre, alb, xb, lob] = await Promise.all([
+  const [sdk, types, fre, alb, xb, lob, hot] = await Promise.all([
     import("@creit-tech/stellar-wallets-kit/sdk"),
     import("@creit-tech/stellar-wallets-kit/types"),
     import("@creit-tech/stellar-wallets-kit/modules/freighter"),
     import("@creit-tech/stellar-wallets-kit/modules/albedo"),
     import("@creit-tech/stellar-wallets-kit/modules/xbull"),
     import("@creit-tech/stellar-wallets-kit/modules/lobstr"),
+    import("@creit-tech/stellar-wallets-kit/modules/hotwallet"),
   ]);
   const { StellarWalletsKit } = sdk as any;
   const { Networks } = types as any;
@@ -43,9 +43,10 @@ async function loadKit(): Promise<{ kit: any }> {
     Albedo: (alb as any).ALBEDO_ID,
     xBull: (xb as any).XBULL_ID,
     "Lobstr Vault": (lob as any).LOBSTR_ID,
+    "HOT Wallet": hot.HOTWALLET_ID,
   };
 
-  // Exactly the four wallets Etesia offers — all config-free, so the connect
+  // Exactly the wallets Etesia offers — all config-free, so the connect
   // screen only lists wallets the kit can actually connect.
   StellarWalletsKit.init({
     modules: [
@@ -53,6 +54,7 @@ async function loadKit(): Promise<{ kit: any }> {
       new (alb as any).AlbedoModule(),
       new (xb as any).xBullModule(),
       new (lob as any).LobstrModule(),
+      new hot.HotWalletModule(),
     ],
   });
   StellarWalletsKit.setNetwork(Networks.PUBLIC);

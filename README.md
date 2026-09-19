@@ -23,6 +23,32 @@ pnpm build
 pnpm exec tsc --noEmit
 ```
 
+Development uses `.next-dev`; production builds and `pnpm start` use `.next`.
+This keeps `pnpm build` from overwriting chunks loaded by an active dev server.
+Both generated directories are ignored by Git.
+
+## Wallets
+
+The connection screen and Stellar Wallets Kit picker support Freighter, Albedo,
+xBull, Lobstr Vault and HOT Wallet on Stellar mainnet. Select HOT Wallet in the
+picker, then approve in its extension or Telegram/mobile widget. The existing
+kit 2.2.0 includes `HotWalletModule`; no extra dependency or API key is required.
+See the [HOT SDK Stellar integration](https://github.com/hot-dao/hot-sdk-js#stellar-connect).
+Connecting reads balances; execution remains simulated and requests no signatures.
+
+Local validation on 2026-09-19: production build, TypeScript and all 27 existing
+tests passed. Browser checks used a controlled HOT extension provider and stubbed
+widget transport to verify the address request, connected label, balance lookup,
+rejection, disconnect and reconnect, plus desktop/mobile layouts. No browser
+runtime errors occurred. Real HOT extension/Telegram/mobile approval remains
+unverified. To check it manually, open the picker, choose HOT Wallet, approve,
+confirm the account/balances, disconnect, then reconnect or reject the request.
+
+Known upstream picker limitation: on reopening, an immediate wallet response can
+arrive before the kit finishes availability checks and installs its modal event
+listeners, leaving the connection pending. Controlled checks wait for those
+checks before selecting the wallet. Reloading restores the connection screen.
+
 ## Data and allocation
 
 - Product cards come from the quant catalog: XLM, AQUA, ETH, BTC, SHX and the

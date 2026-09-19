@@ -114,6 +114,7 @@ function ConnectScreen({ onConnect, connecting, error }) {
     { kind: 'Albedo', sub: 'Web signer', glyph: '◐' },
     { kind: 'xBull', sub: 'Multi-platform', glyph: '◑' },
     { kind: 'Lobstr Vault', sub: 'Mobile', glyph: '◯' },
+    { kind: 'HOT Wallet', sub: 'Extension · Telegram · mobile', glyph: '◉' },
   ];
   return (
     <section className="connect-stage fade-in">
