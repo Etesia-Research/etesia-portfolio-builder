@@ -1,0 +1,66 @@
+Etesia Research Inc. — Proprietary Source Inspection License
+
+Copyright (c) 2026 Etesia Research Inc. All rights reserved.
+
+1. Ownership and scope
+
+This license applies to the original software, documentation and other materials
+in this repository owned by Etesia Research Inc. (the "Materials"). The Materials
+remain the property of Etesia Research Inc. Publication does not transfer
+ownership or dedicate the Materials to the public domain. This is a proprietary
+license, not an open-source license.
+
+2. Limited permission to inspect
+
+You may view and inspect the Materials solely to verify, review or understand
+Etesia's implementation and demonstrations. This permission includes only the
+incidental copies technically necessary for that viewing, such as browser caches.
+It does not authorize running the software, including for local verification,
+testing or demonstrations.
+
+3. Written authorization and signed agreement required
+
+Except for section 2 and the rights preserved in section 4, any use of the
+Materials requires prior written authorization from Etesia Research Inc. and a
+separate written agreement signed by you and an authorized representative of
+Etesia Research Inc. This includes downloading or copying, executing, building,
+testing, modifying, creating derivative works, distributing, sublicensing,
+deploying, hosting, integrating or otherwise using the Materials, whether for
+commercial, noncommercial, academic, internal, verification or demo purposes.
+Public availability, access to a demonstration, and build or deployment
+instructions do not provide that authorization. An authorization request alone
+does not grant permission. Any separately signed agreement governs only the
+rights it expressly grants.
+
+4. Third-party materials, platform terms and applicable law
+
+Third-party components, dependencies, fonts, logos and other third-party
+materials remain the property of their respective owners and are governed by
+their own licenses and notices. This license does not replace those terms,
+restrict rights granted under them, or claim ownership of third-party work.
+Any applicable third-party license obligations for combined or derived works
+remain in effect; this license does not resolve or waive those obligations.
+
+Nothing here restricts rights that cannot lawfully be restricted or rights
+granted under applicable repository-hosting terms, including GitHub's rights
+to view and fork a public repository through its service. Those platform rights
+do not grant additional permission under this license to use the Materials
+outside the scope of those terms.
+
+5. Reservation of rights and notices
+
+All rights not expressly granted are reserved. No patent or trademark license
+is granted. Retain this license and all copyright and other proprietary notices
+in any permitted copy. Permission under this license terminates upon breach;
+any rights preserved under section 4 remain governed by their applicable terms
+and law.
+
+6. No warranty; limitation of liability
+
+TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE MATERIALS ARE PROVIDED
+"AS IS" AND "AS AVAILABLE", WITHOUT WARRANTIES OF ANY KIND, EXPRESS OR IMPLIED,
+INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, TITLE OR
+NONINFRINGEMENT. ETESIA RESEARCH INC. SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES
+OR OTHER LIABILITY ARISING FROM OR IN CONNECTION WITH THE MATERIALS OR THEIR
+USE, WHETHER IN CONTRACT, TORT OR OTHERWISE. A SEPARATE SIGNED AGREEMENT MAY
+EXPRESSLY PROVIDE OTHERWISE.

@@ -2,6 +2,19 @@
 
 Next.js frontend for the Etesia quant API. Use pnpm and the committed lockfile.
 
+## License
+
+Copyright (c) 2026 Etesia Research Inc. All rights reserved.
+Etesia-owned materials are available for inspection of the implementation and
+demonstrations under the [Proprietary Source Inspection License](LICENSE).
+Running, building, testing, copying, modifying, distributing or deploying them
+requires prior written authorization and a separate agreement signed by both
+parties, subject to the license's platform, third-party and legal exceptions.
+The setup and verification instructions below are for authorized users.
+Dependencies, fonts and third-party logos retain their own licenses and ownership;
+see also [logo sources](public/logos/README.md). GitHub's public-repository viewing
+and forking rights remain unaffected.
+
 ## Configuration
 
 Set these **server-only** variables in the ignored `.env.local`:
