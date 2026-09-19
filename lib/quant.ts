@@ -81,6 +81,6 @@ export async function checkRoute(symbol: string, signal?: AbortSignal): Promise<
     const sell = await quantRequest("quotes", { asset_in: contract, asset_out: ASSET_CONTRACTS.USDC.contract, amount: String(buy.quote.amountOut) }, signal);
     return { available: true, reason: "Buy/sell routes quoted at 1 USDC; execution remains simulated", fetchedAt: sell.fetched_at };
   } catch {
-    return { available: false, reason: "Soroswap route unavailable; retry after refresh", fetchedAt: null };
+    return { available: false, reason: "Soroswap route unavailable; refresh missing routes", fetchedAt: null };
   }
 }

@@ -27,7 +27,10 @@ pnpm exec tsc --noEmit
 
 - Product cards come from the quant catalog: XLM, AQUA, ETH, BTC, SHX and the
   Etesia TF vault. USDC/USTRY are reserve assets, absent from the product grid.
-- Prices are dated daily USD closes, not live swap marks. Market caps, one-year
+- Prices are dated daily USD closes, not live swap marks. The price band shows
+  the completed candle day: a September 19 midnight UTC boundary is labeled
+  September 18. Analytics say **Data through close** with that same candle date;
+  raw timestamps and freshness checks remain unchanged. Market caps, one-year
   Sharpe and basket correlations come from the API. Missing values remain
   unavailable; no static numerical fallback or browser allocation solver exists.
 - Working basket shows average signed pairwise correlation (distinct pairs only)
@@ -39,7 +42,12 @@ pnpm exec tsc --noEmit
 - The vault shows **Under construction**. Its Sharpe and correlations use the
   API's simulated return series and report metadata. It has no invented share
   price and cannot receive a Builder allocation.
-- Route checks quote both directions through the Soroswap API using exact Stellar
+- Route checks run and appear only in the final allocation step, for the funding
+  asset and nonzero target positions, excluding USDC. Product/reserve selection
+  and allocation construction do not depend on routes. **Refresh missing routes**
+  retries only failed or unchecked assets and preserves successful checks for
+  the current allocation. Revising/building a new allocation starts new checks.
+  Checks quote both directions through the Soroswap API using exact Stellar
   contracts. A one-USDC route probe is availability evidence, not a liquidity or
   execution guarantee. ETH/BTC analytics use underlying histories, while the
   quoted Stellar instruments are the identified Ultra Capital wrappers.
@@ -68,12 +76,14 @@ vault strategy or historical replay universes.
 
 Load the universe without connecting a wallet, select the vault, and verify that
 correlation labels identify simulated returns. Connect a wallet, select a source
-balance and products with completed route checks, choose cash reserves, and
+balance and products, choose cash reserves, and
 calculate. Check that positions sum to the supplied USDC capital and show each
 buffer separately. Empty reserve selections, stale/missing reference prices,
-failed balance refreshes and unavailable routes must prevent construction.
+failed balance refreshes must prevent construction. Unavailable routes must not
+block allocation. Confirm there are no quote requests before allocation and that
+retrying a missing route does not repeat successful probes.
 Changing inputs or wallets must invalidate a pending result. EURC requires published
-history, API reserve support and successful buy/sell route checks before selection.
+history and API reserve support before selection.
 Missing or invalid EURC closes block a selected EURC reserve without affecting
 other reserve choices or vault targets.
 
