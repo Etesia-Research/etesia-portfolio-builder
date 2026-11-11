@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import { executionQuotes, tokenUnits } from "@/lib/execution";
 
-export default function ExecutionSimulation({ allocation, funding, usdcUsd }) {
+export default function ExecutionSimulation({ allocation, funding, usdcUsd, vaultReason }) {
   const [preview, setPreview] = useState(null);
   const [error, setError] = useState(null);
   const [refresh, setRefresh] = useState(0);
@@ -25,14 +25,14 @@ export default function ExecutionSimulation({ allocation, funding, usdcUsd }) {
   const ready = preview && !expired && preview.rows.every(row => !row.error);
   return <section className="execution-routes">
     <h4>Execution quotes</h4>
-    <p className="data-note">Actual input amounts · quotes via USDC · 0.5% slippage allowance · refresh after 60 seconds. The Etesia-TF row is simulated at $1 per share: there is no mainnet vault. The testnet vault's indexed share price is shown on /testnet.</p>
+    <p className="data-note">Actual input amounts · quotes via USDC · 0.5% slippage allowance · refresh after 60 seconds. The Etesia-TF row is simulated at $1 per share: {vaultReason}.</p>
     {!preview && !error && <p role="status" className="data-note">Fetching trade quotes…</p>}
     {error && <p role="alert" className="data-note">{error}</p>}
     {preview?.funding && <p className="data-note">Funding: {tokenUnits(preview.funding.amountIn)} {funding.symbol} → {tokenUnits(preview.funding.amountOut)} USDC (minimum {tokenUnits(preview.funding.minimumOut)}). Quoted {new Date(preview.funding.fetchedAt).toLocaleTimeString()}.</p>}
     {preview && <div className="execution-quote-list">{preview.rows.map(row => <div className="execution-quote" key={row.id}>
       <strong>{row.id.replaceAll('_', ' ').toUpperCase()}</strong>
       <span>{tokenUnits(row.amountIn)} USDC → {row.amountOut == null ? 'Unavailable' : `${tokenUnits(row.amountOut)} ${row.symbol}`}</span>
-      <span className="data-note">{row.error || (row.kind === 'vault' ? 'Simulated at $1 per share · no mainnet vault · no swap quote' : row.kind === 'cash' ? 'Retained USDC · no swap required' : `Minimum ${tokenUnits(row.minimumOut)} · quoted ${new Date(row.fetchedAt).toLocaleTimeString()}`)}</span>
+      <span className="data-note">{row.error || (row.kind === 'vault' ? `Simulated at $1 per share · ${vaultReason} · no swap quote` : row.kind === 'cash' ? 'Retained USDC · no swap required' : `Minimum ${tokenUnits(row.minimumOut)} · quoted ${new Date(row.fetchedAt).toLocaleTimeString()}`)}</span>
     </div>)}</div>}
     {expired && !completed && <p role="status" className="data-note">Quotes expired. Refresh to simulate execution.</p>}
     {(preview || error) && <button className="btn ghost" onClick={() => setRefresh(value => value + 1)}>Refresh quotes</button>}

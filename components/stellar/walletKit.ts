@@ -12,7 +12,7 @@
 //   use the module id 'varial'.
 //
 // The network comes from lib/network.ts. The mainnet Builder never signs.
-// The testnet page signs: the wallet's network is checked with getNetwork()
+// A vault page signs on its own network: the wallet's network is checked with getNetwork()
 // on connect, before every signature and on window focus, and signing is
 // blocked on a passphrase mismatch. xBull cannot report its network, so it
 // relies on the passphrase that signTx always passes.
@@ -166,7 +166,10 @@ export async function assertNetwork(): Promise<void> {
 
 // Sign a transaction XDR with the connected wallet, always on the page's
 // network passphrase and only after the wallet's network has been checked.
-export async function signTx(xdr: string): Promise<string> {
+// A transaction built for another network than the page's is refused.
+export async function signTx(xdr: string, passphrase: string = network.passphrase): Promise<string> {
+  if (passphrase !== network.passphrase)
+    throw new Error(`This page signs on ${network.label} only; a transaction for "${passphrase}" was refused.`);
   const address = useStellarWalletStore.getState().address;
   if (!address) throw new Error("Connect a wallet before signing.");
   await assertNetwork();

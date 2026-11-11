@@ -13,8 +13,34 @@ const compiled = ts.transpileModule(source + "\nexport { FundingPanel, Masthead,
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true },
   fileName: "PortfolioBuilder.jsx",
 }).outputText;
+function loadTs(file, imports) {
+  const code = ts.transpileModule(fs.readFileSync(path.join(root, file), "utf8"), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true },
+  }).outputText;
+  const module = { exports: {} };
+  new Function("require", "module", "exports", code)((name) => imports[name] ?? require(name), module, module.exports);
+  return module.exports;
+}
+const network = loadTs("lib/network.ts", { "@/data/testnet-manifest.json": require(path.join(root, "data/testnet-manifest.json")) });
+const vaults = loadTs("lib/vaults.ts", { "@/lib/network": network });
+const NetworkSwitch = () => null;
+// A mainnet deployment of the same manifest shape, as config would add it later.
+const manifest = require(path.join(root, "data/testnet-manifest.json"));
+const mainnetDeployment = network.vaultNetwork({ ...manifest, passphrase: network.MAINNET.passphrase, network_epoch: "mainnet-fixture" },
+  { ...network.MAINNET, rpcUrl: "https://rpc.mainnet.example", explorerUrl: "https://stellar.expert/explorer/public", faucetUrl: null, indexer: "vaults/mainnet-fixture" });
+const withMainnet = { ...vaults, VAULTS: vaults.VAULTS.map(v => ({ ...v, networks: { ...v.networks, mainnet: mainnetDeployment } })) };
+// The real execution preview (quotes left pending), to check what it says in each mode.
+const ExecutionSimulation = (() => {
+  const code = ts.transpileModule(fs.readFileSync(path.join(root, "components/ExecutionSimulation.jsx"), "utf8"), {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX, esModuleInterop: true },
+  }).outputText;
+  const module = { exports: {} };
+  new Function("require", "module", "exports", code)((name) => name === "@/lib/execution" ? { executionQuotes: () => new Promise(() => {}), tokenUnits: String } : require(name), module, module.exports);
+  return module.exports.default;
+})();
+const { renderToStaticMarkup } = require("react-dom/server");
 
-function harness(initialState = []) {
+function harness(initialState = [], registry = vaults) {
   const wallet = { address: "A", connected: true };
   const balances = { address: "A", byTk: { USDC: 1.2356789 }, lastUpdated: 1, error: null };
   balances.set = (fn) => fn(balances);
@@ -45,6 +71,8 @@ function harness(initialState = []) {
     "@/stores/usePriceStore": (selector) => selector(prices),
     "@/components/stellar/walletKit": { initWalletKit() {} },
     "@/lib/network": { MAINNET: { label: "Stellar mainnet" } },
+    "@/lib/vaults": registry,
+    "@/components/NetworkSwitch": { __esModule: true, default: NetworkSwitch },
     "@/lib/prices": {
       referenceValue: (prices, symbol, qty) => prices[symbol]?.price == null ? null : prices[symbol].price * qty,
       fundingValue: (prices, symbol, qty) => prices[symbol]?.price == null ? null : prices[symbol].price * qty,
@@ -316,24 +344,119 @@ test("unsupported selected vault blocks construction instead of silently disappe
   assert.ok(!text(tree).includes("Analytics only in this preview"));
 });
 
-test("an allocation with a vault leg links its USDC amount to the testnet deposit; others do not", () => {
+const allocationWith = (positions) => ({ requested_assets: Object.keys(positions), positions, model_version: "m", market_data_as_of: "2026-09-19T00:00:00Z",
+  portfolio_value_usdc: 100, allocated_sleeve_volatility: null, binding_constraints: [], diagnostics: [], funding: {}, usdcUsd: 1 });
+const links = (tree) => nodes(tree).filter((node) => node.type === "a").map((node) => node.props.href);
+
+test("in testnet mode the vault leg links its USDC amount to the testnet vault page; others do not", () => {
   const h = harness();
-  const allocation = (positions) => ({ requested_assets: Object.keys(positions), positions, model_version: "m", market_data_as_of: "2026-09-19T00:00:00Z",
-    portfolio_value_usdc: 100, allocated_sleeve_volatility: null, binding_constraints: [], diagnostics: [], funding: {}, usdcUsd: 1 });
-  const link = (tree) => nodes(tree).find((node) => node.type === "a" && String(node.props.href).startsWith("/testnet"));
-  const tree = h.AllocStage({ allocation: allocation({ "etesia-tf": { allocation_fraction: .4, notional_usdc: 40.25, quantity: 40.25 }, xlm: { allocation_fraction: .6, notional_usdc: 60, quantity: 200 } }), coins: [], onReset() {} });
-  assert.equal(link(tree).props.href, "/testnet?amount=40.2500000");
+  const tree = h.AllocStage({ network: "testnet", allocation: allocationWith({ "etesia-tf": { allocation_fraction: .4, notional_usdc: 40.25, quantity: 40.25 }, xlm: { allocation_fraction: .6, notional_usdc: 60, quantity: 200 } }), coins: [], onReset() {} });
+  assert.deepEqual(links(tree), ["/stellar_tf_vault/testnet?amount=40.2500000"]);
+  assert.match(text(tree), /on Stellar testnet: deposit its 40\.25 USDC in the testnet vault →/);
   assert.match(text(tree), /other legs stay quoted above and are not executed/);
-  assert.equal(link(h.AllocStage({ allocation: allocation({ xlm: { allocation_fraction: 1, notional_usdc: 100, quantity: 300 } }), coins: [], onReset() {} })), undefined);
+  assert.deepEqual(links(h.AllocStage({ network: "testnet", allocation: allocationWith({ xlm: { allocation_fraction: 1, notional_usdc: 100, quantity: 300 } }), coins: [], onReset() {} })), []);
 });
 
-test("only the Etesia-TF card mounts the indexed testnet vault entry, and the basket note keeps the simulated $1 share price", () => {
+test("in mainnet mode the vault leg cannot deposit: it links to the mainnet vault page, never to testnet", () => {
   const h = harness();
-  const card = (coin) => nodes(h.CoinCard({ coin: { name: coin.tk, marketCap: {}, mcap: null, sharpe: null, ...coin }, selected: false, hasBasket: false, onToggle() {}, maxMcap: 1 }));
-  const entry = card({ id: "etesia-tf", tk: "ETESIA-TF", simulated: true }).find(node => node.type?.loader);
+  const tree = h.AllocStage({ network: "mainnet", allocation: allocationWith({ "etesia-tf": { allocation_fraction: .4, notional_usdc: 40.25, quantity: 40.25 } }), coins: [], onReset() {} });
+  assert.deepEqual(links(tree), ["/stellar_tf_vault/mainnet"]);
+  assert.match(text(tree), /Mainnet vault not deployed yet: the Etesia-TF leg is not executed\./);
+  assert.ok(!/testnet|amount=/i.test(text(tree) + links(tree).join(" ")));
+  // The real execution preview it mounts names no testnet vault and links nowhere.
+  const execution = nodes(tree).find((node) => node.props && "vaultReason" in node.props);
+  const html = renderToStaticMarkup(React.createElement(ExecutionSimulation, execution.props));
+  assert.match(html, /simulated at \$1 per share: there is no mainnet vault\./);
+  assert.ok(!/testnet|<a /i.test(html), html);
+  const testnet = nodes(h.AllocStage({ network: "testnet", allocation: allocationWith({ "etesia-tf": { allocation_fraction: 1, notional_usdc: 1, quantity: 1 } }), coins: [], onReset() {} }))
+    .find((node) => node.props && "vaultReason" in node.props);
+  assert.equal(testnet.props.vaultReason, "not the testnet vault's indexed share price");
+});
+
+const vaultCard = (h, network, extra = {}) => h.CoinCard({ coin: { id: "etesia-tf", tk: "ETESIA-TF", name: "Etesia TF Vault", simulated: true, marketCap: {}, mcap: null, sharpe: 0.84, analytics: { simulated: true, window_start: "2023-09-19T00:00:00Z", window_end: "2026-09-19T00:00:00Z" } },
+  network, selected: false, hasBasket: false, onToggle() {}, maxMcap: 1, ...extra });
+
+test("mainnet mode: the vault card shows only mainnet research figures and links to the mainnet vault page", () => {
+  const h = harness();
+  const tree = vaultCard(h, "mainnet");
+  assert.equal(nodes(tree).some(node => node.type?.loader), false); // no indexed testnet figures are mounted
+  assert.match(text(tree), /Mainnet vault not deployed yet/);
+  assert.match(text(tree), /Sharpe · annualized · simulated/);
+  assert.deepEqual(links(tree), ["/stellar_tf_vault/mainnet"]);
+  assert.match(text(tree), /Open vault/);
+  assert.ok(!/testnet|pre-2026|indexed|Market cap/i.test(text(tree)));
+  // One figure: the vault has no market cap.
+  assert.equal(nodes(tree).filter(node => node.props?.className === "stat-val").length, 1);
+});
+
+test("mainnet mode with a mainnet deployment (config only): the card shows that deployment's indexed figures, never testnet's", () => {
+  const h = harness([], withMainnet);
+  const tree = vaultCard(h, "mainnet");
+  assert.deepEqual(nodes(tree).find(node => node.type?.loader).props, { indexer: "vaults/mainnet-fixture" });
+  assert.match(text(tree), /Mainnet vault · mainnet-fixture/);
+  assert.deepEqual(links(tree), ["/stellar_tf_vault/mainnet"]);
+  assert.ok(!/testnet|simulated|Sharpe/i.test(text(tree)), text(tree));
+  const note = text(h.Sidecar({ network: "mainnet", basket: ["ETESIA-TF"], coins: [], analytics: null, analyticsLoading: false, removeFromBasket() {} }));
+  assert.ok(note.includes("a simulated $1 share price: not the mainnet vault's indexed share price."));
+});
+
+test("testnet mode: the vault card shows only the testnet vault's two indexed figures and links to the testnet vault page", () => {
+  const h = harness();
+  const tree = vaultCard(h, "testnet", { hasBasket: true, correlation: { status: "available", correlation: 0.2, simulated: true } });
+  const entry = nodes(tree).find(node => node.type?.loader);
   assert.match(String(entry.type.loader), /components\/VaultCatalogEntry/);
-  assert.equal(card({ id: "xlm", tk: "XLM" }).some(node => node.type?.loader), false);
-  const note = text(h.Sidecar({ basket: ["ETESIA-TF"], coins: [{ tk: "ETESIA-TF", name: "Etesia TF Vault", simulated: true }], analytics: null, analyticsLoading: false, removeFromBasket() {} }));
-  assert.ok(note.includes("a simulated $1 share price: there is no mainnet vault. The indexed testnet share price on its card is display only."));
+  assert.deepEqual(entry.props, { indexer: "vaults/flagship" });
+  assert.match(text(tree), /Testnet vault · pre-2026-12-16-reset/);
+  assert.deepEqual(links(tree), ["/stellar_tf_vault/testnet"]);
+  // No simulated (mainnet research) analytics, correlation pill or factsheet link in testnet mode.
+  assert.ok(!/simulated|Sharpe|Market cap|ρ|Window|factsheet/i.test(text(tree)), text(tree));
+});
+
+test("other asset cards are the same in both modes and have no vault link", () => {
+  const h = harness();
+  const card = (network) => h.CoinCard({ coin: { id: "xlm", tk: "XLM", name: "Stellar", marketCap: {}, mcap: 1e9, sharpe: 0.5, analytics: null }, network, selected: false, hasBasket: false, onToggle() {}, maxMcap: 1e9 });
+  for (const network of ["mainnet", "testnet"]) {
+    assert.equal(nodes(card(network)).some(node => node.type?.loader), false);
+    assert.deepEqual(links(card(network)), []);
+  }
+  assert.equal(text(card("mainnet")), text(card("testnet")));
+});
+
+test("the basket note keeps the simulated $1 share price and names only the active network", () => {
+  const h = harness();
+  const note = (network) => text(h.Sidecar({ network, basket: ["ETESIA-TF"], coins: [{ tk: "ETESIA-TF", name: "Etesia TF Vault", simulated: true }], analytics: null, analyticsLoading: false, removeFromBasket() {} }));
+  assert.ok(note("mainnet").includes("a simulated $1 share price: there is no mainnet vault."));
+  assert.ok(!/testnet/i.test(note("mainnet")));
+  assert.ok(note("testnet").includes("a simulated $1 share price: not the testnet vault's indexed share price."));
   assert.ok(!/assumed \$1/.test(source));
+});
+
+test("the masthead shows the Mainnet | Testnet switch with shareable Builder URLs; mainnet is the default", () => {
+  const h = harness();
+  const select = () => {};
+  const tree = h.Masthead({ wallet: null, onDisconnect() {}, network: "testnet", onNetwork: select });
+  const toggle = nodes(tree).find(node => node.type === NetworkSwitch);
+  assert.equal(toggle.props.active, "testnet");
+  assert.equal(toggle.props.onSelect, select);
+  assert.deepEqual(["mainnet", "testnet"].map(toggle.props.href), ["/", "/?network=testnet"]);
+  assert.equal(vaults.builderNetwork(""), "mainnet");
+  assert.equal(vaults.builderNetwork("?network=testnet"), "testnet");
+  assert.equal(vaults.builderNetwork("?network=Testnet"), "mainnet");
+  assert.equal(vaults.builderNetwork("?network=mainnet&x=1"), "mainnet");
+});
+
+test("the masthead, banner and ticker name only the active network", () => {
+  const masthead = (h, network) => text(h.Masthead({ wallet: null, onDisconnect() {}, network, onNetwork() {} }));
+  const page = (network) => { const state = []; state[16] = network; return harness(state); };
+  const vaultCoin = { id: "etesia-tf", tk: "ETESIA-TF", simulated: true };
+  const mainnet = page("mainnet");
+  assert.match(masthead(mainnet, "mainnet"), /Stellar mainnet(?! market data)/);
+  assert.ok(!/testnet/i.test(masthead(mainnet, "mainnet") + text(mainnet.render())));
+  assert.match(text(mainnet.render()), /Beta · Quant market data and allocation · Vault returns and execution are simulated/);
+  assert.match(text(mainnet.Ticker({ coins: [vaultCoin], network: "mainnet" })), /ETESIA-TF.*under construction/);
+  const testnet = page("testnet");
+  assert.match(masthead(testnet, "testnet"), /Stellar mainnet market data · testnet vault/);
+  assert.match(text(testnet.render()), /Testnet mode · vault cards show the testnet vault, test funds only · Market data and wallet balances stay on mainnet; allocation and execution are simulated/);
+  // The testnet card shows the indexed share price, so the ticker drops the simulated $1 one.
+  assert.ok(!text(testnet.Ticker({ coins: [vaultCoin, { tk: "USDC" }], network: "testnet" })).includes("ETESIA-TF"));
 });

@@ -1,18 +1,23 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import useStellarWalletStore from "@/stores/useStellarWalletStore";
 import { initWalletKit, connectWallet, disconnectWallet } from "@/components/stellar/walletKit";
-import { TESTNET } from "@/lib/network";
-import { INDEXED_LIMIT, SHARE_DECIMALS, addUsdcTrustline, deposit, eventDetail, exitAll, freshness, fromUnits, minBound, maxBound, preview, readIndexed, readPosition, readUsdcLine, sample, supplyAccrual, targetLabel, toUnits, vaultError, withdraw } from "@/lib/vault";
+import NetworkSwitch from "@/components/NetworkSwitch";
+import { builderHref, findVault, vaultHref } from "@/lib/vaults";
+import { INDEXED_LIMIT, SHARE_DECIMALS, freshness, fromUnits, minBound, maxBound, sample, supplyAccrual, toUnits, vaultClient } from "@/lib/vault";
+
+// A vault's page on one network (/<slug>/<network>): indexed metrics, wallet,
+// trustline, position and the bounded deposit / withdraw / redeem flows. Every
+// read, transaction and signature uses that network's deployment only.
 
 const truncateAddr = (a) => (a && a.length > 9 ? `${a.slice(0, 4)}…${a.slice(-4)}` : a);
-const usdc = (units) => units == null ? '—' : `${fromUnits(units, TESTNET.usdc.decimals)} USDC`;
+const usdc = (units, net) => units == null ? '—' : `${fromUnits(units, net.usdc.decimals)} USDC`;
 const shares = (units) => units == null ? '—' : `${fromUnits(units, SHARE_DECIMALS)} shares`;
 const num = (value, digits = 7) => value == null ? '—' : value.toLocaleString('en-US', { maximumFractionDigits: digits });
 const pct = (value) => value == null ? '—' : `${(value * 100).toFixed(2)}%`;
 const when = (iso) => iso ? `${iso.slice(0, 16).replace('T', ' ')} UTC` : '—';
-const txLink = (hash) => <a href={`${TESTNET.explorerUrl}/tx/${hash}`} target="_blank" rel="noreferrer">{hash.slice(0, 8)}…</a>;
+const txLink = (hash, net) => <a href={`${net.explorerUrl}/tx/${hash}`} target="_blank" rel="noreferrer">{hash.slice(0, 8)}…</a>;
 const usable = (view) => view && view.status !== 'error' && view.status !== 'missing';
 const statusColor = (view) => !view || view.status === 'fresh' ? undefined : { color: view.status === 'error' ? 'var(--bad)' : 'var(--warn)' };
 
@@ -29,8 +34,75 @@ function Panel({ title, view, children }) {
   </>;
 }
 
+// One metric: its value only when every view it reads has data (else
+// "unavailable", never a stand-in), any warning about it, and each view's freshness label.
+function Metric({ label, views, value, warning }) {
+  const list = Object.entries(views);
+  const shown = list.some(([, view]) => !view) ? '…' : list.every(([, view]) => usable(view)) ? value() ?? 'unavailable' : 'unavailable';
+  return <div>
+    <dt>{label}</dt>
+    <dd>{shown}</dd>
+    {warning && <dd className="data-note" data-status="stale">{warning}</dd>}
+    {list.map(([name, view]) => <dd key={name} className="data-note" data-status={view?.status ?? 'loading'}>{list.length > 1 ? `${name} · ` : ''}{freshness(view)}</dd>)}
+  </div>;
+}
+
+// D5-06 key metrics, each with its views' freshness (formerly on the catalog card).
+export function VaultMetrics({ indexed, client }) {
+  const { net, assetSymbol, eventDetail } = client;
+  const { summary, history, allocations, performance, events } = indexed;
+  const holdings = usable(allocations) ? allocations.holdings : [];
+  const latest = holdings.filter(h => h.assets).at(-1), newest = holdings.at(-1);
+  const failed = latest && latest !== newest ? `Latest snapshot at ${when(newest.captured_at)} failed (${Object.entries(newest.errors ?? {}).map(([view, code]) => `${view} ${code}`).join(' · ') || 'holdings() failed'}); showing the last successful snapshot at ${when(latest.captured_at)}.` : null;
+  const allocation = () => {
+    if (!latest) return null;
+    const target = allocations.targets.at(-1);
+    const expired = target && target.expiry * 1000 < Date.parse(latest.captured_at) ? ` · target epoch ${target.epoch} expired at ${when(new Date(target.expiry * 1000).toISOString())}` : '';
+    const assets = [...new Set([...latest.assets.map(a => a.asset), ...(target?.assets ?? [])])];
+    return `${assets.map(asset => {
+      const held = latest.assets.find(a => a.asset === asset);
+      const i = target ? target.assets.indexOf(asset) : -1;
+      return `${held?.symbol ?? assetSymbol(asset)} ${pct(held?.fraction)}${target ? ` vs ${i < 0 ? 0 : target.weights_bps[i] / 100}% target` : ''}`;
+    }).join(' · ')}${target ? '' : ' · no published target'} · holdings at ${when(latest.captured_at)}${expired}`;
+  };
+  const rebalance = () => {
+    const last = events.events.filter(e => e.kind === 'plan' || e.kind === 'unwind').at(-1);
+    if (!last) return `None in the latest ${events.events.length} indexed events`;
+    return <>{when(last.closed_at)} · {last.kind} · {eventDetail(last, history, allocations)} · <a href={`${net.explorerUrl}/tx/${last.tx_hash}`} target="_blank" rel="noreferrer">{last.tx_hash.slice(0, 8)}…</a></>;
+  };
+  const blend = () => {
+    if (latest && !latest.assets.some(a => a.supply > 0)) return 'No Blend supply in the latest snapshot';
+    // An asset with no measurable interval has no measured interest: unavailable, not +0.
+    const accrual = supplyAccrual(allocations.holdings, events, summary.indexer?.next_ledger).filter(a => a.counted > 0);
+    return accrual.length ? accrual.map(a => `${a.symbol} ${a.change >= 0 ? '+' : ''}${num(a.change)} interest over ${a.counted} of ${a.intervals} snapshot intervals from ${when(a.from)} to ${when(a.to)}`).join(' · ') : null;
+  };
+  // Largest peak-to-trough fall of the indexed share price over the history window.
+  const drawdown = () => {
+    const points = history.points.filter(p => p.share_price_usdc != null);
+    if (points.length < 2) return null;
+    let peak = -Infinity, worst = 0;
+    for (const p of points) { peak = Math.max(peak, p.share_price_usdc); worst = Math.max(worst, 1 - p.share_price_usdc / peak); }
+    return `${pct(worst)} over ${points.length} snapshots from ${when(points[0].captured_at)} to ${when(points.at(-1).captured_at)} · share price, not annualized`;
+  };
+  const actual = performance?.actual;
+  return <section className="vault-metrics" aria-label={`Key metrics, ${net.label} vault (${net.epoch}), indexed`}>
+    <h4>Key metrics · {net.label} vault ({net.epoch}), indexed</h4>
+    <dl>
+      <Metric label="Share price" views={{ summary }} value={() => summary.share_price_usdc == null ? null : `${num(summary.share_price_usdc)} USDC`} />
+      <Metric label="TVL" views={{ summary }} value={() => summary.tvl_usdc == null ? null : `${num(summary.tvl_usdc)} USDC`} />
+      <Metric label="Allocation vs target" views={{ allocations }} value={allocation} warning={failed} />
+      <Metric label="Last rebalance" views={{ events }} value={rebalance} />
+      <Metric label="Blend yield" views={{ summary, allocations, events }} value={blend} />
+      <Metric label="Actual return" views={{ performance }} value={() => actual.return_fraction == null ? null : `${pct(actual.return_fraction)} over ${actual.window_days?.toFixed(2) ?? '—'} days · not annualized`} />
+      <Metric label="Max drawdown" views={{ history }} value={drawdown} />
+    </dl>
+    <p className="data-note">Not used in the Builder allocation or the simulated execution, which price the vault at $1 per share.</p>
+  </section>;
+}
+
 // D5-06: vault views from the indexer (D5-05 routes), each labelled fresh, stale, missing or unavailable.
-export function IndexedVault({ indexed }) {
+export function IndexedVault({ indexed, client }) {
+  const { net, eventDetail, targetLabel } = client;
   const { summary, history, allocations, performance, events } = indexed;
   return <section className="execution-routes">
     <p className="data-note">Read from the Etesia indexer through the quant API, not from the contract. Stale means the view's snapshot or event cursor is older than 15 minutes; missing means the indexer has no data for that view.</p>
@@ -74,13 +146,13 @@ export function IndexedVault({ indexed }) {
         <div className="alloc-table"><table className="performance-table">
           <caption>Published targets (onchain target events) · latest {Math.min(5, allocations.targets.length)} of {allocations.targets.length}</caption>
           <thead><tr><th scope="col">Published</th><th scope="col">Weights</th><th scope="col">Tx</th></tr></thead>
-          <tbody>{allocations.targets.slice(-5).reverse().map(t => <tr key={t.tx_hash}><th scope="row">{when(t.closed_at)}</th><td>{targetLabel(t)}</td><td>{txLink(t.tx_hash)}</td></tr>)}</tbody>
+          <tbody>{allocations.targets.slice(-5).reverse().map(t => <tr key={t.tx_hash}><th scope="row">{when(t.closed_at)}</th><td>{targetLabel(t)}</td><td>{txLink(t.tx_hash, net)}</td></tr>)}</tbody>
         </table></div>
       </>;
     }}</Panel>
 
     <Panel title="Performance · actual, separate from the backtest" view={performance}>{() => <div className="execution-quote-list">
-      <Row label="Actual share-price return" value={pct(performance.actual.return_fraction)} note={`${num(performance.actual.start_share_price_usdc)} → ${num(performance.actual.end_share_price_usdc)} USDC per share · ${performance.actual.window_days == null ? '—' : performance.actual.window_days.toFixed(2)} days from ${performance.actual.start_source ?? '—'} · testnet vault, not annualized`} />
+      <Row label="Actual share-price return" value={pct(performance.actual.return_fraction)} note={`${num(performance.actual.start_share_price_usdc)} → ${num(performance.actual.end_share_price_usdc)} USDC per share · ${performance.actual.window_days == null ? '—' : performance.actual.window_days.toFixed(2)} days from ${performance.actual.start_source ?? '—'} · ${net.label} vault, not annualized`} />
       <Row label="Backtest · simulated" value={performance.backtest ? `cumulative ${pct(performance.backtest.metrics.cumulative_net_return)} · CAGR ${pct(performance.backtest.metrics.cagr)} · max drawdown ${pct(performance.backtest.metrics.maximum_drawdown)}` : 'No published backtest'}
         note={performance.backtest ? `run ${performance.backtest.run_id} · ${performance.backtest.start} to ${performance.backtest.end} · simulated history, not vault results` : null} />
     </div>}</Panel>
@@ -90,7 +162,7 @@ export function IndexedVault({ indexed }) {
       <thead><tr><th scope="col">Time</th><th scope="col">Event</th><th scope="col">Detail</th><th scope="col">Tx</th></tr></thead>
       <tbody>{events.events.slice(-20).reverse().map(e => <tr key={e.id}><th scope="row">{when(e.closed_at)}</th>
         <td>{['target', 'plan', 'unwind'].includes(e.kind) ? 'Rebalance' : ['position', 'rewards'].includes(e.kind) ? 'Blend yield' : 'Fees'} · {e.kind}</td>
-        <td>{eventDetail(e, history, allocations)}</td><td>{txLink(e.tx_hash)}</td></tr>)}</tbody>
+        <td>{eventDetail(e, history, allocations)}</td><td>{txLink(e.tx_hash, net)}</td></tr>)}</tbody>
     </table></div>}</Panel>
   </section>;
 }
@@ -105,12 +177,13 @@ export function IndexedPosition({ view, contractShares }) {
   </>;
 }
 
-function AmountForm({ kind, max, disabled, onSubmit, initial = '' }) {
+function AmountForm({ client, kind, max, disabled, onSubmit, initial = '' }) {
+  const { net, preview, vaultError } = client;
   const [amount, setAmount] = useState(initial);
   const [quote, setQuote] = useState(null);
   const [error, setError] = useState(null);
   let units = null;
-  try { units = amount ? toUnits(amount, TESTNET.usdc.decimals) : null; } catch { units = null; }
+  try { units = amount ? toUnits(amount, net.usdc.decimals) : null; } catch { units = null; }
   const overMax = units != null && max != null && units > max;
   const valid = units != null && units > BigInt(0) && !overMax;
   const onPreview = async () => {
@@ -123,8 +196,8 @@ function AmountForm({ kind, max, disabled, onSubmit, initial = '' }) {
       <input type="text" inputMode="decimal" value={amount} placeholder="0.00" disabled={disabled} onChange={e => { setAmount(e.target.value.replace(/[^0-9.]/g, '')); setError(null); }} />
       <span className="unit">USDC</span>
     </div>
-    {max != null && <div className="quick-amounts"><button className="qa" disabled={disabled || max <= BigInt(0)} onClick={() => { setAmount(fromUnits(max, TESTNET.usdc.decimals)); setError(null); }}>MAX {usdc(max)}</button></div>}
-    {overMax && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>Above the {kind === 'deposit' ? 'USDC balance' : 'max withdraw'} of {usdc(max)}.</p>}
+    {max != null && <div className="quick-amounts"><button className="qa" disabled={disabled || max <= BigInt(0)} onClick={() => { setAmount(fromUnits(max, net.usdc.decimals)); setError(null); }}>MAX {usdc(max, net)}</button></div>}
+    {overMax && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>Above the {kind === 'deposit' ? 'USDC balance' : 'max withdraw'} of {usdc(max, net)}.</p>}
     {quote?.amount === amount && <p className="data-note">Simulation preview · {kind === 'deposit'
       ? `${quote.amount} USDC ≈ ${shares(quote.shares)}; minimum accepted ${shares(minBound(quote.shares))} (0.5% bound)`
       : `${quote.amount} USDC burns ≈ ${shares(quote.shares)}; maximum accepted ${shares(maxBound(quote.shares))} (0.5% bound)`}. Nothing signed yet; the bound is re-read before signing.</p>}
@@ -136,13 +209,17 @@ function AmountForm({ kind, max, disabled, onSubmit, initial = '' }) {
   </div>;
 }
 
-// Vault leg handed over from the Builder's allocation (/testnet?amount=...).
-function allocatedAmount() {
+// Vault leg handed over from the Builder's allocation (/<slug>/<network>?amount=...).
+function allocatedAmount(net) {
   const value = new URLSearchParams(window.location.search).get('amount');
-  try { return value && toUnits(value, TESTNET.usdc.decimals) > BigInt(0) ? value : null; } catch { return null; }
+  try { return value && toUnits(value, net.usdc.decimals) > BigInt(0) ? value : null; } catch { return null; }
 }
 
-export default function TestnetVault() {
+export default function VaultDesk({ slug, network }) {
+  const vault = findVault(slug);
+  const net = vault.networks[network];
+  const client = useMemo(() => vaultClient(net), [net]);
+  const { addUsdcTrustline, deposit, exitAll, readIndexed, readPosition, readUsdcLine, vaultError, withdraw } = client;
   const address = useStellarWalletStore(s => s.address);
   const connected = useStellarWalletStore(s => s.connected);
   const connecting = useStellarWalletStore(s => s.connecting);
@@ -155,17 +232,17 @@ export default function TestnetVault() {
   const [busy, setBusy] = useState(null);
   const [actionError, setActionError] = useState(null);
   const [receipts, setReceipts] = useState([]);
-  const [allocated] = useState(allocatedAmount);
+  const [allocated] = useState(() => allocatedAmount(net));
   const [indexed, setIndexed] = useState({});
 
-  useEffect(() => { initWalletKit(TESTNET); }, []);
+  useEffect(() => { initWalletKit(net); }, [net]);
 
   // Only the newest read lands, so a slower read for an earlier address cannot overwrite it.
   const indexedRead = useRef(0);
   const refreshIndexed = useCallback(() => {
     const id = ++indexedRead.current;
     return readIndexed(address).then(next => { if (id === indexedRead.current) setIndexed(next); });
-  }, [address]);
+  }, [address, readIndexed]);
   useEffect(() => { setIndexed({}); refreshIndexed(); }, [refreshIndexed]);
   const sharePrice = indexed.summary?.share_price_usdc ?? null;
 
@@ -176,7 +253,7 @@ export default function TestnetVault() {
       const [nextLine, nextPosition] = await Promise.all([readUsdcLine(address), readPosition(address)]);
       setLine(nextLine); setPosition(nextPosition);
     } catch (err) { setReadError(vaultError(err)); }
-  }, [address]);
+  }, [address, readUsdcLine, readPosition, vaultError]);
   useEffect(() => { setLine(null); setPosition(null); setReceipts([]); setActionError(null); refresh(); }, [refresh]);
 
   const run = async (label, action) => {
@@ -193,20 +270,20 @@ export default function TestnetVault() {
   };
 
   const ready = connected && address && !networkError && !busy;
-  const usdcBalance = line?.balance != null ? toUnits(line.balance, TESTNET.usdc.decimals) : null;
+  const usdcBalance = line?.balance != null ? toUnits(line.balance, net.usdc.decimals) : null;
 
   return <div id="root">
-    <div className="data-banner">Testnet · pre-reset deployment ({TESTNET.epoch}) · vault deposits and withdrawals are real testnet transactions signed by your wallet · test funds only</div>
+    <div className="data-banner">{net.label} · deployment {net.epoch} · vault deposits and withdrawals are real {net.label} transactions signed by your wallet{network === 'testnet' ? ' · test funds only' : ''}</div>
     <header className="masthead">
       <div className="left">
-        <div className="row"><a href="/">← Portfolio Atelier (mainnet, simulated)</a></div>
-        <div className="row" style={{ marginTop: 6 }}><span>{TESTNET.label}</span></div>
-        <div className="row" style={{ marginTop: 6 }}><span>Vault {truncateAddr(TESTNET.vault)}</span></div>
+        <div className="row"><a href={builderHref(network)}>← Portfolio Atelier</a></div>
+        <div className="row" style={{ marginTop: 6 }}><NetworkSwitch active={network} href={(next) => vaultHref(vault, next)} /></div>
+        <div className="row" style={{ marginTop: 6 }}><span>{net.label} · vault {truncateAddr(net.vault)}</span></div>
       </div>
       <div className="center">
         <div className="eyebrow">— Etesia Research Bulletin —</div>
         <h1>Portfolio Atelier</h1>
-        <div className="sub">Etesia-TF flagship vault on Stellar testnet.</div>
+        <div className="sub">{vault.name} flagship vault on {net.label}.</div>
       </div>
       <div className="right">
         {connected && address ? <>
@@ -219,24 +296,24 @@ export default function TestnetVault() {
     {networkError && <p role="alert" className="data-banner" style={{ color: 'var(--bad)' }}>{networkError} Switch networks in the wallet, then return to this tab to re-check.</p>}
 
     <div className="section-bar"><span className="num-mark">01</span><h2>Vault — indexed metrics</h2><span className="meta">Indexer · flagship vault</span></div>
-    <IndexedVault indexed={indexed} />
+    <VaultMetrics indexed={indexed} client={client} />
     <button className="btn ghost" onClick={refreshIndexed}>Refresh indexed data</button>
 
-    <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">02</span><h2>Wallet — connect on testnet</h2><span className="meta">Freighter/Varial · xBull</span></div>
+    <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">02</span><h2>Wallet — connect on {network}</h2><span className="meta">Freighter/Varial · xBull</span></div>
     {!(connected && address) ? <section className="execution-routes">
-      <p className="data-note">The wallet must be set to {TESTNET.label} ("{TESTNET.passphrase}"). Freighter/Varial reports its network and signing is blocked on a mismatch. xBull cannot report its network; every signature request pins the testnet passphrase. xBull is not evidenced in the recorded runs.</p>
+      <p className="data-note">The wallet must be set to {net.label} ("{net.passphrase}"). Freighter/Varial reports its network and signing is blocked on a mismatch. xBull cannot report its network; every signature request pins the {net.label} passphrase. xBull is not evidenced in the recorded runs.</p>
       <button className="btn lg" disabled={connecting} onClick={() => connectWallet().catch(() => {})}><span className="dot" />{connecting ? 'Connecting… approve in your wallet' : 'Connect wallet'}<span>→</span></button>
       {connectError && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>{connectError}</p>}
     </section> : <>
-      <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">03</span><h2>Onboarding — USDC trustline</h2><span className="meta">Horizon testnet</span></div>
+      <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">03</span><h2>Onboarding — USDC trustline</h2><span className="meta">Horizon · {net.label}</span></div>
       <section className="execution-routes">
         {!line && !readError && <p role="status" className="data-note">Reading the account from Horizon…</p>}
         {line && <div className="execution-quote-list">
-          <Row label="Account" value={line.funded ? `Funded · ${line.xlm} XLM` : 'Not funded on testnet'} note={line.funded ? null : 'Fund the account with testnet XLM (Friendbot) before adding the trustline.'} />
-          <Row label="USDC trustline" value={line.trustline ? `Present · ${line.balance} USDC` : 'Missing'} note={`${TESTNET.usdc.code}:${truncateAddr(TESTNET.usdc.issuer)} · Blend testnet USDC`} />
+          <Row label="Account" value={line.funded ? `Funded · ${line.xlm} XLM` : `Not funded on ${net.label}`} note={line.funded ? null : `Fund the account with ${net.label} XLM${network === 'testnet' ? ' (Friendbot)' : ''} before adding the trustline.`} />
+          <Row label="USDC trustline" value={line.trustline ? `Present · ${line.balance} USDC` : 'Missing'} note={`${net.usdc.code}:${truncateAddr(net.usdc.issuer)}${net.assets.USDC.stand_in ? ` · ${net.assets.USDC.stand_in}` : ''}`} />
         </div>}
         {line?.funded && !line.trustline && <button className="btn" disabled={!ready} onClick={() => run('trustline', () => addUsdcTrustline(address))}>Sign &amp; add USDC trustline</button>}
-        {line?.trustline && <p className="data-note">Test USDC comes from Blend's testnet faucet: <a href={TESTNET.faucetUrl} target="_blank" rel="noreferrer">{TESTNET.faucetUrl}</a>. Refresh after claiming.</p>}
+        {line?.trustline && net.faucetUrl && <p className="data-note">Test USDC comes from Blend's testnet faucet: <a href={net.faucetUrl} target="_blank" rel="noreferrer">{net.faucetUrl}</a>. Refresh after claiming.</p>}
       </section>
 
       <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">04</span><h2>Position — shares and liquidity</h2><span className="meta">{position ? `Read from contract at ledger ${position.ledger}` : 'Contract read'}</span></div>
@@ -245,9 +322,9 @@ export default function TestnetVault() {
         {readError && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>{readError}</p>}
         {position && <div className="execution-quote-list">
           <Row label="Vault shares" value={shares(position.shares)} note="balance(owner) · contract token, 12 decimals" />
-          <Row label="Share value" value={usdc(position.value)} note="convert_to_assets(balance)" />
-          <Row label="Max withdraw" value={usdc(position.maxWithdraw)} note="max_withdraw(owner) · capped at liquid USDC" />
-          <Row label="Vault liquid USDC" value={usdc(position.liquid)} note="liquid_assets()" />
+          <Row label="Share value" value={usdc(position.value, net)} note="convert_to_assets(balance)" />
+          <Row label="Max withdraw" value={usdc(position.maxWithdraw, net)} note="max_withdraw(owner) · capped at liquid USDC" />
+          <Row label="Vault liquid USDC" value={usdc(position.liquid, net)} note="liquid_assets()" />
           <Row label="Deposits" value={position.paused ? 'Paused' : 'Open'} note="state().paused" />
           <IndexedPosition view={indexed.position} contractShares={position.shares} />
         </div>}
@@ -259,12 +336,12 @@ export default function TestnetVault() {
         <div className="col">
           <h5>① Deposit USDC · deposit_bounded</h5>
           {allocated && <p className="data-note">Prefilled with the vault leg of your Builder allocation: {allocated} USDC{sharePrice ? ` ≈ ${num(Number(allocated) / sharePrice)} shares at the indexed share price of ${num(sharePrice)} USDC (${freshness(indexed.summary)})` : ` · indexed share price unavailable (${freshness(indexed.summary)})`}; the deposit preview reads the exact shares from the contract. Only this leg executes; the allocation's other legs stay quoted on the Builder and are not executed.</p>}
-          <AmountForm kind="deposit" initial={allocated ?? ''} max={usdcBalance} disabled={!ready || !line?.trustline || position?.paused} onSubmit={amount => run('deposit', () => deposit(address, amount))} />
+          <AmountForm client={client} kind="deposit" initial={allocated ?? ''} max={usdcBalance} disabled={!ready || !line?.trustline || position?.paused} onSubmit={amount => run('deposit', () => deposit(address, amount))} />
           {position?.paused && <p className="data-note">Deposits are paused on this vault.</p>}
         </div>
         <div className="col">
           <h5>② Partial withdraw · withdraw_bounded</h5>
-          <AmountForm kind="withdraw" max={position?.maxWithdraw ?? null} disabled={!ready || !position || position.maxWithdraw <= BigInt(0)} onSubmit={amount => run('withdraw', () => withdraw(address, amount))} />
+          <AmountForm client={client} kind="withdraw" max={position?.maxWithdraw ?? null} disabled={!ready || !position || position.maxWithdraw <= BigInt(0)} onSubmit={amount => run('withdraw', () => withdraw(address, amount))} />
           <h5 style={{ marginTop: 24 }}>③ Full exit · redeem_bounded</h5>
           <p className="data-note">Redeems the whole share balance for USDC, accepting at least 0.5% below preview_redeem. It fails with a liquidity error if the vault's liquid USDC is below the value of your shares.</p>
           <button className="btn" disabled={!ready || !position || position.shares <= BigInt(0)} onClick={() => run('exit', () => exitAll(address))}>Sign &amp; redeem all shares</button>
@@ -274,14 +351,18 @@ export default function TestnetVault() {
       {actionError && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>{actionError}</p>}
 
       {receipts.length > 0 && <>
-        <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">06</span><h2>Receipts</h2><span className="meta">Testnet transactions, not simulations</span></div>
+        <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">06</span><h2>Receipts</h2><span className="meta">{net.label} transactions, not simulations</span></div>
         {receipts.map(receipt => <div key={receipt.hash} role="status" className="tx-receipt">
-          <strong>Testnet transaction, not a simulation · {receipt.action}</strong>
+          <strong>{net.label} transaction, not a simulation · {receipt.action}</strong>
           <p>Confirmed in ledger {receipt.ledger}{receipt.returned ? ` · contract returned ${receipt.returned}` : ''}.</p>
-          <p className="data-note">Hash <a href={`${TESTNET.explorerUrl}/tx/${receipt.hash}`} target="_blank" rel="noreferrer">{receipt.hash}</a></p>
+          <p className="data-note">Hash <a href={`${net.explorerUrl}/tx/${receipt.hash}`} target="_blank" rel="noreferrer">{receipt.hash}</a></p>
         </div>)}
       </>}
     </>}
-    <footer className="data-footer"><span>ETESIA RESEARCH</span><span>{TESTNET.label} · vault {TESTNET.vault} · position values read from the contract · vault metrics from the indexer, labelled by freshness</span></footer>
+
+    {/* The detailed indexed views come after the deposit desk, so the deposit is reached directly. */}
+    <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">{!(connected && address) ? '03' : receipts.length ? '07' : '06'}</span><h2>Vault — indexed history and events</h2><span className="meta">Indexer · flagship vault</span></div>
+    <IndexedVault indexed={indexed} client={client} />
+    <footer className="data-footer"><span>ETESIA RESEARCH</span><span>{net.label} · vault {net.vault} · position values read from the contract · vault metrics from the indexer, labelled by freshness</span></footer>
   </div>;
 }

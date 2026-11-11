@@ -4,6 +4,11 @@ const { PHASE_DEVELOPMENT_SERVER } = require("next/constants");
 // Browser-side fallback so @stellar/stellar-sdk (which references Node core
 // modules) bundles cleanly on the client.
 const nextConfig = {
+  // The testnet vault page moved to /<vault>/<network>; /testnet is cited in
+  // submission documents. The query string (?amount=) is kept.
+  async redirects() {
+    return [{ source: "/testnet", destination: "/stellar_tf_vault/testnet", permanent: false }];
+  },
   webpack: (config, { isServer }) => {
     if (!isServer) {
       config.resolve.fallback = {

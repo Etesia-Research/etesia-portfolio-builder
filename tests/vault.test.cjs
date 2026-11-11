@@ -37,8 +37,8 @@ function failingEvent(contract, code) {
 // function name (numbers become i128), `sends` and `polls` are the sequences of
 // sendTransaction and getTransaction outcomes (a function is thrown), and
 // `horizon` stubs Horizon.Server.
-function harness({ views = {}, sends = [], polls = [{ status: "SUCCESS", ledger: 77, returnValue: i128(5) }], horizon = {} } = {}) {
-  const calls = { contract: [], signed: 0, sent: 0, polled: [], hashes: [] };
+function harness({ views = {}, sends = [], polls = [{ status: "SUCCESS", ledger: 77, returnValue: i128(5) }], horizon = {} } = {}, config = TESTNET) {
+  const calls = { contract: [], signed: 0, sent: 0, polled: [], hashes: [], passphrases: [], networks: [] };
   const next = (queue, fallback) => {
     const outcome = queue.length ? queue.shift() : fallback;
     if (typeof outcome === "function") throw outcome();
@@ -60,6 +60,7 @@ function harness({ views = {}, sends = [], polls = [{ status: "SUCCESS", ledger:
     async prepareTransaction(tx) { return tx; }
     async sendTransaction(tx) {
       calls.sent++;
+      calls.networks.push(tx.networkPassphrase);
       calls.hashes.push(Buffer.from(tx.hash()).toString("hex"));
       return { hash: calls.hashes.at(-1), ...next(sends, { status: "PENDING" }) };
     }
@@ -69,12 +70,13 @@ function harness({ views = {}, sends = [], polls = [{ status: "SUCCESS", ledger:
     async loadAccount(address) { return horizon.loadAccount(address); }
     async submitTransaction(tx) { return horizon.submitTransaction(tx); }
   }
-  const vault = load("lib/vault.ts", {
+  const lib = load("lib/vault.ts", {
     "@stellar/stellar-sdk": { ...sdk, Contract, rpc: { ...sdk.rpc, Server }, Horizon: { ...sdk.Horizon, Server: HorizonServer } },
     "@/lib/network": network,
-    "@/components/stellar/walletKit": { signTx: async (xdr) => { calls.signed++; return xdr; } },
+    "@/components/stellar/walletKit": { signTx: async (xdr, passphrase) => { calls.signed++; calls.passphrases.push(passphrase); return xdr; } },
     "@/lib/quant": { quantRequest: async () => { throw new Error("not used"); } },
   });
+  const vault = { ...lib, ...lib.vaultClient(config) };
   return { vault, calls, flows: () => calls.contract.filter(c => c.fn.endsWith("_bounded")) };
 }
 
@@ -192,7 +194,7 @@ test("trustline submission maps Horizon result codes and treats a timeout as unk
   const failed = (status, extras) => async () => { throw Object.assign(new Error(`Transaction submission failed. Server responded: ${status}`), { response: { status, data: { extras } } }); };
   const loadAccount = async (address) => new sdk.Account(address, "1");
   const low = harness({ horizon: { loadAccount, submitTransaction: failed(400, { result_codes: { transaction: "tx_failed", operations: ["op_low_reserve"] } }) } });
-  await assert.rejects(low.vault.addUsdcTrustline(OWNER), /more testnet XLM/);
+  await assert.rejects(low.vault.addUsdcTrustline(OWNER), /more Stellar testnet XLM/);
   const seq = harness({ horizon: { loadAccount, submitTransaction: failed(400, { result_codes: { transaction: "tx_bad_seq" } }) } });
   await assert.rejects(seq.vault.addUsdcTrustline(OWNER), /[0-9a-f]{64} was rejected \(tx_bad_seq\)/);
   const timeout = harness({ horizon: { loadAccount, submitTransaction: failed(504) } });
@@ -231,4 +233,18 @@ test("errors map to vault codes only when the vault itself failed", () => {
   assert.equal(vault.vaultError(new Error("HostError: Error(Contract, #10)\n\nEvent log")), "HostError: Error(Contract, #10)");
   assert.equal(vault.vaultError(new Error("Signature request was rejected in the wallet. Nothing was submitted.")), "Signature request was rejected in the wallet. Nothing was submitted.");
   for (const code of Array.from({ length: 20 }, (_, i) => i + 1)) assert.ok(vault.VAULT_ERRORS[code]);
+});
+
+test("a vault client builds and signs only on its own deployment's network", async () => {
+  const t = harness({ views: { preview_deposit: () => 1 } });
+  await t.vault.deposit(OWNER, "1");
+  assert.deepEqual(t.calls.passphrases, [TESTNET.passphrase]);
+  // A mainnet deployment of the same shape: its transactions carry the mainnet passphrase only.
+  const manifest = { ...JSON.parse(fs.readFileSync(manifestPath, "utf8")), passphrase: network.MAINNET.passphrase };
+  const mainnet = network.vaultNetwork(manifest, { ...network.MAINNET, rpcUrl: "https://rpc.mainnet.example", explorerUrl: "https://stellar.expert/explorer/public", faucetUrl: null, indexer: "vaults/flagship" });
+  const m = harness({ views: { preview_deposit: () => 1 } }, mainnet);
+  await m.vault.deposit(OWNER, "1");
+  assert.deepEqual(m.calls.passphrases, [sdk.Networks.PUBLIC]);
+  assert.deepEqual(m.calls.networks, [sdk.Networks.PUBLIC]);
+  assert.deepEqual(t.calls.networks, [sdk.Networks.TESTNET]);
 });

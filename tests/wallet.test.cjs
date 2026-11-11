@@ -164,3 +164,11 @@ test("a restored Varial session on the wrong network shows the block on load", a
   await m.walletKit.initWalletKit(MAINNET);
   assert.deepEqual([m.state().connected, m.calls.disconnect, m.calls.getNetwork], [true, 0, 0]);
 });
+
+test("a page's wallet refuses to sign a transaction built for another network", async () => {
+  const h = harness();
+  await h.connect();
+  await assert.rejects(h.walletKit.signTx("XDR", MAINNET.passphrase), /signs on Stellar testnet only/);
+  assert.equal(h.calls.sign.length, 0);
+  assert.equal(await h.walletKit.signTx("XDR", TESTNET.passphrase), "signed:XDR");
+});

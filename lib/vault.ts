@@ -1,4 +1,4 @@
-// Testnet vault client: USDC trustline, contract reads and the bounded
+// Vault client: USDC trustline, contract reads and the bounded
 // deposit / withdraw / redeem flows of the flagship vault.
 //
 // doc-checked: @stellar/stellar-sdk 17.4.0 type defs (rpc.Server
@@ -24,7 +24,7 @@ import {
   TransactionBuilder, humanizeEvents, nativeToScVal, rpc, scValToNative, xdr,
   type Transaction,
 } from "@stellar/stellar-sdk";
-import { TESTNET } from "@/lib/network";
+import type { VaultNetworkConfig } from "@/lib/network";
 import { signTx } from "@/components/stellar/walletKit";
 import { quantRequest } from "@/lib/quant";
 
@@ -34,11 +34,6 @@ export const DEADLINE_SECONDS = 300;
 // At least one second apart, so polling outlasts the transaction's time bound
 // and a NOT_FOUND result means it can no longer be included.
 export const POLL_ATTEMPTS = DEADLINE_SECONDS + 30;
-
-const server = new rpc.Server(TESTNET.rpcUrl);
-const horizon = new Horizon.Server(TESTNET.horizonUrl);
-const vault = new Contract(TESTNET.vault);
-const usdcAsset = new Asset(TESTNET.usdc.code, TESTNET.usdc.issuer);
 
 // Vault Error enum (contracts/vault/src/types.rs).
 export const VAULT_ERRORS: Record<number, string> = {
@@ -65,23 +60,6 @@ export const VAULT_ERRORS: Record<number, string> = {
 };
 
 const FAILING = "failing with contract error";
-// The vault's own failure event in a simulation's event log. An inner contract
-// (USDC SAC, oracle, Blend) reuses low error numbers and the vault re-reports
-// its code as "contract call failed", so both the contract and the text must match.
-const VAULT_FAILURE = new RegExp(`contract:${TESTNET.vault}, topics:\\[error, Error\\(Contract, #(\\d+)\\)\\], data:\\["${FAILING}"`);
-
-// Turn any simulation, submission or wallet failure into a user message.
-export function vaultError(err: unknown): string {
-  const message = err instanceof Error ? err.message : String(err ?? "");
-  if (/trustline entry is missing/i.test(message)) return "Add the USDC trustline before depositing.";
-  if (/resulting balance is not within the allowed range|balance is not sufficient/i.test(message))
-    return "The USDC transfer would leave a balance out of range: not enough USDC for this deposit, or the trustline limit reached for this withdrawal.";
-  const code = Number(VAULT_FAILURE.exec(message)?.[1]);
-  if (VAULT_ERRORS[code]) return `${VAULT_ERRORS[code]} (vault error ${code})`;
-  if (/Error\(Auth,/.test(message)) return "Authorization failed in simulation: the vault call must be signed by the connected account.";
-  if (/Account not found/i.test(message)) return "This account is not funded on testnet yet. Fund it with XLM first.";
-  return (message.split("\n")[0] || "Unknown error.");
-}
 
 // Decimal string <-> integer units, without floating point.
 export function toUnits(amount: string, decimals: number): bigint {
@@ -106,21 +84,6 @@ const i128 = (value: bigint) => nativeToScVal(value, { type: "i128" });
 const u64 = (value: bigint) => nativeToScVal(value, { type: "u64" });
 const address = (value: string) => Address.fromString(value).toScVal();
 
-function buildCall(source: Account, fn: string, args: xdr.ScVal[]): Transaction {
-  return new TransactionBuilder(source, { fee: BASE_FEE, networkPassphrase: TESTNET.passphrase })
-    .addOperation(vault.call(fn, ...args))
-    .setTimeout(DEADLINE_SECONDS)
-    .build();
-}
-
-// Simulate a read-only vault call. Simulation needs no funded source account.
-async function read(fn: string, args: xdr.ScVal[] = []): Promise<{ value: any; ledger: number }> {
-  const source = new Account(Keypair.random().publicKey(), "0");
-  const sim = await server.simulateTransaction(buildCall(source, fn, args));
-  if (rpc.Api.isSimulationError(sim)) throw new Error(sim.error);
-  return { value: scValToNative(sim.result!.retval), ledger: sim.latestLedger };
-}
-
 export type VaultPosition = {
   ledger: number;
   shares: bigint;
@@ -130,44 +93,12 @@ export type VaultPosition = {
   paused: boolean;
 };
 
-// Shares and their USDC value, read from the contract (not an indexer).
-// The indexed views (readIndexed below) are shown next to this read.
-export async function readPosition(owner: string): Promise<VaultPosition> {
-  const [balance, maxWithdraw, liquid, state] = await Promise.all([
-    read("balance", [address(owner)]),
-    read("max_withdraw", [address(owner)]),
-    read("liquid_assets"),
-    read("state"),
-  ]);
-  const shares = BigInt(balance.value);
-  const value = shares > BigInt(0) ? BigInt((await read("convert_to_assets", [i128(shares)])).value) : BigInt(0);
-  return {
-    ledger: Math.max(balance.ledger, maxWithdraw.ledger, liquid.ledger, state.ledger),
-    shares, value, maxWithdraw: BigInt(maxWithdraw.value), liquid: BigInt(liquid.value), paused: Boolean(state.value.paused),
-  };
-}
-
 // D5-05 indexed views of the flagship vault, through the Builder proxy. Each
 // carries status (fresh, stale or missing) and as_of; a failed request becomes
 // status "error" so its panel says so instead of showing nothing.
 export type Indexed = { status: "fresh" | "stale" | "missing" | "error"; as_of?: string | null; age_seconds?: number | null; error?: string; [field: string]: any };
 export const INDEXED_LIMIT = 288; // snapshots every 300 s: about 24 h
 export const EVENTS_LIMIT = 100; // newest rebalance and yield events
-
-export async function readIndexed(owner?: string | null): Promise<Record<string, Indexed>> {
-  const base = "vaults/flagship";
-  const paths: Record<string, string> = {
-    summary: `${base}/summary`, history: `${base}/history?limit=${INDEXED_LIMIT}`,
-    allocations: `${base}/allocations?limit=${INDEXED_LIMIT}`, performance: `${base}/performance`, events: `${base}/events?limit=${EVENTS_LIMIT}`,
-    ...(owner ? { position: `${base}/positions/${owner}` } : {}),
-  };
-  const settled = await Promise.allSettled(Object.values(paths).map((path) => quantRequest(path)));
-  return Object.fromEntries(Object.keys(paths).map((key, i) => {
-    const result = settled[i];
-    return [key, result.status === "fulfilled" ? result.value
-      : { status: "error", error: result.reason instanceof Error ? result.reason.message : String(result.reason) }];
-  }));
-}
 
 export function freshness(view?: Indexed): string {
   if (!view) return "Reading the indexer…";
@@ -183,29 +114,8 @@ export function sample<T>(items: T[], count: number): T[] {
   return Array.from({ length: count }, (_, i) => items[Math.round((i * (items.length - 1)) / (count - 1))]);
 }
 
-export const assetSymbol = (contract: string) =>
-  Object.values(TESTNET.assets).find((asset) => asset.address === contract)?.symbol ?? contract;
-export const targetLabel = (t: { assets: string[]; weights_bps: number[]; yield_bps: number }) =>
-  `${t.assets.map((asset, i) => `${assetSymbol(asset)} ${t.weights_bps[i] / 100}%`).join(" · ")} · Blend yield ${t.yield_bps / 100}% of the residual reserve`;
-
 // Blend request types used by the vault's position event (execution.rs).
 const BLEND_REQUEST = ["supply", "withdraw", "supply collateral", "withdraw collateral", "borrow", "repay"];
-
-// One readable line per rebalance or Blend-yield event; plan and target rows
-// reuse the decoded USDC equity and weights of the history and allocations views.
-export function eventDetail(event: { kind: string; tx_hash: string; data: any }, history?: Indexed, allocations?: Indexed): string {
-  const equity = history?.plan_equity?.find((p: any) => p.tx_hash === event.tx_hash && p.kind === event.kind);
-  if (equity) return `nonce ${equity.nonce} · equity ${equity.before_usdc} → ${equity.after_usdc} USDC`;
-  const target = event.kind === "target" && allocations?.targets?.find((t: any) => t.tx_hash === event.tx_hash);
-  if (target) return `epoch ${target.epoch} · ${targetLabel(target)}`;
-  if (event.kind === "position" && Array.isArray(event.data)) {
-    const [kind, asset, amount] = event.data;
-    const decimals = Object.values(TESTNET.assets).find((a) => a.address === asset)?.decimals;
-    const value = decimals == null ? String(amount) : fromUnits(BigInt(amount), decimals);
-    return `Blend ${BLEND_REQUEST[kind] ?? `request ${kind}`} ${value} ${assetSymbol(asset)}`;
-  }
-  return JSON.stringify(event.data);
-}
 
 // Blend interest per asset supplied in the latest snapshot: the change in its
 // Blend-supplied balance summed over consecutive snapshot intervals. Every
@@ -235,56 +145,14 @@ export function supplyAccrual(holdings: Holding[] = [], events?: Indexed, nextLe
 
 export type UsdcLine = { funded: boolean; trustline: boolean; balance: string | null; xlm: string | null };
 
-export async function readUsdcLine(owner: string): Promise<UsdcLine> {
-  let account;
-  try {
-    account = await horizon.loadAccount(owner);
-  } catch (err: any) {
-    if (err instanceof NotFoundError) return { funded: false, trustline: false, balance: null, xlm: null };
-    throw err;
-  }
-  const line = account.balances.find((b: any) => b.asset_code === TESTNET.usdc.code && b.asset_issuer === TESTNET.usdc.issuer);
-  const xlm = account.balances.find((b: any) => b.asset_type === "native");
-  return { funded: true, trustline: Boolean(line), balance: line ? line.balance : null, xlm: xlm ? xlm.balance : null };
-}
-
 export type Receipt = { action: string; hash: string; ledger: number; returned?: string };
 type Returned = { decimals: number; unit: string };
 const SHARES: Returned = { decimals: SHARE_DECIMALS, unit: "shares" };
-const USDC: Returned = { decimals: TESTNET.usdc.decimals, unit: "USDC" };
 
 // SDK 17 returns the hash as a Uint8Array.
 const txHash = (tx: { hash(): Uint8Array }) => Array.from(tx.hash(), (byte) => byte.toString(16).padStart(2, "0")).join("");
 const unknownOutcome = (hash: string, why: string) =>
   new Error(`Transaction ${hash} ${why}. Its outcome is unknown; check the explorer before retrying.`);
-
-export async function addUsdcTrustline(owner: string): Promise<Receipt> {
-  const account = await horizon.loadAccount(owner);
-  const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: TESTNET.passphrase })
-    .addOperation(Operation.changeTrust({ asset: usdcAsset }))
-    .setTimeout(DEADLINE_SECONDS)
-    .build();
-  const signed = TransactionBuilder.fromXDR(await signTx(tx.toXDR()), TESTNET.passphrase);
-  const hash = txHash(signed);
-  try {
-    const result = await horizon.submitTransaction(signed);
-    return { action: "Add USDC trustline", hash: result.hash, ledger: result.ledger };
-  } catch (err: any) {
-    // SDK 17: TransactionFailedError / BadResponseError carry {status, data}.
-    const codes = err?.response?.data?.extras?.result_codes;
-    if (codes?.operations?.includes("op_low_reserve"))
-      throw new Error("Fund the account with more testnet XLM: the trustline raises its minimum balance by 0.5 XLM.");
-    if (codes) throw new Error(`Trustline transaction ${hash} was rejected (${[codes.transaction, ...(codes.operations ?? [])].join(", ")}).`);
-    throw unknownOutcome(hash, `could not be confirmed (${vaultError(err)})`);
-  }
-}
-
-// The vault's own error code from an included transaction's diagnostic events.
-export function onchainVaultCode(events: xdr.DiagnosticEvent[] = []): number | undefined {
-  const failure = humanizeEvents(events).find((e) => e.contractId === TESTNET.vault && e.topics[0] === "error"
-    && Array.isArray(e.data) && e.data[0] === FAILING);
-  return failure?.topics[1]?.code;
-}
 
 // A resource or footprint failure is fixed by simulating again, so the
 // transaction is re-prepared and re-signed once.
@@ -297,67 +165,208 @@ export function needsResimulation(result: xdr.TransactionResult | undefined): bo
     && op.tr.invokeHostFunctionResult.type === "invokeHostFunctionResourceLimitExceeded";
 }
 
-async function invoke(owner: string, action: string, fn: string, args: xdr.ScVal[], returns: Returned, retried = false): Promise<Receipt> {
-  const prepared = await server.prepareTransaction(buildCall(await server.getAccount(owner), fn, args));
-  const signed = TransactionBuilder.fromXDR(await signTx(prepared.toXDR()), TESTNET.passphrase);
-  const hash = txHash(signed);
-  let sent;
-  try {
-    sent = await server.sendTransaction(signed);
-  } catch (err) {
-    throw unknownOutcome(hash, `could not be confirmed as submitted (${vaultError(err)})`);
-  }
-  if (sent.status === "ERROR") {
-    if (!retried && needsResimulation(sent.errorResult)) return invoke(owner, action, fn, args, returns, true);
-    const type = sent.errorResult?.result.type ?? "unknown";
-    if (type === "txTooLate") throw new Error(`The signature took longer than the transaction's ${DEADLINE_SECONDS}-second window, so it was not submitted. Preview again and retry.`);
-    throw new Error(`Transaction rejected before inclusion (${type}).`);
-  }
-  if (sent.status === "TRY_AGAIN_LATER") throw new Error("The network did not queue the transaction. Try again.");
-  let final;
-  try {
-    final = await server.pollTransaction(hash, { attempts: POLL_ATTEMPTS });
-  } catch (err) {
-    throw unknownOutcome(hash, `was submitted but its status could not be read (${vaultError(err)})`);
-  }
-  if (final.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-    const returned = final.returnValue ? `${fromUnits(BigInt(scValToNative(final.returnValue)), returns.decimals)} ${returns.unit}` : undefined;
-    return { action, hash, ledger: final.ledger, returned };
-  }
-  if (final.status === rpc.Api.GetTransactionStatus.FAILED) {
-    if (!retried && needsResimulation(final.resultXdr)) return invoke(owner, action, fn, args, returns, true);
-    const code = onchainVaultCode(final.diagnosticEventsXdr);
-    if (code && VAULT_ERRORS[code]) throw new Error(`${VAULT_ERRORS[code]} (vault error ${code}) Transaction ${hash} failed onchain; only the fee was charged.`);
-    throw new Error(`Transaction ${hash} failed onchain (${final.resultXdr.result.type}).`);
-  }
-  throw unknownOutcome(hash, `was not found within ${POLL_ATTEMPTS} seconds, past its time bound`);
-}
+// Every network-bound read and flow of one vault deployment. A page builds the
+// client of its own network, so it reads, builds and signs only on that network.
+export function vaultClient(net: VaultNetworkConfig) {
+  const server = new rpc.Server(net.rpcUrl);
+  const horizon = new Horizon.Server(net.horizonUrl);
+  const vault = new Contract(net.vault);
+  const usdcAsset = new Asset(net.usdc.code, net.usdc.issuer);
+  const USDC: Returned = { decimals: net.usdc.decimals, unit: "USDC" };
 
-// Preview for the form, shown before anything is signed; the flows below
-// re-read it so the bound reflects the latest ledger.
-export async function preview(kind: "deposit" | "withdraw", amount: string): Promise<bigint> {
-  const assets = toUnits(amount, TESTNET.usdc.decimals);
-  return BigInt((await read(kind === "deposit" ? "preview_deposit" : "preview_withdraw", [i128(assets)])).value);
-}
+  // The vault's own failure event in a simulation's event log. An inner contract
+  // (USDC SAC, oracle, Blend) reuses low error numbers and the vault re-reports
+  // its code as "contract call failed", so both the contract and the text must match.
+  const VAULT_FAILURE = new RegExp(`contract:${net.vault}, topics:\\[error, Error\\(Contract, #(\\d+)\\)\\], data:\\["${FAILING}"`);
 
-// receiver, from/owner and operator are all the connected account.
-export async function deposit(owner: string, amount: string): Promise<Receipt> {
-  const minShares = minBound(await preview("deposit", amount));
-  return invoke(owner, `Deposit ${amount} USDC`, "deposit_bounded",
-    [i128(toUnits(amount, USDC.decimals)), address(owner), address(owner), address(owner), i128(minShares), u64(deadline())], SHARES);
-}
+  // Turn any simulation, submission or wallet failure into a user message.
+  function vaultError(err: unknown): string {
+    const message = err instanceof Error ? err.message : String(err ?? "");
+    if (/trustline entry is missing/i.test(message)) return "Add the USDC trustline before depositing.";
+    if (/resulting balance is not within the allowed range|balance is not sufficient/i.test(message))
+      return "The USDC transfer would leave a balance out of range: not enough USDC for this deposit, or the trustline limit reached for this withdrawal.";
+    const code = Number(VAULT_FAILURE.exec(message)?.[1]);
+    if (VAULT_ERRORS[code]) return `${VAULT_ERRORS[code]} (vault error ${code})`;
+    if (/Error\(Auth,/.test(message)) return "Authorization failed in simulation: the vault call must be signed by the connected account.";
+    if (/Account not found/i.test(message)) return `This account is not funded on ${net.label} yet. Fund it with XLM first.`;
+    return (message.split("\n")[0] || "Unknown error.");
+  }
 
-export async function withdraw(owner: string, amount: string): Promise<Receipt> {
-  const maxShares = maxBound(await preview("withdraw", amount));
-  return invoke(owner, `Withdraw ${amount} USDC`, "withdraw_bounded",
-    [i128(toUnits(amount, USDC.decimals)), address(owner), address(owner), address(owner), i128(maxShares), u64(deadline())], SHARES);
-}
+  function buildCall(source: Account, fn: string, args: xdr.ScVal[]): Transaction {
+    return new TransactionBuilder(source, { fee: BASE_FEE, networkPassphrase: net.passphrase })
+      .addOperation(vault.call(fn, ...args))
+      .setTimeout(DEADLINE_SECONDS)
+      .build();
+  }
 
-// Full exit: redeem the whole share balance for USDC.
-export async function exitAll(owner: string): Promise<Receipt> {
-  const shares = BigInt((await read("balance", [address(owner)])).value);
-  if (shares <= BigInt(0)) throw new Error("This account holds no vault shares.");
-  const redeemable = BigInt((await read("preview_redeem", [i128(shares)])).value);
-  return invoke(owner, `Full exit: redeem ${fromUnits(shares, SHARE_DECIMALS)} shares`, "redeem_bounded",
-    [i128(shares), address(owner), address(owner), address(owner), i128(minBound(redeemable)), u64(deadline())], USDC);
+  // Simulate a read-only vault call. Simulation needs no funded source account.
+  async function read(fn: string, args: xdr.ScVal[] = []): Promise<{ value: any; ledger: number }> {
+    const source = new Account(Keypair.random().publicKey(), "0");
+    const sim = await server.simulateTransaction(buildCall(source, fn, args));
+    if (rpc.Api.isSimulationError(sim)) throw new Error(sim.error);
+    return { value: scValToNative(sim.result!.retval), ledger: sim.latestLedger };
+  }
+
+  // Shares and their USDC value, read from the contract (not an indexer).
+  // The indexed views (readIndexed below) are shown next to this read.
+  async function readPosition(owner: string): Promise<VaultPosition> {
+    const [balance, maxWithdraw, liquid, state] = await Promise.all([
+      read("balance", [address(owner)]),
+      read("max_withdraw", [address(owner)]),
+      read("liquid_assets"),
+      read("state"),
+    ]);
+    const shares = BigInt(balance.value);
+    const value = shares > BigInt(0) ? BigInt((await read("convert_to_assets", [i128(shares)])).value) : BigInt(0);
+    return {
+      ledger: Math.max(balance.ledger, maxWithdraw.ledger, liquid.ledger, state.ledger),
+      shares, value, maxWithdraw: BigInt(maxWithdraw.value), liquid: BigInt(liquid.value), paused: Boolean(state.value.paused),
+    };
+  }
+
+  async function readIndexed(owner?: string | null): Promise<Record<string, Indexed>> {
+    const base = net.indexer;
+    const paths: Record<string, string> = {
+      summary: `${base}/summary`, history: `${base}/history?limit=${INDEXED_LIMIT}`,
+      allocations: `${base}/allocations?limit=${INDEXED_LIMIT}`, performance: `${base}/performance`, events: `${base}/events?limit=${EVENTS_LIMIT}`,
+      ...(owner ? { position: `${base}/positions/${owner}` } : {}),
+    };
+    const settled = await Promise.allSettled(Object.values(paths).map((path) => quantRequest(path)));
+    return Object.fromEntries(Object.keys(paths).map((key, i) => {
+      const result = settled[i];
+      return [key, result.status === "fulfilled" ? result.value
+        : { status: "error", error: result.reason instanceof Error ? result.reason.message : String(result.reason) }];
+    }));
+  }
+
+  const assetSymbol = (contract: string) =>
+    Object.values(net.assets).find((asset) => asset.address === contract)?.symbol ?? contract;
+
+  const targetLabel = (t: { assets: string[]; weights_bps: number[]; yield_bps: number }) =>
+    `${t.assets.map((asset, i) => `${assetSymbol(asset)} ${t.weights_bps[i] / 100}%`).join(" · ")} · Blend yield ${t.yield_bps / 100}% of the residual reserve`;
+
+  // One readable line per rebalance or Blend-yield event; plan and target rows
+  // reuse the decoded USDC equity and weights of the history and allocations views.
+  function eventDetail(event: { kind: string; tx_hash: string; data: any }, history?: Indexed, allocations?: Indexed): string {
+    const equity = history?.plan_equity?.find((p: any) => p.tx_hash === event.tx_hash && p.kind === event.kind);
+    if (equity) return `nonce ${equity.nonce} · equity ${equity.before_usdc} → ${equity.after_usdc} USDC`;
+    const target = event.kind === "target" && allocations?.targets?.find((t: any) => t.tx_hash === event.tx_hash);
+    if (target) return `epoch ${target.epoch} · ${targetLabel(target)}`;
+    if (event.kind === "position" && Array.isArray(event.data)) {
+      const [kind, asset, amount] = event.data;
+      const decimals = Object.values(net.assets).find((a) => a.address === asset)?.decimals;
+      const value = decimals == null ? String(amount) : fromUnits(BigInt(amount), decimals);
+      return `Blend ${BLEND_REQUEST[kind] ?? `request ${kind}`} ${value} ${assetSymbol(asset)}`;
+    }
+    return JSON.stringify(event.data);
+  }
+
+  async function readUsdcLine(owner: string): Promise<UsdcLine> {
+    let account;
+    try {
+      account = await horizon.loadAccount(owner);
+    } catch (err: any) {
+      if (err instanceof NotFoundError) return { funded: false, trustline: false, balance: null, xlm: null };
+      throw err;
+    }
+    const line = account.balances.find((b: any) => b.asset_code === net.usdc.code && b.asset_issuer === net.usdc.issuer);
+    const xlm = account.balances.find((b: any) => b.asset_type === "native");
+    return { funded: true, trustline: Boolean(line), balance: line ? line.balance : null, xlm: xlm ? xlm.balance : null };
+  }
+
+  async function addUsdcTrustline(owner: string): Promise<Receipt> {
+    const account = await horizon.loadAccount(owner);
+    const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: net.passphrase })
+      .addOperation(Operation.changeTrust({ asset: usdcAsset }))
+      .setTimeout(DEADLINE_SECONDS)
+      .build();
+    const signed = TransactionBuilder.fromXDR(await signTx(tx.toXDR(), net.passphrase), net.passphrase);
+    const hash = txHash(signed);
+    try {
+      const result = await horizon.submitTransaction(signed);
+      return { action: "Add USDC trustline", hash: result.hash, ledger: result.ledger };
+    } catch (err: any) {
+      // SDK 17: TransactionFailedError / BadResponseError carry {status, data}.
+      const codes = err?.response?.data?.extras?.result_codes;
+      if (codes?.operations?.includes("op_low_reserve"))
+        throw new Error(`Fund the account with more ${net.label} XLM: the trustline raises its minimum balance by 0.5 XLM.`);
+      if (codes) throw new Error(`Trustline transaction ${hash} was rejected (${[codes.transaction, ...(codes.operations ?? [])].join(", ")}).`);
+      throw unknownOutcome(hash, `could not be confirmed (${vaultError(err)})`);
+    }
+  }
+
+  // The vault's own error code from an included transaction's diagnostic events.
+  function onchainVaultCode(events: xdr.DiagnosticEvent[] = []): number | undefined {
+    const failure = humanizeEvents(events).find((e) => e.contractId === net.vault && e.topics[0] === "error"
+      && Array.isArray(e.data) && e.data[0] === FAILING);
+    return failure?.topics[1]?.code;
+  }
+
+  async function invoke(owner: string, action: string, fn: string, args: xdr.ScVal[], returns: Returned, retried = false): Promise<Receipt> {
+    const prepared = await server.prepareTransaction(buildCall(await server.getAccount(owner), fn, args));
+    const signed = TransactionBuilder.fromXDR(await signTx(prepared.toXDR(), net.passphrase), net.passphrase);
+    const hash = txHash(signed);
+    let sent;
+    try {
+      sent = await server.sendTransaction(signed);
+    } catch (err) {
+      throw unknownOutcome(hash, `could not be confirmed as submitted (${vaultError(err)})`);
+    }
+    if (sent.status === "ERROR") {
+      if (!retried && needsResimulation(sent.errorResult)) return invoke(owner, action, fn, args, returns, true);
+      const type = sent.errorResult?.result.type ?? "unknown";
+      if (type === "txTooLate") throw new Error(`The signature took longer than the transaction's ${DEADLINE_SECONDS}-second window, so it was not submitted. Preview again and retry.`);
+      throw new Error(`Transaction rejected before inclusion (${type}).`);
+    }
+    if (sent.status === "TRY_AGAIN_LATER") throw new Error("The network did not queue the transaction. Try again.");
+    let final;
+    try {
+      final = await server.pollTransaction(hash, { attempts: POLL_ATTEMPTS });
+    } catch (err) {
+      throw unknownOutcome(hash, `was submitted but its status could not be read (${vaultError(err)})`);
+    }
+    if (final.status === rpc.Api.GetTransactionStatus.SUCCESS) {
+      const returned = final.returnValue ? `${fromUnits(BigInt(scValToNative(final.returnValue)), returns.decimals)} ${returns.unit}` : undefined;
+      return { action, hash, ledger: final.ledger, returned };
+    }
+    if (final.status === rpc.Api.GetTransactionStatus.FAILED) {
+      if (!retried && needsResimulation(final.resultXdr)) return invoke(owner, action, fn, args, returns, true);
+      const code = onchainVaultCode(final.diagnosticEventsXdr);
+      if (code && VAULT_ERRORS[code]) throw new Error(`${VAULT_ERRORS[code]} (vault error ${code}) Transaction ${hash} failed onchain; only the fee was charged.`);
+      throw new Error(`Transaction ${hash} failed onchain (${final.resultXdr.result.type}).`);
+    }
+    throw unknownOutcome(hash, `was not found within ${POLL_ATTEMPTS} seconds, past its time bound`);
+  }
+
+  // Preview for the form, shown before anything is signed; the flows below
+  // re-read it so the bound reflects the latest ledger.
+  async function preview(kind: "deposit" | "withdraw", amount: string): Promise<bigint> {
+    const assets = toUnits(amount, net.usdc.decimals);
+    return BigInt((await read(kind === "deposit" ? "preview_deposit" : "preview_withdraw", [i128(assets)])).value);
+  }
+
+  // receiver, from/owner and operator are all the connected account.
+  async function deposit(owner: string, amount: string): Promise<Receipt> {
+    const minShares = minBound(await preview("deposit", amount));
+    return invoke(owner, `Deposit ${amount} USDC`, "deposit_bounded",
+      [i128(toUnits(amount, USDC.decimals)), address(owner), address(owner), address(owner), i128(minShares), u64(deadline())], SHARES);
+  }
+
+  async function withdraw(owner: string, amount: string): Promise<Receipt> {
+    const maxShares = maxBound(await preview("withdraw", amount));
+    return invoke(owner, `Withdraw ${amount} USDC`, "withdraw_bounded",
+      [i128(toUnits(amount, USDC.decimals)), address(owner), address(owner), address(owner), i128(maxShares), u64(deadline())], SHARES);
+  }
+
+  // Full exit: redeem the whole share balance for USDC.
+  async function exitAll(owner: string): Promise<Receipt> {
+    const shares = BigInt((await read("balance", [address(owner)])).value);
+    if (shares <= BigInt(0)) throw new Error("This account holds no vault shares.");
+    const redeemable = BigInt((await read("preview_redeem", [i128(shares)])).value);
+    return invoke(owner, `Full exit: redeem ${fromUnits(shares, SHARE_DECIMALS)} shares`, "redeem_bounded",
+      [i128(shares), address(owner), address(owner), address(owner), i128(minBound(redeemable)), u64(deadline())], USDC);
+  }
+
+  return { net, vaultError, readPosition, readIndexed, readUsdcLine, addUsdcTrustline, onchainVaultCode, preview, deposit, withdraw, exitAll, assetSymbol, targetLabel, eventDetail };
 }
+export type VaultClient = ReturnType<typeof vaultClient>;

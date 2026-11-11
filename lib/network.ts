@@ -4,8 +4,9 @@
 //   Horizon endpoints for testnet). The testnet values come from the copied
 //   pre-reset deployment manifest (data/testnet-manifest.json, sha256
 //   cfa30d48adb6c5559dfbed446a4a0763c67ed0672305b18910e493b1920c2220, copied
-//   from etesia-vault/deploy/testnet/pre-2026-12-16-reset.json), so the
-//   passphrase, vault and USDC ids cannot drift from the deployed contracts.
+//   from etesia-vault/deploy/testnet/pre-2026-12-16-reset.json), so the vault
+//   and USDC ids cannot drift from the deployed contracts, and the manifest's
+//   passphrase must match the network it is used on.
 
 import manifest from "@/data/testnet-manifest.json";
 
@@ -15,6 +16,7 @@ export type ManifestAsset = {
   kind: string;
   decimals: number;
   classic?: string;
+  stand_in?: string;
 };
 
 export type NetworkConfig = {
@@ -25,15 +27,23 @@ export type NetworkConfig = {
   wallets: readonly string[];
 };
 
-export type TestnetConfig = NetworkConfig & {
+// A deployed vault on one network: its manifest's contracts plus that
+// network's endpoints. Only vaultNetwork() builds one, from a manifest.
+export type VaultNetworkConfig = NetworkConfig & {
   epoch: string;
   rpcUrl: string;
   explorerUrl: string;
-  faucetUrl: string;
+  faucetUrl: string | null;
+  // Quant API path of the vault's indexed views.
+  indexer: string;
   vault: string;
   usdc: { contract: string; code: string; issuer: string; decimals: number };
   assets: Record<string, ManifestAsset>;
 };
+
+// Every network's deployment manifest has the shape of the testnet one.
+export type Manifest = typeof manifest;
+export type Endpoints = NetworkConfig & Pick<VaultNetworkConfig, "rpcUrl" | "explorerUrl" | "faucetUrl" | "indexer">;
 
 export const MAINNET: NetworkConfig = {
   label: "Stellar mainnet",
@@ -42,25 +52,35 @@ export const MAINNET: NetworkConfig = {
   wallets: ["Freighter", "Albedo", "xBull", "Lobstr Vault", "HOT Wallet"],
 };
 
-// Asset registry keyed by symbol, generated from the manifest at build time.
-const assets: Record<string, ManifestAsset> = Object.fromEntries(
-  (manifest.assets as ManifestAsset[]).map((asset) => [asset.symbol, asset])
-);
-const [usdcCode, usdcIssuer] = (assets.USDC.classic ?? "").split(":");
-if (assets.USDC.address !== manifest.vaults.flagship.usdc || !usdcIssuer)
-  throw new Error("Testnet manifest USDC does not match the flagship vault");
+// The flagship vault of a manifest on the given network. A manifest for
+// another network is rejected, so one network's contracts never get another's passphrase.
+export function vaultNetwork(source: Manifest, network: Endpoints): VaultNetworkConfig {
+  if (source.passphrase !== network.passphrase)
+    throw new Error(`Manifest passphrase "${source.passphrase}" is not ${network.label}`);
+  // Asset registry keyed by symbol, generated from the manifest at build time.
+  const assets: Record<string, ManifestAsset> = Object.fromEntries(
+    (source.assets as ManifestAsset[]).map((asset) => [asset.symbol, asset])
+  );
+  const [usdcCode, usdcIssuer] = (assets.USDC.classic ?? "").split(":");
+  if (assets.USDC.address !== source.vaults.flagship.usdc || !usdcIssuer)
+    throw new Error("Manifest USDC does not match the flagship vault");
+  return {
+    ...network,
+    epoch: source.network_epoch,
+    vault: source.vaults.flagship.id,
+    usdc: { contract: assets.USDC.address, code: usdcCode, issuer: usdcIssuer, decimals: assets.USDC.decimals },
+    assets,
+  };
+}
 
-export const TESTNET: TestnetConfig = {
+export const TESTNET = vaultNetwork(manifest, {
   label: "Stellar testnet",
-  passphrase: manifest.passphrase,
+  passphrase: "Test SDF Network ; September 2015",
   horizonUrl: "https://horizon-testnet.stellar.org",
   // Only wallets that report their network or accept a pinned passphrase.
   wallets: ["Freighter", "xBull"],
-  epoch: manifest.network_epoch,
   rpcUrl: "https://soroban-testnet.stellar.org",
   explorerUrl: "https://stellar.expert/explorer/testnet",
   faucetUrl: "https://testnet.blend.capital",
-  vault: manifest.vaults.flagship.id,
-  usdc: { contract: assets.USDC.address, code: usdcCode, issuer: usdcIssuer, decimals: assets.USDC.decimals },
-  assets,
-};
+  indexer: "vaults/flagship",
+});

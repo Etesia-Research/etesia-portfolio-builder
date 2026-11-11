@@ -39,6 +39,8 @@ test("factsheet preserves zero allocation, null metrics and stale report dates w
   assert.match(html, /Stale report/);
   assert.match(html, new RegExp(`/api/quant/vault/backtests/${report.run_id}/files/pdf`));
   assert.doesNotMatch(html, /private-test-key|private-model-parameter|private upstream error/);
+  assert.match(html, /href="\/stellar_tf_vault\/mainnet"/);
+  assert.match(html, /href="\/stellar_tf_vault\/testnet"/);
 });
 
 test("blocked and unavailable allocations never become zero holdings, while reports fail independently", async () => {

@@ -1040,12 +1040,12 @@ button.coin-card:focus-visible { outline: 2px solid var(--accent); outline-offse
 .product-card-wrap { display: flex; flex-direction: column; min-width: 0; background: var(--paper); }
 .product-card-wrap.is-selected { background: var(--ink); color: var(--paper); }
 .product-card-wrap > .coin-card { flex: 1; }
-.product-info { display: flex; align-items: center; gap: 8px; margin: 0 18px 16px; padding: 10px 0 0; border-top: 1px solid currentColor; color: inherit; font-family: 'IBM Plex Mono', monospace; font-size: 11px; text-decoration: none; }
-.product-info > :last-child { margin-left: auto; }
-.product-info:hover { text-decoration: underline; }
+.product-links { display: flex; justify-content: flex-end; margin: 0 18px 16px; padding: 10px 0 0; border-top: 1px solid currentColor; font-family: 'IBM Plex Mono', monospace; font-size: 11px; }
+.product-links a { color: inherit; text-decoration: none; font-weight: 500; white-space: nowrap; }
+.product-links a:hover { text-decoration: underline; }
 .factsheet { max-width: 1200px; margin: 0 auto; padding: 28px 40px 40px; }
 .factsheet a { color: inherit; }
-.factsheet a:focus-visible, .product-info:focus-visible { outline: 2px solid var(--accent); outline-offset: 5px; }
+.factsheet a:focus-visible, .product-links a:focus-visible, .network-switch a:focus-visible { outline: 2px solid var(--accent); outline-offset: 5px; }
 .factsheet-nav, .factsheet-edition, .factsheet-period, .factsheet-colophon { display: flex; justify-content: space-between; gap: 16px; font-family: 'IBM Plex Mono', monospace; font-size: 10px; }
 .factsheet-nav { padding-bottom: 22px; border-bottom: 4px double var(--rule); }
 .factsheet-nav a { text-decoration: none; }
@@ -1153,15 +1153,25 @@ button.coin-card:focus-visible { outline: 2px solid var(--accent); outline-offse
   .factsheet { print-color-adjust: exact; }
 }
 
-/* Etesia-TF catalog entry: indexed testnet vault metrics (D5-06) */
-.product-indexed { margin: 0 18px 16px; padding-top: 10px; border-top: 1px solid currentColor; font-family: 'IBM Plex Mono', monospace; font-size: 11px; overflow-wrap: anywhere; }
-.product-indexed h5 { margin: 0 0 4px; font-size: 9px; font-weight: 500; letter-spacing: 0.18em; text-transform: uppercase; }
-.product-indexed dl { margin: 0; }
-.product-indexed dl > div { padding: 6px 0; border-bottom: 1px solid rgba(29,26,20,.16); }
-.product-indexed dt { font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.7; }
-.product-indexed dd { margin: 2px 0 0; }
-.product-indexed dd.data-note { margin-top: 2px; }
-.product-indexed [data-status="stale"], .product-indexed [data-status="missing"], .product-indexed [data-status="error"] { color: var(--warn); }
-.product-card-wrap.is-selected .product-indexed dl > div { border-bottom-color: rgba(243,238,227,0.2); }
-.product-card-wrap.is-selected .product-indexed [data-status="stale"], .product-card-wrap.is-selected .product-indexed [data-status="missing"], .product-card-wrap.is-selected .product-indexed [data-status="error"] { color: #e3a657; }
-.product-indexed a { color: inherit; }
+/* Network mode switch (masthead) and per-network vault pages */
+.network-switch { display: inline-flex; border: 1px solid var(--rule); }
+.network-switch a { padding: 3px 10px; color: var(--ink-2); text-decoration: none; letter-spacing: 0.14em; text-transform: uppercase; font-size: 10px; }
+.network-switch a + a { border-left: 1px solid var(--rule); }
+.network-switch a[aria-current] { background: var(--rule); color: var(--paper); }
+.network-switch a:not([aria-current]):hover { background: var(--paper-2); color: var(--ink); }
+.coin-card .data-note[data-status="stale"], .coin-card .data-note[data-status="missing"], .coin-card .data-note[data-status="error"] { color: var(--warn); }
+.coin-card.selected .data-note[data-status="stale"], .coin-card.selected .data-note[data-status="missing"], .coin-card.selected .data-note[data-status="error"] { color: #e3a657; }
+.vault-metrics { margin: 18px 0 8px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; overflow-wrap: anywhere; }
+.vault-metrics h4 { margin: 0 0 10px; font-size: 10px; font-weight: 500; letter-spacing: 0.18em; text-transform: uppercase; }
+.vault-metrics dl { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr)); margin: 0; border-top: 1px solid var(--rule); border-left: 1px solid var(--rule); }
+.vault-metrics dl > div { padding: 12px 14px; min-width: 0; border-right: 1px solid var(--rule); border-bottom: 1px solid var(--rule); }
+.vault-metrics dt { font-size: 9px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--ink-2); }
+.vault-metrics dd { margin: 4px 0 0; }
+.vault-metrics dd.data-note { margin-top: 4px; }
+.vault-metrics [data-status="stale"], .vault-metrics [data-status="missing"], .vault-metrics [data-status="error"] { color: var(--warn); }
+.vault-metrics a { color: inherit; }
+.vault-state { font-family: 'Instrument Serif', serif; font-size: 32px; line-height: 1.1; margin: 16px 0 0; color: var(--accent); }
+.vault-strategy { font-family: 'Instrument Serif', serif; font-size: 20px; line-height: 1.35; max-width: 60ch; margin: 16px 0 12px; }
+.masthead a, #root .factsheet-text-link { color: inherit; }
+.factsheet-vault-links { display: flex; flex-wrap: wrap; gap: 8px 22px; margin-top: 14px; }
+@media (max-width: 600px) { .product-links { margin: 0 12px 14px; } }

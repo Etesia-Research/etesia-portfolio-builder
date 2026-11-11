@@ -12,6 +12,8 @@ import AllocationSimulation from "@/components/AllocationSimulation";
 import useBalanceStore from "@/stores/useBalanceStore";
 import { fetchHoldings } from "@/lib/balances";
 import { MAINNET } from "@/lib/network";
+import { VAULTS, builderHref, builderNetwork, vaultHref } from "@/lib/vaults";
+import NetworkSwitch from "@/components/NetworkSwitch";
 
 const VaultCatalogEntry = dynamic(() => import("@/components/VaultCatalogEntry"), { ssr: false, loading: () => null });
 const EMPTY_HOLDINGS = {};
@@ -50,7 +52,7 @@ function ProductLogo({ coin, className = 'gl' }) {
 
 // ---------- Components ----------
 
-function Masthead({ wallet, onDisconnect }) {
+function Masthead({ wallet, onDisconnect, network, onNetwork }) {
   const today = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: '2-digit' });
   const bySymbol = usePriceStore(s => s.bySymbol);
   const pricesLoading = usePriceStore(s => s.loading);
@@ -67,8 +69,11 @@ function Masthead({ wallet, onDisconnect }) {
           <span>{today}</span>
         </div>
         <div className="row" style={{ marginTop: 6 }}>
+          <NetworkSwitch active={network} href={builderHref} onSelect={onNetwork} />
+        </div>
+        <div className="row" style={{ marginTop: 6 }}>
           {/* TODO(Step 4): replace with the real latest ledger sequence from Horizon */}
-          <span>{MAINNET.label}</span>
+          <span>{MAINNET.label}{network === 'testnet' ? ' market data · testnet vault' : ''}</span>
         </div>
         <div className="row" style={{ marginTop: 6 }}>
           <span>{pricesStatus}</span>
@@ -100,9 +105,12 @@ function Masthead({ wallet, onDisconnect }) {
   );
 }
 
-function Ticker({ coins }) {
+// A vault deployed on the active network has its indexed price on its card, so
+// the ticker leaves out its simulated $1 price.
+function Ticker({ coins, network }) {
   const bySymbol = usePriceStore(s => s.bySymbol);
-  const lane = <div className="lane">{coins.concat(coins).map((c, i) => {
+  const shown = coins.filter(c => !VAULTS.some(v => v.coin === c.id && v.networks[network]));
+  const lane = <div className="lane">{shown.concat(shown).map((c, i) => {
     const price = bySymbol[c.tk];
     return <span key={i} className="it"><strong>{c.tk}</strong>&nbsp;{fmtUsd(price?.price, price?.price < 1 ? 4 : 2)}&nbsp;
       <span style={{ fontSize: 10 }}>{c.simulated ? 'under construction' : price?.price == null ? 'unavailable' : `${price.stale ? 'stale ' : ''}close ${fmtCloseDate(price.ts)}`}</span>
@@ -160,40 +168,59 @@ function ConnectScreen({ onConnect, connecting, error }) {
   );
 }
 
-function CoinCard({ coin, selected, correlation, correlationLoading, hasBasket, onToggle, maxMcap }) {
+// A vault card's one status line for the active network.
+// (Mainnet research figures below it are labelled simulated.)
+function vaultStatus(network, deployment) {
+  const label = network === 'mainnet' ? 'Mainnet' : 'Testnet';
+  return deployment ? `${label} vault · ${deployment.epoch}` : `${label} vault not deployed yet`;
+}
+
+// Why the Builder prices a vault at a simulated $1 per share, naming only the active network.
+const simulatedShareReason = (vault, network) => vault.networks[network] ? `not the ${network} vault's indexed share price` : `there is no ${network} vault`;
+
+function CoinCard({ coin, network, selected, correlation, correlationLoading, hasBasket, onToggle, maxMcap }) {
   const mcapFrac = coin.mcap > 0 && maxMcap > 1 ? Math.min(1, Math.log10(coin.mcap) / Math.log10(maxMcap)) : 0;
   const corr = correlation?.status === 'available' ? correlation.correlation : null;
+  // A vault's card shows only the active network's vault: where it is deployed,
+  // its indexed figures replace the simulated research analytics.
+  const vault = VAULTS.find(v => v.coin === coin.id);
+  const deployment = vault ? vault.networks[network] : null;
+  const indexedVault = Boolean(deployment);
   return (
     <div className={`product-card-wrap ${selected ? 'is-selected' : ''}`}>
     <button type="button" className={`coin-card ${selected ? 'selected' : ''}`} onClick={onToggle} data-tk={coin.tk} aria-pressed={selected}>
       <div className="top"><ProductLogo coin={coin} className="glyph" /><div className="check">{selected ? '✓' : ''}</div></div>
       <div className="name-line"><div className="tk">{coin.tk}</div><div className="nm">{coin.name}</div></div>
-      {coin.simulated && <div className="product-status">Under construction · simulated returns</div>}
+      {vault && <div className="product-status">{vaultStatus(network, deployment)}</div>}
+      {coin.simulated && !vault && <div className="product-status">Under construction · simulated returns</div>}
       {!coin.simulated && !coin.allocationSupported && <div className="product-status">Analytics only · allocation API update required</div>}
       {['eth', 'btc'].includes(coin.id) && <div className="data-note">Underlying price history</div>}
-      {hasBasket && <div className={`corr-pill ${corr == null ? '' : corrColor(corr)}`} title={metricNote(correlation, correlation?.error)}>
+      {hasBasket && !indexedVault && <div className={`corr-pill ${corr == null ? '' : corrColor(corr)}`} title={metricNote(correlation, correlation?.error)}>
         {correlationLoading ? 'ρ loading…' : corr == null ? 'ρ unavailable' : `ρ ${corr.toFixed(2)}${correlation.simulated ? ' · simulated' : ''}${correlation.stale ? ' · stale' : ''}`}
       </div>}
+      {indexedVault ? <VaultCatalogEntry indexer={deployment.indexer} /> : <>
       <div className="stats">
-        <div title={`${coin.marketCap.reason || ''} ${coin.marketCap.as_of ? fmtDate(coin.marketCap.as_of) : ''}`}>
+        {!vault && <div title={`${coin.marketCap.reason || ''} ${coin.marketCap.as_of ? fmtDate(coin.marketCap.as_of) : ''}`}>
           <div className="stat-label">{coin.marketCap.basis === 'issuer_net_value' ? 'Issuer net value' : 'Market cap'}{coin.marketCap.stale && coin.mcap != null ? ' · stale' : ''}</div>
           <div className="stat-val">{fmtMcap(coin.mcap)}</div><div className="bar-track"><div className="bar-fill" style={{ width: `${mcapFrac * 100}%` }} /></div>
-        </div>
+        </div>}
         <div title={metricNote(coin.analytics, coin.analyticsError)}>
           <div className="stat-label">Sharpe · annualized{coin.simulated ? ' · simulated' : ''}</div>
           <div className="stat-val">{coin.sharpe == null ? '—' : coin.sharpe.toFixed(2)}</div>
         </div>
       </div>
       <div className="data-note">{metricNote(coin.analytics, coin.analyticsError)}</div>
-      {hasBasket && !correlationLoading && corr == null && <div className="data-note">{correlation?.reason || correlation?.error || 'Correlation unavailable'}</div>}
+      </>}
+      {hasBasket && !indexedVault && !correlationLoading && corr == null && <div className="data-note">{correlation?.reason || correlation?.error || 'Correlation unavailable'}</div>}
     </button>
-    {coin.id === 'etesia-tf' && <a className="product-info" href="/stellar_tf_vault" aria-label="Etesia-TF strategy factsheet"><span aria-hidden="true">ⓘ</span> Strategy factsheet <span aria-hidden="true">↗</span></a>}
-    {coin.id === 'etesia-tf' && <VaultCatalogEntry />}
+    {vault && <div className="product-links">
+      <a href={vaultHref(vault, network)} aria-label={`Open the ${vault.name} ${network} vault page`}>Open vault <span aria-hidden="true">→</span></a>
+    </div>}
     </div>
   );
 }
 
-function Sidecar({ basket, coins, removeFromBasket, analytics, analyticsLoading }) {
+function Sidecar({ basket, coins, removeFromBasket, analytics, analyticsLoading, network }) {
   return <aside className="sidecar">
     <h4>Working basket — {basket.length} {basket.length === 1 ? 'asset' : 'assets'}</h4>
     {!basket.length && <div className="empty">An empty page awaits the first pick.</div>}
@@ -216,7 +243,7 @@ function Sidecar({ basket, coins, removeFromBasket, analytics, analyticsLoading 
     </div>}
     <p className="data-note">Sharpe uses the arithmetic mean of daily portfolio returns, not CAGR or an average of product ratios. With negative returns, lower volatility can make Sharpe more negative.</p>
     <p className="data-note">ρ compares each product with this basket over up to three years, using equal capital at the start of the window and fixed quantities thereafter.</p>
-    {basket.includes('ETESIA-TF') && <p className="data-note">Basket metrics include simulated vault returns. The vault is included in allocation using simulated history and a simulated $1 share price: there is no mainnet vault. The indexed testnet share price on its card is display only.</p>}
+    {basket.includes('ETESIA-TF') && <p className="data-note">Basket metrics include simulated vault returns. The vault is included in allocation using simulated history and a simulated $1 share price: {simulatedShareReason(VAULTS.find(v => v.coin === 'etesia-tf'), network)}.</p>}
   </aside>;
 }
 
@@ -346,7 +373,7 @@ function FundingPanel({ coins, allocationCoins, selectedHolding, setSelectedHold
 }
 
 
-function AllocStage({ allocation, coins, onReset }) {
+function AllocStage({ allocation, coins, onReset, network }) {
   const productAllocation = allocation.requested_assets.reduce((sum, id) => sum + (allocation.positions[id]?.allocation_fraction || 0), 0);
   const ordered = Object.entries(allocation.positions || {}).filter(([, p]) => p.allocation_fraction > 0).sort((a, b) => b[1].allocation_fraction - a[1].allocation_fraction);
   const coinFor = (id) => coins.find(c => c.id === id.replace('_buffer', '').replace('_reserve', ''));
@@ -375,8 +402,14 @@ function AllocStage({ allocation, coins, onReset }) {
     </div><button className="btn ghost" onClick={onReset}>← Revise basket</button></div>
     <p className="data-note">Simulated allocation · reference quantities, no funds moved. Product allocation and estimated volatility include every selected product, including the vault. The volatility estimate uses the current risk model’s one-year history and excludes reserves and buffers. The three-year historical metrics below include the entire portfolio.</p>
     <AllocationSimulation allocation={allocation} />
-    <ExecutionSimulation allocation={allocation} funding={allocation.funding} usdcUsd={allocation.usdcUsd} />
-    {allocation.positions?.['etesia-tf']?.notional_usdc > 0 && <p className="data-note">Only the Etesia-TF vault leg executes, on Stellar testnet: <a href={`/testnet?amount=${allocation.positions['etesia-tf'].notional_usdc.toFixed(7)}`}>deposit its {allocation.positions['etesia-tf'].notional_usdc.toLocaleString(undefined, { maximumFractionDigits: 2 })} USDC in the testnet vault →</a> The other legs stay quoted above and are not executed.</p>}
+    <ExecutionSimulation allocation={allocation} funding={allocation.funding} usdcUsd={allocation.usdcUsd} vaultReason={simulatedShareReason(VAULTS.find(v => v.coin === 'etesia-tf'), network)} />
+    {VAULTS.filter(v => allocation.positions?.[v.coin]?.notional_usdc > 0).map(v => {
+      const leg = allocation.positions[v.coin].notional_usdc;
+      const deployment = v.networks[network];
+      return deployment
+        ? <p className="data-note" key={v.slug}>Only the {v.name} vault leg executes, on {deployment.label}: <a href={`${vaultHref(v, network)}?amount=${leg.toFixed(7)}`}>deposit its {leg.toLocaleString(undefined, { maximumFractionDigits: 2 })} USDC in the {network} vault →</a> The other legs stay quoted above and are not executed.</p>
+        : <p className="data-note" key={v.slug}>{network === 'mainnet' ? 'Mainnet' : 'Testnet'} vault not deployed yet: the {v.name} leg is not executed. <a href={vaultHref(v, network)}>{v.name} {network} vault page →</a></p>;
+    })}
     {allocation.binding_constraints.length > 0 && <p className="data-note">Model limits: {allocation.binding_constraints.map(c => c.replaceAll('_', ' ')).join(' · ')}</p>}
     {allocation.diagnostics.length > 0 && <p className="data-note">{allocation.diagnostics.join(' · ')}</p>}
   </section>;
@@ -401,6 +434,9 @@ export default function PortfolioBuilder() {
   const [cashReserves, setCashReserves] = useState(['ustry']);
   const [supportedReserves, setSupportedReserves] = useState(['ustry']);
   const [basketAnalytics, setBasketAnalytics] = useState({ key: '', value: null });
+  // Mainnet | Testnet mode, kept in the URL (?network=testnet) so links share it.
+  const [network, setNetwork] = useState(() => builderNetwork(window.location.search));
+  const selectNetwork = (next) => { setNetwork(next); window.history.replaceState(null, '', builderHref(next)); };
   const buildRequest = useRef(null);
 
   const address = useStellarWalletStore(s => s.address);
@@ -561,20 +597,22 @@ export default function PortfolioBuilder() {
   };
 
   return <div id="root">
-    <div className="data-banner">Beta · Quant market data and allocation · Vault returns and execution are simulated</div>
-    <Masthead wallet={wallet} onDisconnect={() => { buildRequest.current?.abort(); disconnectWallet(); setBasket([]); setHolding(null); setAmount(''); setAllocation(null); setPhase('connect'); }} />
-    <Ticker coins={products} />
+    <div className="data-banner">{network === 'testnet'
+      ? 'Testnet mode · vault cards show the testnet vault, test funds only · Market data and wallet balances stay on mainnet; allocation and execution are simulated'
+      : 'Beta · Quant market data and allocation · Vault returns and execution are simulated'}</div>
+    <Masthead network={network} onNetwork={selectNetwork} wallet={wallet} onDisconnect={() => { buildRequest.current?.abort(); disconnectWallet(); setBasket([]); setHolding(null); setAmount(''); setAllocation(null); setPhase('connect'); }} />
+    <Ticker coins={products} network={network} />
     {phase === 'connect' && <ConnectScreen onConnect={kind => connectWallet(kind).catch(() => {})} connecting={connecting} error={connectError} />}
     <div className={phase === 'allocated' ? 'locked' : ''}>
       <div className="section-bar"><span className="num-mark">02</span><h2>Universe — pick the candidates</h2><span className="meta">{basket.length ? `${basket.length} selected · lowest correlation first` : 'Select products to compare'}</span></div>
       <div className="data-toolbar"><span role="status">{loading ? 'Loading quant market data…' : catalogError ? `Market data unavailable: ${catalogError}` : `${products.length} products from the quant universe · daily reference data`}</span><button className="btn ghost" disabled={loading} onClick={() => setRefresh(v => v + 1)}>Refresh data</button></div>
-      <div className="two-col"><div className="coin-grid">{sortedCoins.map(c => <CoinCard key={c.tk} coin={c} selected={basket.includes(c.tk)} correlation={candidateCorr[c.tk]} correlationLoading={correlationLoading} hasBasket={basket.length > 0} onToggle={() => setBasket(current => current.includes(c.tk) ? current.filter(t => t !== c.tk) : [...current, c.tk])} maxMcap={maxMcap} />)}</div><Sidecar basket={basket} coins={coins} analytics={basketAnalytics.key === basketKey ? basketAnalytics.value : null} analyticsLoading={basket.length > 0 && basketAnalytics.key !== basketKey} removeFromBasket={tk => setBasket(current => current.filter(t => t !== tk))} /></div>
+      <div className="two-col"><div className="coin-grid">{sortedCoins.map(c => <CoinCard key={c.tk} coin={c} network={network} selected={basket.includes(c.tk)} correlation={candidateCorr[c.tk]} correlationLoading={correlationLoading} hasBasket={basket.length > 0} onToggle={() => setBasket(current => current.includes(c.tk) ? current.filter(t => t !== c.tk) : [...current, c.tk])} maxMcap={maxMcap} />)}</div><Sidecar basket={basket} coins={coins} network={network} analytics={basketAnalytics.key === basketKey ? basketAnalytics.value : null} analyticsLoading={basket.length > 0 && basketAnalytics.key !== basketKey} removeFromBasket={tk => setBasket(current => current.filter(t => t !== tk))} /></div>
       {wallet && <>
         <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">03</span><h2>Funding — capital source &amp; amount</h2><span className="meta">Hypothetical allocation</span></div>
         <FundingPanel coins={coins} allocationCoins={allocationCoins} selectedHolding={holding} setSelectedHolding={setHolding} amount={amount} setAmount={setAmount} onBuild={onBuild} building={building} error={buildError} budget={budget} setBudget={setBudget} reserveValid={reserveValid} reserveSelector={<CashReservePanel selected={cashReserves} onChange={setCashReserves} supported={supportedReserves} coins={coins} />} />
       </>}
     </div>
-    {phase === 'allocated' && allocation?.owner === address && <><div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">05</span><h2>Allocation — model targets</h2><span className="meta">Simulation only</span></div><AllocStage allocation={allocation} coins={coins} onReset={() => { setAllocation(null); setPhase('select'); }} /></>}
+    {phase === 'allocated' && allocation?.owner === address && <><div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">05</span><h2>Allocation — model targets</h2><span className="meta">Simulation only</span></div><AllocStage allocation={allocation} coins={coins} network={network} onReset={() => { setAllocation(null); setPhase('select'); }} /></>}
     <footer className="data-footer"><span>ETESIA RESEARCH</span><span>Live wallet balances · daily quant analytics · simulated vault returns · allocation preview, no funds moved</span></footer>
   </div>;
 }

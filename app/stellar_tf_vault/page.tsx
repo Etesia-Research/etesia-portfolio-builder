@@ -90,6 +90,7 @@ export default async function VaultFactsheet() {
             <div><dt>Status</dt><dd>Research preview</dd></div>
           </dl>
           <a href="#research" className="factsheet-text-link">Explore the backtest <span aria-hidden="true">↓</span></a>
+          <div className="factsheet-vault-links"><a href="/stellar_tf_vault/mainnet" className="factsheet-text-link">Mainnet vault <span aria-hidden="true">→</span></a><a href="/stellar_tf_vault/testnet" className="factsheet-text-link">Testnet vault <span aria-hidden="true">→</span></a></div>
         </aside>
       </header>
       <div className="factsheet-edition">

@@ -1,5 +1,5 @@
-// D5-06: the Builder proxy's indexed vault routes and the /testnet panels fed
-// by them, with fixture responses shaped like the D5-05 metrics API.
+// D5-06: the Builder proxy's indexed vault routes and the testnet vault page's
+// panels fed by them, with fixture responses shaped like the D5-05 metrics API.
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -25,8 +25,14 @@ const OWNER = sdk.Keypair.random().publicKey();
 const [USDC, XLM, RESERVE] = [TESTNET.usdc.contract, TESTNET.assets.XLM.address, TESTNET.assets.tRESERVE.address];
 const hash = (c) => c.repeat(64);
 
-function vaultLib(quantRequest = async () => { throw new Error("not used"); }) {
+const vaults = load("lib/vaults.ts", { "@/lib/network": network });
+function vaultModule(quantRequest = async () => { throw new Error("not used"); }) {
   return load("lib/vault.ts", { "@/lib/network": network, "@/components/stellar/walletKit": { signTx: async () => { throw new Error("not used"); } }, "@/lib/quant": { quantRequest } });
+}
+// The testnet client merged with the module's network-free helpers.
+function vaultLib(quantRequest) {
+  const lib = vaultModule(quantRequest);
+  return { ...lib, ...lib.vaultClient(TESTNET) };
 }
 
 // Responses shaped like d5-05 routes (summary values from the 2026-11-11 testnet sample).
@@ -154,24 +160,28 @@ test("Blend interest leaves out intervals with a supply or withdraw and interval
   assert.deepEqual(lib.supplyAccrual([], fixtures.events, 5680001), []);
 });
 
-function component() {
-  const lib = vaultLib();
-  return load("components/TestnetVault.jsx", { "@/lib/vault": lib, "@/lib/network": network,
-    "@/stores/useStellarWalletStore": { default: () => null }, "@/components/stellar/walletKit": {} });
+function component(imports = {}, globals = {}) {
+  return load("components/VaultDesk.jsx", { "@/lib/vault": vaultModule(), "@/lib/vaults": vaults,
+    "@/components/NetworkSwitch": { __esModule: true, default: () => null },
+    "@/stores/useStellarWalletStore": { default: () => null }, "@/components/stellar/walletKit": {}, ...imports }, globals);
 }
 
-test("the /testnet page mounts the indexed vault section before any wallet connects", () => {
-  const { default: TestnetVault } = load("components/TestnetVault.jsx", { "@/lib/vault": vaultLib(), "@/lib/network": network,
+test("the testnet vault page mounts the indexed vault section before any wallet connects", () => {
+  const { default: VaultDesk } = component({
     "@/stores/useStellarWalletStore": { __esModule: true, default: sel => sel({ address: null, connected: false }) },
     "@/components/stellar/walletKit": { initWalletKit() {}, connectWallet() {}, disconnectWallet() {} } }, { window: { location: { search: "" } } });
-  const html = renderToStaticMarkup(React.createElement(TestnetVault));
+  const html = renderToStaticMarkup(React.createElement(VaultDesk, { slug: "stellar_tf_vault", network: "testnet" }));
   assert.ok(html.includes("Vault — indexed metrics"));
+  assert.ok(html.includes("Key metrics · Stellar testnet vault (pre-2026-12-16-reset), indexed"));
   assert.ok(html.includes("Vault summary") && html.includes("Reading the indexer…"));
+  // The deposit is reached directly: the wallet comes right after the key metrics, the detailed panels after it.
+  assert.ok(html.indexOf("Key metrics") < html.indexOf("Connect wallet") && html.indexOf("Connect wallet") < html.indexOf("Vault summary"));
 });
 
 test("indexed panels show each view's values with its status, and stale, missing and failed views are labelled", () => {
   const { IndexedVault } = component();
-  const html = renderToStaticMarkup(React.createElement(IndexedVault, { indexed: fixtures }));
+  const client = vaultLib();
+  const html = renderToStaticMarkup(React.createElement(IndexedVault, { indexed: fixtures, client }));
   for (const text of ["1,000.8164 USDC", "1.0006921 USDC", "1,000.1242 shares", "Open", "nonce 47", "XLM 12% · tRESERVE 85.5% · USDC 2.5%", "3 ledgers behind",
     `mark:${XLM} oracle:Stale`, "Fresh · indexed as of 2026-11-11T12:55:00+00:00", "Stale · indexed as of 2026-11-11T12:00:00+00:00",
     "12 snapshots", "Holdings at 2026-11-11 12:50 UTC", "Blend interest · supplied USDC +0.0123 over 1 of 2 snapshot intervals",
@@ -181,7 +191,7 @@ test("indexed panels show each view's values with its status, and stale, missing
     "Rebalance · plan", "nonce 46 · equity 1000.5 → 1000.4 USDC", "Blend yield · position", "Blend supply 100 USDC", `/tx/${hash("a")}`]) {
     assert.ok(html.includes(text), text);
   }
-  const degraded = renderToStaticMarkup(React.createElement(IndexedVault, { indexed: {
+  const degraded = renderToStaticMarkup(React.createElement(IndexedVault, { client, indexed: {
     summary: { ...fixtures.summary, ...header("missing"), tvl_usdc: null },
     history: { status: "error", error: "Quant request timed out" },
     performance: { ...fixtures.performance, backtest: null },
@@ -192,7 +202,7 @@ test("indexed panels show each view's values with its status, and stale, missing
   assert.ok(degraded.includes("No published backtest"));
   assert.ok(!degraded.includes("TVL")); // a missing view shows no stand-in values
   // The latest snapshot succeeded: no stale-holdings note.
-  const current = renderToStaticMarkup(React.createElement(IndexedVault, { indexed: { ...fixtures, allocations: { ...fixtures.allocations, holdings: fixtures.allocations.holdings.slice(0, 3) } } }));
+  const current = renderToStaticMarkup(React.createElement(IndexedVault, { client, indexed: { ...fixtures, allocations: { ...fixtures.allocations, holdings: fixtures.allocations.holdings.slice(0, 3) } } }));
   assert.ok(current.includes("Holdings at 2026-11-11 12:50 UTC") && !current.includes("showing the last successful snapshot"));
 });
 
@@ -205,36 +215,40 @@ test("the indexed position sits next to the contract read and says whether the s
   assert.ok(render({ view: { ...fixtures.position, ...header("missing") }, contractShares: BigInt(1) }).includes("Missing"));
 });
 
-test("the mainnet execution row is labelled as simulated at $1 per share", () => {
+test("the execution row is labelled as simulated at $1 per share, naming only the active network", () => {
   const { default: ExecutionSimulation } = load("components/ExecutionSimulation.jsx", { "@/lib/execution": { executionQuotes: () => new Promise(() => {}), tokenUnits: String } });
-  const html = renderToStaticMarkup(React.createElement(ExecutionSimulation, { allocation: {}, funding: {}, usdcUsd: 1 }));
+  const html = renderToStaticMarkup(React.createElement(ExecutionSimulation, { allocation: {}, funding: {}, usdcUsd: 1, vaultReason: "there is no mainnet vault" }));
   assert.ok(html.includes("The Etesia-TF row is simulated at $1 per share: there is no mainnet vault."));
+  assert.ok(!/testnet/i.test(html), html);
   const source = fs.readFileSync(path.join(root, "components/ExecutionSimulation.jsx"), "utf8");
-  assert.ok(source.includes("'Simulated at $1 per share · no mainnet vault · no swap quote'"));
-  assert.ok(!/[Aa]ssumed \$1/.test(source));
+  assert.ok(source.includes("`Simulated at $1 per share · ${vaultReason} · no swap quote`"));
+  assert.ok(!/[Aa]ssumed \$1|testnet/i.test(source));
 });
 
-function catalogEntry(quantRequest) {
-  return load("components/VaultCatalogEntry.jsx", { "@/lib/vault": vaultLib(quantRequest), "@/lib/network": network });
+// The key metrics moved from the catalog card to the vault page (VaultDesk).
+function catalogEntry() {
+  const { VaultMetrics } = component();
+  const client = vaultLib();
+  return { IndexedVaultEntry: ({ indexed }) => React.createElement(VaultMetrics, { indexed, client }) };
 }
 
-test("the mainnet catalog entry shows the indexed testnet vault metrics, each with its freshness", () => {
+test("the vault page's key metrics show the indexed testnet vault metrics, each with its freshness", () => {
   const { IndexedVaultEntry } = catalogEntry();
   const html = renderToStaticMarkup(React.createElement(IndexedVaultEntry, { indexed: fixtures }));
-  for (const text of ["Testnet vault (pre-reset), indexed", "1.0006921 USDC", "1,000.8164 USDC",
+  for (const text of ["Key metrics · Stellar testnet vault (pre-2026-12-16-reset), indexed", "1.0006921 USDC", "1,000.8164 USDC",
     "USDC 90.00% vs 2.5% target · XLM 10.00% vs 12% target · tRESERVE — vs 85.5% target · holdings at 2026-11-11 12:50 UTC · target epoch 3 expired at 2026-11-11 12:26 UTC",
     'data-status="stale">Latest snapshot at 2026-11-11 12:55 UTC failed (holdings vault:Pricing); showing the last successful snapshot at 2026-11-11 12:50 UTC.',
     "2026-11-11 05:00 UTC · plan · nonce 46 · equity 1000.5 → 1000.4 USDC", `${TESTNET.explorerUrl}/tx/${hash("a")}`,
     "USDC +0.0123 interest over 1 of 2 snapshot intervals from 2026-11-11 04:00 UTC to 2026-11-11 12:50 UTC", "0.07% over 2.54 days · not annualized",
     "0.00% over 12 snapshots from 2026-11-11 00:00 UTC to 2026-11-11 11:00 UTC · share price, not annualized", "Stale · indexed as of 2026-11-11T12:00:00+00:00",
     "Fresh · indexed as of 2026-11-11T12:55:00+00:00 · 2 min old", "events · Fresh · indexed as of 2026-11-11T12:57:00+00:00",
-    "Not used in the allocation or the simulated execution, which price the vault at $1 per share."]) {
+    "Not used in the Builder allocation or the simulated execution, which price the vault at $1 per share."]) {
     assert.ok(html.includes(text), text);
   }
   assert.ok(!html.includes("unavailable"));
 });
 
-test("the catalog entry labels stale, missing, failed and loading views and never shows a stand-in number", () => {
+test("the key metrics label stale, missing, failed and loading views and never shows a stand-in number", () => {
   const { IndexedVaultEntry } = catalogEntry();
   const render = (indexed) => renderToStaticMarkup(React.createElement(IndexedVaultEntry, { indexed }));
   const degraded = render({
@@ -270,7 +284,7 @@ test("a failed allocations, events, performance or history request leaves its me
   assert.ok(!html.includes("showing the last successful snapshot"));
 });
 
-test("the catalog entry compares against the newest target and shows the latest rebalance or unwind", () => {
+test("the key metrics compare against the newest target and shows the latest rebalance or unwind", () => {
   const { IndexedVaultEntry } = catalogEntry();
   const newer = { ...fixtures.allocations.targets[0], ledger: 5679600, tx_hash: hash("g"), epoch: 4, expiry: 1794500000, assets: [XLM, USDC], weights_bps: [3000, 7000] };
   const unwind = { id: "0004", ledger: 5679800, closed_at: "2026-11-11T11:00:00Z", tx_hash: hash("h"), contract: TESTNET.vault, kind: "unwind", topics: ["unwind"], data: [47] };
@@ -306,12 +320,28 @@ test("Blend yield shows no unmeasured zero, says when nothing is supplied, and m
   assert.equal(one.match(/<dd>unavailable<\/dd>/g).length, 1);
 });
 
-test("the catalog entry reads the flagship views through the quant proxy without an owner and refreshes every 300 s", async () => {
+test("the compact catalog card reads only the summary of the active network's indexer and refreshes every 300 s", async () => {
   const paths = [], intervals = [];
   const runEffects = { ...React, useState: (initial) => [initial, () => {}], useEffect: (fn) => { fn(); } };
-  const { default: VaultCatalogEntry } = load("components/VaultCatalogEntry.jsx", { react: runEffects, "@/lib/network": network,
-    "@/lib/vault": vaultLib(async (p) => { paths.push(p); return header("missing"); }) }, { setInterval: (fn, ms) => intervals.push(ms), clearInterval() {} });
-  renderToStaticMarkup(React.createElement(VaultCatalogEntry));
-  assert.deepEqual(paths.sort(), ["vaults/flagship/allocations?limit=288", "vaults/flagship/events?limit=100", "vaults/flagship/history?limit=288", "vaults/flagship/performance", "vaults/flagship/summary"]);
+  const { default: VaultCatalogEntry } = load("components/VaultCatalogEntry.jsx", { react: runEffects,
+    "@/lib/quant": { quantRequest: async (p) => { paths.push(p); return header("missing"); } } }, { setInterval: (fn, ms) => intervals.push(ms), clearInterval() {} });
+  renderToStaticMarkup(React.createElement(VaultCatalogEntry, { indexer: TESTNET.indexer }));
+  assert.deepEqual(paths, ["vaults/flagship/summary"]);
   assert.deepEqual(intervals, [300000]);
+});
+
+test("the compact catalog card shows at most share price and TVL with one freshness line, never a stand-in", () => {
+  const { VaultFigures } = load("components/VaultCatalogEntry.jsx", { "@/lib/quant": {} });
+  const render = (summary) => renderToStaticMarkup(React.createElement(VaultFigures, { summary }));
+  const html = render(fixtures.summary);
+  assert.ok(html.includes("Share price · USDC") && html.includes(">1.0007<") && html.includes("TVL · USDC") && html.includes(">1,000.82<"));
+  assert.ok(html.includes('data-status="fresh">Fresh · indexed 2026-11-11 12:55 UTC'));
+  assert.equal(html.match(/class="stat-val"/g).length, 2);
+  for (const detail of ["target", "rebalance", "Blend", "drawdown", "return"]) assert.ok(!html.includes(detail), detail);
+  assert.ok(render(header("stale", "2026-11-11T12:00:00+00:00", 3300)).includes('data-status="stale">Stale · indexed 2026-11-11 12:00 UTC'));
+  const down = render({ status: "error", error: "Quant request timed out" });
+  assert.equal(down.match(/>—</g).length, 2);
+  assert.ok(down.includes("Indexer unavailable") && !/\d\.\d/.test(down));
+  assert.equal(render(header("missing")).match(/>—</g).length, 2);
+  assert.equal(render(null).match(/>…</g).length, 2);
 });

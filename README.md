@@ -62,21 +62,30 @@ arrive before the kit finishes availability checks and installs its modal event
 listeners, leaving the connection pending. Controlled checks wait for those
 checks before selecting the wallet. Reloading restores the connection screen.
 
-## Testnet vault (`/testnet`)
+## Vault pages (`/<vault>/<network>`)
 
-`/testnet` signs real Stellar testnet transactions against the flagship vault of
-the pre-reset deployment (`data/testnet-manifest.json`, copied from
-`etesia-vault/deploy/testnet/pre-2026-12-16-reset.json`). It offers
-Freighter/Varial and xBull only; the mainnet pages still sign nothing. An
-allocation with an Etesia-TF leg links to `/testnet?amount=<vault-leg USDC>`,
-which prefills the deposit; the other legs stay quoted and are not executed.
+Each vault has one page per network, listed in `lib/vaults.ts`: today
+`/stellar_tf_vault/testnet` and `/stellar_tf_vault/mainnet`. A new vault is one
+registry entry. The masthead switch (Mainnet | Testnet, `?network=testnet` on `/`)
+selects which network's vault the Builder shows; the two are never mixed. The old
+`/testnet` URL redirects to `/stellar_tf_vault/testnet`.
+
+`/stellar_tf_vault/testnet` signs real Stellar testnet transactions against the
+flagship vault of the pre-reset deployment (`data/testnet-manifest.json`, copied
+from `etesia-vault/deploy/testnet/pre-2026-12-16-reset.json`). It offers
+Freighter/Varial and xBull only; the Builder itself still signs nothing. In
+testnet mode, an allocation with an Etesia-TF leg links to
+`/stellar_tf_vault/testnet?amount=<vault-leg USDC>`, which prefills the deposit;
+the other legs stay quoted and are not executed. `/stellar_tf_vault/mainnet`
+shows the vault as not deployed, with every control disabled, until a mainnet
+manifest is added to the registry.
 
 ### Testnet wallet check (manual script)
 
 Use a throwaway testnet account funded with Friendbot, with Freighter/Varial set
 to Testnet. Expected page text is quoted.
 
-1. Open `/testnet`, press **Connect wallet**, pick Freighter, approve. The
+1. Open `/stellar_tf_vault/testnet`, press **Connect wallet**, pick Freighter, approve. The
    masthead shows "CONNECTED — Freighter"; Onboarding shows "Funded · … XLM" and
    "USDC trustline Missing".
 2. Press **Sign & add USDC trustline**, approve. A receipt "Testnet transaction,
