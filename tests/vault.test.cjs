@@ -73,6 +73,7 @@ function harness({ views = {}, sends = [], polls = [{ status: "SUCCESS", ledger:
     "@stellar/stellar-sdk": { ...sdk, Contract, rpc: { ...sdk.rpc, Server }, Horizon: { ...sdk.Horizon, Server: HorizonServer } },
     "@/lib/network": network,
     "@/components/stellar/walletKit": { signTx: async (xdr) => { calls.signed++; return xdr; } },
+    "@/lib/quant": { quantRequest: async () => { throw new Error("not used"); } },
   });
   return { vault, calls, flows: () => calls.contract.filter(c => c.fn.endsWith("_bounded")) };
 }

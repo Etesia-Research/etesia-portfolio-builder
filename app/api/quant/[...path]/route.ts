@@ -6,12 +6,15 @@ const GET_PATH = new RegExp(`^(tokens|market-caps|tokens/${TOKEN}/(?:last-close|
 const POST_PATH = /^(correlations|basket\/analytics|builder\/(?:targets|simulation)|quotes)$/;
 
 const REPORT_PATH = /^vault\/backtests\/([a-f0-9]{20})\/files\/(pdf|xlsx)$/;
+// D5-05 indexed vault metrics; their query string (kind, limit) is forwarded.
+const VAULT_PATH = /^vaults\/(flagship|guard)\/(summary|history|allocations|performance|events|positions\/[GC][A-Z2-7]{55})$/;
 
 async function proxy(request: NextRequest, context: { params: Promise<{ path: string[] }> }) {
   const { path } = await context.params;
   const endpoint = path.join("/");
   const report = request.method === "GET" ? REPORT_PATH.exec(endpoint) : null;
-  if (!report && !(request.method === "GET" ? GET_PATH : POST_PATH).test(endpoint)) {
+  const vault = request.method === "GET" && VAULT_PATH.test(endpoint);
+  if (!report && !vault && !(request.method === "GET" ? GET_PATH : POST_PATH).test(endpoint)) {
     return NextResponse.json({ error: "Unknown quant endpoint" }, { status: 404 });
   }
   const configured = process.env.ETESIA_API_URL?.trim();
@@ -30,7 +33,7 @@ async function proxy(request: NextRequest, context: { params: Promise<{ path: st
   }
   try {
     const base = new URL(configured.includes("://") ? configured : `https://${configured}`);
-    const response = await fetch(new URL(`/v1/${endpoint}`, base), {
+    const response = await fetch(new URL(`/v1/${endpoint}${vault ? request.nextUrl.search : ""}`, base), {
       method: request.method,
       headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body,

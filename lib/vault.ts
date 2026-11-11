@@ -26,6 +26,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { TESTNET } from "@/lib/network";
 import { signTx } from "@/components/stellar/walletKit";
+import { quantRequest } from "@/lib/quant";
 
 export const SHARE_DECIMALS = 12; // types.rs SHARE_MULTIPLIER: twelve share decimals
 export const BOUND_BPS = BigInt(50); // 0.5% slippage bound against the preview
@@ -130,8 +131,7 @@ export type VaultPosition = {
 };
 
 // Shares and their USDC value, read from the contract (not an indexer).
-// D5-06 seam: indexed NAV / share-price history and rebalance panels attach
-// next to this read once the quant metrics routes exist.
+// The indexed views (readIndexed below) are shown next to this read.
 export async function readPosition(owner: string): Promise<VaultPosition> {
   const [balance, maxWithdraw, liquid, state] = await Promise.all([
     read("balance", [address(owner)]),
@@ -145,6 +145,92 @@ export async function readPosition(owner: string): Promise<VaultPosition> {
     ledger: Math.max(balance.ledger, maxWithdraw.ledger, liquid.ledger, state.ledger),
     shares, value, maxWithdraw: BigInt(maxWithdraw.value), liquid: BigInt(liquid.value), paused: Boolean(state.value.paused),
   };
+}
+
+// D5-05 indexed views of the flagship vault, through the Builder proxy. Each
+// carries status (fresh, stale or missing) and as_of; a failed request becomes
+// status "error" so its panel says so instead of showing nothing.
+export type Indexed = { status: "fresh" | "stale" | "missing" | "error"; as_of?: string | null; age_seconds?: number | null; error?: string; [field: string]: any };
+export const INDEXED_LIMIT = 288; // snapshots every 300 s: about 24 h
+export const EVENTS_LIMIT = 100; // newest rebalance and yield events
+
+export async function readIndexed(owner?: string | null): Promise<Record<string, Indexed>> {
+  const base = "vaults/flagship";
+  const paths: Record<string, string> = {
+    summary: `${base}/summary`, history: `${base}/history?limit=${INDEXED_LIMIT}`,
+    allocations: `${base}/allocations?limit=${INDEXED_LIMIT}`, performance: `${base}/performance`, events: `${base}/events?limit=${EVENTS_LIMIT}`,
+    ...(owner ? { position: `${base}/positions/${owner}` } : {}),
+  };
+  const settled = await Promise.allSettled(Object.values(paths).map((path) => quantRequest(path)));
+  return Object.fromEntries(Object.keys(paths).map((key, i) => {
+    const result = settled[i];
+    return [key, result.status === "fulfilled" ? result.value
+      : { status: "error", error: result.reason instanceof Error ? result.reason.message : String(result.reason) }];
+  }));
+}
+
+export function freshness(view?: Indexed): string {
+  if (!view) return "Reading the indexer…";
+  if (view.status === "error") return `Unavailable · ${view.error}`;
+  if (view.status === "missing") return "Missing · the indexer has no data for this view yet";
+  const age = view.age_seconds == null ? "" : ` · ${Math.round(view.age_seconds / 60)} min old`;
+  return `${view.status === "stale" ? "Stale" : "Fresh"} · indexed as of ${view.as_of}${age}`;
+}
+
+// Evenly spaced items, always keeping the first and the last.
+export function sample<T>(items: T[], count: number): T[] {
+  if (items.length <= count) return items;
+  return Array.from({ length: count }, (_, i) => items[Math.round((i * (items.length - 1)) / (count - 1))]);
+}
+
+export const assetSymbol = (contract: string) =>
+  Object.values(TESTNET.assets).find((asset) => asset.address === contract)?.symbol ?? contract;
+export const targetLabel = (t: { assets: string[]; weights_bps: number[]; yield_bps: number }) =>
+  `${t.assets.map((asset, i) => `${assetSymbol(asset)} ${t.weights_bps[i] / 100}%`).join(" · ")} · Blend yield ${t.yield_bps / 100}% of the residual reserve`;
+
+// Blend request types used by the vault's position event (execution.rs).
+const BLEND_REQUEST = ["supply", "withdraw", "supply collateral", "withdraw collateral", "borrow", "repay"];
+
+// One readable line per rebalance or Blend-yield event; plan and target rows
+// reuse the decoded USDC equity and weights of the history and allocations views.
+export function eventDetail(event: { kind: string; tx_hash: string; data: any }, history?: Indexed, allocations?: Indexed): string {
+  const equity = history?.plan_equity?.find((p: any) => p.tx_hash === event.tx_hash && p.kind === event.kind);
+  if (equity) return `nonce ${equity.nonce} · equity ${equity.before_usdc} → ${equity.after_usdc} USDC`;
+  const target = event.kind === "target" && allocations?.targets?.find((t: any) => t.tx_hash === event.tx_hash);
+  if (target) return `epoch ${target.epoch} · ${targetLabel(target)}`;
+  if (event.kind === "position" && Array.isArray(event.data)) {
+    const [kind, asset, amount] = event.data;
+    const decimals = Object.values(TESTNET.assets).find((a) => a.address === asset)?.decimals;
+    const value = decimals == null ? String(amount) : fromUnits(BigInt(amount), decimals);
+    return `Blend ${BLEND_REQUEST[kind] ?? `request ${kind}`} ${value} ${assetSymbol(asset)}`;
+  }
+  return JSON.stringify(event.data);
+}
+
+// Blend interest per asset supplied in the latest snapshot: the change in its
+// Blend-supplied balance summed over consecutive snapshot intervals. Every
+// vault supply or withdraw emits a position event (execution.rs pool_action),
+// so an interval is skipped when it holds one for that asset, when the events
+// view does not cover it (older than the events returned, or at or past the
+// indexer's next ledger), or when either snapshot lacks the asset.
+type Holding = { captured_at: string; ledger: number | null; assets: { asset: string; symbol: string; supply: number }[] | null };
+export function supplyAccrual(holdings: Holding[] = [], events?: Indexed, nextLedger?: number | null) {
+  const priced = holdings.filter((h) => h.assets && h.ledger != null);
+  const list: { ledger: number; kind: string; data: any }[] | undefined = events?.events;
+  if (priced.length < 2 || !Array.isArray(list) || nextLedger == null) return [];
+  const reach = list.length >= EVENTS_LIMIT ? list[0].ledger : -Infinity;
+  return priced.at(-1)!.assets!.filter((a) => a.supply > 0).map(({ asset, symbol }) => {
+    let change = 0, counted = 0;
+    for (let i = 1; i < priced.length; i++) {
+      const [a, b] = [priced[i - 1], priced[i]];
+      const start = a.assets!.find((x) => x.asset === asset), end = b.assets!.find((x) => x.asset === asset);
+      const moved = list.some((e) => e.kind === "position" && Array.isArray(e.data) && e.data[1] === asset && e.ledger > a.ledger! && e.ledger <= b.ledger!);
+      if (!start || !end || moved || a.ledger! < reach || b.ledger! >= nextLedger) continue;
+      change += end.supply - start.supply;
+      counted++;
+    }
+    return { symbol, from: priced[0].captured_at, to: priced.at(-1)!.captured_at, change, counted, intervals: priced.length - 1 };
+  });
 }
 
 export type UsdcLine = { funded: boolean; trustline: boolean; balance: string | null; xlm: string | null };
