@@ -43,6 +43,7 @@ function harness(initialState = []) {
     "@/stores/useBalanceStore": (selector) => selector(balances),
     "@/stores/usePriceStore": (selector) => selector(prices),
     "@/components/stellar/walletKit": { initWalletKit() {} },
+    "@/lib/network": { MAINNET: { label: "Stellar mainnet" } },
     "@/lib/prices": {
       referenceValue: (prices, symbol, qty) => prices[symbol]?.price == null ? null : prices[symbol].price * qty,
       fundingValue: (prices, symbol, qty) => prices[symbol]?.price == null ? null : prices[symbol].price * qty,
@@ -312,4 +313,15 @@ test("unsupported selected vault blocks construction instead of silently disappe
   assert.equal(buildButton(tree).props.disabled, true);
   assert.match(text(tree), /Allocation API update required for ETESIA-TF/);
   assert.ok(!text(tree).includes("Analytics only in this preview"));
+});
+
+test("an allocation with a vault leg links its USDC amount to the testnet deposit; others do not", () => {
+  const h = harness();
+  const allocation = (positions) => ({ requested_assets: Object.keys(positions), positions, model_version: "m", market_data_as_of: "2026-09-19T00:00:00Z",
+    portfolio_value_usdc: 100, allocated_sleeve_volatility: null, binding_constraints: [], diagnostics: [], funding: {}, usdcUsd: 1 });
+  const link = (tree) => nodes(tree).find((node) => node.type === "a" && String(node.props.href).startsWith("/testnet"));
+  const tree = h.AllocStage({ allocation: allocation({ "etesia-tf": { allocation_fraction: .4, notional_usdc: 40.25, quantity: 40.25 }, xlm: { allocation_fraction: .6, notional_usdc: 60, quantity: 200 } }), coins: [], onReset() {} });
+  assert.equal(link(tree).props.href, "/testnet?amount=40.2500000");
+  assert.match(text(tree), /other legs stay quoted above and are not executed/);
+  assert.equal(link(h.AllocStage({ allocation: allocation({ xlm: { allocation_fraction: 1, notional_usdc: 100, quantity: 300 } }), coins: [], onReset() {} })), undefined);
 });

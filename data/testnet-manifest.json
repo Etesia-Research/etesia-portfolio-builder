@@ -1,0 +1,234 @@
+{
+  "label": "Testnet rehearsal deployment; Etesia-made and labelled markets; Etesia-deployed copy of Soroswap's mainnet v3 WASM; no mainnet claim",
+  "network_epoch": "pre-2026-12-16-reset",
+  "passphrase": "Test SDF Network ; September 2015",
+  "aggregator": "CBE32GUTQH657PTGU2ILOCY44QCOYTKKVMFW5TWFPTBZYSIMTZVUV5TH",
+  "aggregator_config": {
+    "admin": "GAQKH3PL27IA7HE4NXFAXCUYI2POXVYVEDZOZUTXYWZEYCPDD5CRDUVY",
+    "aqua_router": "CBCFTQSPDBAIZ6R6PJQKSQWKNKWH2QIV3I4J72SHWBIK3ADRRAM5A6GD",
+    "min_partner_bps": 25,
+    "paused": false,
+    "pend_admin": null,
+    "protocol_bps": 10,
+    "soroswap_router": "CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD",
+    "treasury": "GB4QNF6OLNA2FV4EJHFWYCP7KNDDCO5Y72G4QCY5WJM6PZ23GSHH3OER"
+  },
+  "factory": "CDP3HMUH6SMS3S7NPGNDJLULCOXXEPSHY4JKUKMBNQMATHDHWXRRJTBY",
+  "pairs": [
+    {
+      "address": "CBR76WMT6J733CCVBP23M2EL5QGP5HXLPEFNFZGZ7IB6QHOJAHP7YM3V",
+      "label": "third-party Soroswap pair, realigned by Etesia"
+    },
+    {
+      "address": "CC47HAL6FXYPVBQ6LIHKDZFVYS7XJW3N6TGRAZJSXOB2URUDTOY555UA",
+      "label": "Etesia-seeded pair"
+    }
+  ],
+  "assets": [
+    {
+      "address": "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU",
+      "symbol": "USDC",
+      "kind": "Settlement",
+      "decimals": 7,
+      "classic": "USDC:GATALTGTWIOT6BUDBCZM3Q4OQ4BO2COLOAZ7IYSKPLC2PMSOPPGF5V56",
+      "stand_in": "Blend testnet USDC"
+    },
+    {
+      "address": "CCOF6WEYQQUFIMR4SEVELW4AGZAOYMGZCYCQVXN7AFGWZXXVEDPXQ5K7",
+      "symbol": "tRESERVE",
+      "kind": "Reserve",
+      "decimals": 7,
+      "classic": "tRESERVE:GDRVYVG3SQC4DJ6L7DPPGV6OQSBCZZWJA64VDXUJDQVMWN2A4KRXZM3R",
+      "stand_in": "Etesia-issued reserve stand-in, marked at par to Reflector USDC"
+    },
+    {
+      "address": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+      "symbol": "XLM",
+      "kind": "Xlm",
+      "decimals": 7,
+      "classic": "native",
+      "stand_in": "native XLM SAC"
+    }
+  ],
+  "provider": {
+    "id": "CC3ASLC6FIH76EVTMJIC2IAMVUS5Y5JYXI4WM4U5RPEUBPUGCWWSX5EB",
+    "config": {
+      "sources": [
+        {
+          "asset": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+          "denominator": [
+            {
+              "asset": {
+                "Other": "USDC"
+              },
+              "base": {
+                "Other": "USD"
+              },
+              "contract": "CCYOZJCOPG34LLQQ7N24YXBM7LL62R7ONMZ3G6WZAAYPB5OYKOMJRN63",
+              "decimals": 14,
+              "max_age": 3600,
+              "resolution": 300
+            }
+          ],
+          "numerator": {
+            "asset": {
+              "Other": "XLM"
+            },
+            "base": {
+              "Other": "USD"
+            },
+            "contract": "CCYOZJCOPG34LLQQ7N24YXBM7LL62R7ONMZ3G6WZAAYPB5OYKOMJRN63",
+            "decimals": 14,
+            "max_age": 3600,
+            "resolution": 300
+          }
+        },
+        {
+          "asset": "CCOF6WEYQQUFIMR4SEVELW4AGZAOYMGZCYCQVXN7AFGWZXXVEDPXQ5K7",
+          "denominator": [
+            {
+              "asset": {
+                "Other": "USDC"
+              },
+              "base": {
+                "Other": "USD"
+              },
+              "contract": "CCYOZJCOPG34LLQQ7N24YXBM7LL62R7ONMZ3G6WZAAYPB5OYKOMJRN63",
+              "decimals": 14,
+              "max_age": 3600,
+              "resolution": 300
+            }
+          ],
+          "numerator": {
+            "asset": {
+              "Other": "USDC"
+            },
+            "base": {
+              "Other": "USD"
+            },
+            "contract": "CCYOZJCOPG34LLQQ7N24YXBM7LL62R7ONMZ3G6WZAAYPB5OYKOMJRN63",
+            "decimals": 14,
+            "max_age": 3600,
+            "resolution": 300
+          }
+        }
+      ],
+      "usdc": "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU"
+    }
+  },
+  "vaults": {
+    "flagship": {
+      "id": "CD73M44EYNZOX7YWPSBMITVPERWNA6ZHDLAZ2XSM4RQM6V4XT7GYXFQH",
+      "ledger": 5660907,
+      "assets": [
+        {
+          "address": "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU",
+          "decimals": 7,
+          "kind": "Settlement"
+        },
+        {
+          "address": "CCOF6WEYQQUFIMR4SEVELW4AGZAOYMGZCYCQVXN7AFGWZXXVEDPXQ5K7",
+          "decimals": 7,
+          "kind": "Reserve"
+        },
+        {
+          "address": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+          "decimals": 7,
+          "kind": "Xlm"
+        }
+      ],
+      "usdc": "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU",
+      "oracle": "CC3ASLC6FIH76EVTMJIC2IAMVUS5Y5JYXI4WM4U5RPEUBPUGCWWSX5EB",
+      "router": "CBE32GUTQH657PTGU2ILOCY44QCOYTKKVMFW5TWFPTBZYSIMTZVUV5TH",
+      "route_contracts": [
+        "CBR76WMT6J733CCVBP23M2EL5QGP5HXLPEFNFZGZ7IB6QHOJAHP7YM3V",
+        "CC47HAL6FXYPVBQ6LIHKDZFVYS7XJW3N6TGRAZJSXOB2URUDTOY555UA"
+      ],
+      "pool": "CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF",
+      "pool_assets": [
+        "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU"
+      ],
+      "admin": "GAQKH3PL27IA7HE4NXFAXCUYI2POXVYVEDZOZUTXYWZEYCPDD5CRDUVY",
+      "executor": "GDGCL46KVU6FR2BU32PUGS7KBQCE6U4375JCR7NHU3PMX5K3O7VXJT7N",
+      "guardian": "GCVI25VJYHIDZYGUW62ZCH6N2NWUVJGSCPLJP6UV2MMM5BVYBFVUFLPQ",
+      "fees": {
+        "management_bps": 100,
+        "performance_bps": 1000,
+        "recipient": "GAQKH3PL27IA7HE4NXFAXCUYI2POXVYVEDZOZUTXYWZEYCPDD5CRDUVY"
+      },
+      "borrowing": false,
+      "max_price_age": 3600,
+      "max_slippage_bps": 100,
+      "max_leg_bps": 2000,
+      "max_turnover_bps": 10000,
+      "max_loss_bps": 200,
+      "cooldown": 12,
+      "max_debt_bps": 0,
+      "min_health_bps": 12500
+    },
+    "guard": {
+      "id": "CCUHQJ3FSGC26UOCLN3EK2DUO725ZLBVRUF5B7N36W6MB3DM4JEOC6VO",
+      "ledger": 5660913,
+      "assets": [
+        {
+          "address": "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU",
+          "decimals": 7,
+          "kind": "Settlement"
+        },
+        {
+          "address": "CCOF6WEYQQUFIMR4SEVELW4AGZAOYMGZCYCQVXN7AFGWZXXVEDPXQ5K7",
+          "decimals": 7,
+          "kind": "Reserve"
+        },
+        {
+          "address": "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
+          "decimals": 7,
+          "kind": "Xlm"
+        }
+      ],
+      "usdc": "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU",
+      "oracle": "CC3ASLC6FIH76EVTMJIC2IAMVUS5Y5JYXI4WM4U5RPEUBPUGCWWSX5EB",
+      "router": "CBE32GUTQH657PTGU2ILOCY44QCOYTKKVMFW5TWFPTBZYSIMTZVUV5TH",
+      "route_contracts": [
+        "CBR76WMT6J733CCVBP23M2EL5QGP5HXLPEFNFZGZ7IB6QHOJAHP7YM3V",
+        "CC47HAL6FXYPVBQ6LIHKDZFVYS7XJW3N6TGRAZJSXOB2URUDTOY555UA"
+      ],
+      "pool": "CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF",
+      "pool_assets": [
+        "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU"
+      ],
+      "admin": "GAQKH3PL27IA7HE4NXFAXCUYI2POXVYVEDZOZUTXYWZEYCPDD5CRDUVY",
+      "executor": "GDTIM3OLD5TQFNMM7ZZMFCUHFX4XMR6ITHFEQ6NOGXUDXOSTX2ZD3PR6",
+      "guardian": "GCHQQLF3ZRDWPHK7KZZCT2OHNGGGJODJSXFTQX7NECEA6UYOV3VBDTEH",
+      "fees": {
+        "management_bps": 100,
+        "performance_bps": 1000,
+        "recipient": "GAQKH3PL27IA7HE4NXFAXCUYI2POXVYVEDZOZUTXYWZEYCPDD5CRDUVY"
+      },
+      "borrowing": false,
+      "max_price_age": 300,
+      "max_slippage_bps": 100,
+      "max_leg_bps": 500,
+      "max_turnover_bps": 300,
+      "max_loss_bps": 50,
+      "cooldown": 720,
+      "max_debt_bps": 0,
+      "min_health_bps": 12500
+    }
+  },
+  "code": {
+    "CD73M44EYNZOX7YWPSBMITVPERWNA6ZHDLAZ2XSM4RQM6V4XT7GYXFQH": "ac188cbf790c3fa3a4112fb4f2abe0dfd587303936e2c132f2df9eb062d41b47",
+    "CCUHQJ3FSGC26UOCLN3EK2DUO725ZLBVRUF5B7N36W6MB3DM4JEOC6VO": "ac188cbf790c3fa3a4112fb4f2abe0dfd587303936e2c132f2df9eb062d41b47",
+    "CC3ASLC6FIH76EVTMJIC2IAMVUS5Y5JYXI4WM4U5RPEUBPUGCWWSX5EB": "3070b68c3ec31a8f200646c42a3305d92ff42ed83785d234572457c03733201c",
+    "CBE32GUTQH657PTGU2ILOCY44QCOYTKKVMFW5TWFPTBZYSIMTZVUV5TH": "437653282e9c93b0b4d736d8fde01bf002adefb61bfb75917e609f5336ee3190",
+    "CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD": "4b95bbf9caec2c6e00c786f53c5f392c2fcdb8435ac0a862ab5e0645eb65824c",
+    "CDP3HMUH6SMS3S7NPGNDJLULCOXXEPSHY4JKUKMBNQMATHDHWXRRJTBY": "86285a9234d3f0d687eaf88efe8d5d72172b38c9a86624c9934c0cbf2aff2993",
+    "CBR76WMT6J733CCVBP23M2EL5QGP5HXLPEFNFZGZ7IB6QHOJAHP7YM3V": "8447525edd62f72ffaf52136358034657ea0511a8fec1cd0ebde649f86cca464",
+    "CC47HAL6FXYPVBQ6LIHKDZFVYS7XJW3N6TGRAZJSXOB2URUDTOY555UA": "8447525edd62f72ffaf52136358034657ea0511a8fec1cd0ebde649f86cca464",
+    "CCEBVDYM32YNYCVNRXQKDFFPISJJCV557CDZEIRBEE4NCV4KHPQ44HGF": "a41fc53d6753b6c04eb15b021c55052366a4c8e0e21bc72700f461264ec1350e",
+    "CCYOZJCOPG34LLQQ7N24YXBM7LL62R7ONMZ3G6WZAAYPB5OYKOMJRN63": "25fc306065cbb9b05461db78ec259802cb916053ba5b3ab911b0a72dd1a81439",
+    "CAQCFVLOBK5GIULPNZRGATJJMIZL5BSP7X5YJVMGCPTUEPFM4AVSRCJU": "stellar-asset",
+    "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC": "stellar-asset",
+    "CCOF6WEYQQUFIMR4SEVELW4AGZAOYMGZCYCQVXN7AFGWZXXVEDPXQ5K7": "stellar-asset"
+  }
+}

@@ -10,6 +10,7 @@ import ExecutionSimulation from "@/components/ExecutionSimulation";
 import AllocationSimulation from "@/components/AllocationSimulation";
 import useBalanceStore from "@/stores/useBalanceStore";
 import { fetchHoldings } from "@/lib/balances";
+import { MAINNET } from "@/lib/network";
 
 const EMPTY_HOLDINGS = {};
 const RESERVE_IDS = new Set(['usdc', 'eurc', 'ustry']);
@@ -65,7 +66,7 @@ function Masthead({ wallet, onDisconnect }) {
         </div>
         <div className="row" style={{ marginTop: 6 }}>
           {/* TODO(Step 4): replace with the real latest ledger sequence from Horizon */}
-          <span>Stellar mainnet</span>
+          <span>{MAINNET.label}</span>
         </div>
         <div className="row" style={{ marginTop: 6 }}>
           <span>{pricesStatus}</span>
@@ -372,6 +373,7 @@ function AllocStage({ allocation, coins, onReset }) {
     <p className="data-note">Simulated allocation · reference quantities, no funds moved. Product allocation and estimated volatility include every selected product, including the vault. The volatility estimate uses the current risk model’s one-year history and excludes reserves and buffers. The three-year historical metrics below include the entire portfolio.</p>
     <AllocationSimulation allocation={allocation} />
     <ExecutionSimulation allocation={allocation} funding={allocation.funding} usdcUsd={allocation.usdcUsd} />
+    {allocation.positions?.['etesia-tf']?.notional_usdc > 0 && <p className="data-note">Only the Etesia-TF vault leg executes, on Stellar testnet: <a href={`/testnet?amount=${allocation.positions['etesia-tf'].notional_usdc.toFixed(7)}`}>deposit its {allocation.positions['etesia-tf'].notional_usdc.toLocaleString(undefined, { maximumFractionDigits: 2 })} USDC in the testnet vault →</a> The other legs stay quoted above and are not executed.</p>}
     {allocation.binding_constraints.length > 0 && <p className="data-note">Model limits: {allocation.binding_constraints.map(c => c.replaceAll('_', ' ')).join(' · ')}</p>}
     {allocation.diagnostics.length > 0 && <p className="data-note">{allocation.diagnostics.join(' · ')}</p>}
   </section>;

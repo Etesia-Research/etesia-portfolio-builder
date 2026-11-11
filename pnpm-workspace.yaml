@@ -1,3 +1,10 @@
+# Install scripts stay disabled; none of these native or postinstall steps is needed.
+allowBuilds:
+  '@reown/appkit': false
+  bufferutil: false
+  secp256k1: false
+  sharp: false
+  utf-8-validate: false
 # Supply-chain guard: do not install any package version published less than
 # this many minutes ago (1440 = 1 day). See https://pnpm.io/settings
 minimumReleaseAge: 1440

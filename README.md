@@ -44,8 +44,8 @@ Both generated directories are ignored by Git.
 
 The connection screen and Stellar Wallets Kit picker support Freighter, Albedo,
 xBull, Lobstr Vault and HOT Wallet on Stellar mainnet. Select HOT Wallet in the
-picker, then approve in its extension or Telegram/mobile widget. The existing
-kit 2.2.0 includes `HotWalletModule`; no extra dependency or API key is required.
+picker, then approve in its extension or Telegram/mobile widget. Kit 2.8.0
+includes `HotWalletModule`; no extra dependency or API key is required.
 See the [HOT SDK Stellar integration](https://github.com/hot-dao/hot-sdk-js#stellar-connect).
 Connecting reads balances; execution remains simulated and requests no signatures.
 
@@ -61,6 +61,40 @@ Known upstream picker limitation: on reopening, an immediate wallet response can
 arrive before the kit finishes availability checks and installs its modal event
 listeners, leaving the connection pending. Controlled checks wait for those
 checks before selecting the wallet. Reloading restores the connection screen.
+
+## Testnet vault (`/testnet`)
+
+`/testnet` signs real Stellar testnet transactions against the flagship vault of
+the pre-reset deployment (`data/testnet-manifest.json`, copied from
+`etesia-vault/deploy/testnet/pre-2026-12-16-reset.json`). It offers
+Freighter/Varial and xBull only; the mainnet pages still sign nothing. An
+allocation with an Etesia-TF leg links to `/testnet?amount=<vault-leg USDC>`,
+which prefills the deposit; the other legs stay quoted and are not executed.
+
+### Testnet wallet check (manual script)
+
+Use a throwaway testnet account funded with Friendbot, with Freighter/Varial set
+to Testnet. Expected page text is quoted.
+
+1. Open `/testnet`, press **Connect wallet**, pick Freighter, approve. The
+   masthead shows "CONNECTED — Freighter"; Onboarding shows "Funded · … XLM" and
+   "USDC trustline Missing".
+2. Press **Sign & add USDC trustline**, approve. A receipt "Testnet transaction,
+   not a simulation · Add USDC trustline" shows the ledger and hash.
+3. Start a vault action (for example a deposit after **Preview**) and reject it in
+   the wallet: "Signature request was rejected in the wallet. Nothing was
+   submitted."
+4. Switch the wallet to Mainnet, then return to the tab: the banner "Wallet
+   network mismatch: switch your wallet to Stellar testnet …" appears and the
+   sign buttons are disabled. Switch back to Testnet and return to the tab: the
+   banner clears.
+5. Press **↪ disconnect**: the masthead shows "UNCONNECTED".
+
+Vault flow (D5-03): claim test USDC from the Blend faucet link, **Refresh**,
+then **Preview** and **Sign & deposit**; the receipt shows the shares the
+contract returned. Then a partial **Sign & withdraw** within "Max withdraw" and
+**Sign & redeem all shares**. An unconfirmed transaction is reported with its
+hash as an unknown outcome; check the explorer before retrying.
 
 ## Data and allocation
 

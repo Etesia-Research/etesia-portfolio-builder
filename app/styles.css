@@ -1025,6 +1025,7 @@ button.coin-card:focus-visible { outline: 2px solid var(--accent); outline-offse
 .equity-chart input { width: 100%; accent-color: #125862; }
 .simulated-execution { margin-top: 24px; }
 .simulation-receipt { margin-top: 16px; padding: 16px; border: 1px solid var(--rule); font-size: 13px; line-height: 1.6; }
+.tx-receipt { margin-top: 16px; padding: 16px; border: 1px solid var(--good); border-left-width: 4px; font-size: 13px; line-height: 1.6; }
 
 .execution-quote-list { margin: 16px 0; }
 .execution-quote { display: grid; grid-template-columns: minmax(140px, 1fr) 2fr; gap: 6px 16px; padding: 12px 0; border-bottom: 1px solid var(--rule); font-size: 13px; overflow-wrap: anywhere; }
