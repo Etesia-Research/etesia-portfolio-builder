@@ -127,3 +127,35 @@ test("the old /testnet URL redirects to the testnet vault page", async () => {
   assert.deepEqual(await config.redirects(), [{ source: "/testnet", destination: "/stellar_tf_vault/testnet", permanent: false }]);
   assert.equal(fs.existsSync(path.join(root, "app/testnet")), false);
 });
+
+// D5 allocation: the testnet markets come from the hash-pinned manifest.
+const execution = load("lib/execution.ts", { "@/lib/network": network, "@/lib/vaults": vaults, "@/lib/assets": load("lib/assets.ts"), "@/lib/quant": {} });
+
+test("TESTNET.router and markets come from the manifest; mainnet has no markets", () => {
+  assert.equal(TESTNET.router, testnetManifest.aggregator_config.soroswap_router);
+  assert.equal(TESTNET.router, "CCJUD55AG6W5HAI5LRVNKAE5WDP5XGZBUDS5WNTIVDU7O264UZZE7BRD");
+  assert.deepEqual(TESTNET.markets, { xlm: "XLM", ustry: "tRESERVE" });
+  for (const symbol of Object.values(TESTNET.markets)) assert.ok(testnetManifest.assets.some(a => a.symbol === symbol), symbol);
+  assert.equal(TESTNET.assets.tRESERVE.address, "CCOF6WEYQQUFIMR4SEVELW4AGZAOYMGZCYCQVXN7AFGWZXXVEDPXQ5K7");
+  assert.equal("markets" in MAINNET, false);
+  assert.equal("router" in MAINNET, false);
+});
+
+test("a market symbol missing from the manifest throws", () => {
+  const endpoints = { label: "Stellar testnet", passphrase: sdk.Networks.TESTNET, horizonUrl: "h", wallets: [], rpcUrl: "r", explorerUrl: "e", faucetUrl: null, indexer: "i" };
+  assert.throws(() => network.vaultNetwork(testnetManifest, endpoints, { aqua: "AQUA" }), /Market asset AQUA is not in the manifest/);
+  assert.deepEqual(network.vaultNetwork(testnetManifest, endpoints).markets, {});
+});
+
+test("every non-native market output has a changeTrust step before its swap (the trustline guard)", () => {
+  for (const [id, symbol] of Object.entries(TESTNET.markets)) {
+    const asset = TESTNET.assets[symbol];
+    // The manifest address is the SAC of its classic identity.
+    const sac = asset.classic === "native" ? sdk.Asset.native() : new sdk.Asset(...asset.classic.split(":"));
+    assert.equal(sac.contractId(TESTNET.passphrase), asset.address, symbol);
+    const { legs } = execution.testnetLegs({ positions: { [id]: { allocation_fraction: .975 }, usdc: { allocation_fraction: .025 } }, funding: { symbol: "USDC", amount: "1" } }, 10000000n, TESTNET);
+    const keys = legs.map(l => l.key);
+    if (asset.classic === "native") assert.deepEqual(keys, [`swap:${symbol}`]);
+    else assert.deepEqual(keys, [`trustline:${symbol}`, `swap:${symbol}`]);
+  }
+});

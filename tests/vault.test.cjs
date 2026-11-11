@@ -37,7 +37,7 @@ function failingEvent(contract, code) {
 // function name (numbers become i128), `sends` and `polls` are the sequences of
 // sendTransaction and getTransaction outcomes (a function is thrown), and
 // `horizon` stubs Horizon.Server.
-function harness({ views = {}, sends = [], polls = [{ status: "SUCCESS", ledger: 77, returnValue: i128(5) }], horizon = {} } = {}, config = TESTNET) {
+function harness({ views = {}, sends = [], polls = [{ status: "SUCCESS", ledger: 77, returnValue: i128(5) }], horizon = {}, gets = [] } = {}, config = TESTNET) {
   const calls = { contract: [], signed: 0, sent: 0, polled: [], hashes: [], passphrases: [], networks: [] };
   const next = (queue, fallback) => {
     const outcome = queue.length ? queue.shift() : fallback;
@@ -46,7 +46,7 @@ function harness({ views = {}, sends = [], polls = [{ status: "SUCCESS", ledger:
   };
   class Contract extends sdk.Contract {
     call(fn, ...args) {
-      calls.contract.push({ fn, args: args.map(sdk.scValToNative) });
+      calls.contract.push({ fn, args: args.map(sdk.scValToNative), contract: this.contractId() });
       return super.call(fn, ...args);
     }
   }
@@ -65,6 +65,7 @@ function harness({ views = {}, sends = [], polls = [{ status: "SUCCESS", ledger:
       return { hash: calls.hashes.at(-1), ...next(sends, { status: "PENDING" }) };
     }
     async pollTransaction(hash, opts) { calls.polled.push(opts.attempts); return next(polls); }
+    async getTransaction(hash) { calls.checked = [...(calls.checked ?? []), hash]; return next(gets); }
   }
   class HorizonServer {
     async loadAccount(address) { return horizon.loadAccount(address); }
@@ -182,10 +183,12 @@ test("position reads shares from balance and their value from convert_to_assets"
 
 test("USDC line: an unknown account is unfunded; a funded one reports its trustline", async () => {
   const missing = harness({ horizon: { loadAccount: async () => { throw new sdk.NotFoundError("Not Found", { status: 404 }); } } });
-  assert.deepEqual(await missing.vault.readUsdcLine(OWNER), { funded: false, trustline: false, balance: null, xlm: null });
-  const balances = [{ asset_type: "native", balance: "10.0000000" }, { asset_code: "USDC", asset_issuer: TESTNET.usdc.issuer, balance: "5.0000000" }];
-  const funded = harness({ horizon: { loadAccount: async () => ({ balances }) } });
-  assert.deepEqual(await funded.vault.readUsdcLine(OWNER), { funded: true, trustline: true, balance: "5.0000000", xlm: "10.0000000" });
+  assert.deepEqual(await missing.vault.readUsdcLine(OWNER), { funded: false, trustline: false, balance: null, xlm: null, subentries: 0, lines: {} });
+  const [reserveCode, reserveIssuer] = TESTNET.assets.tRESERVE.classic.split(":");
+  const balances = [{ asset_type: "native", balance: "10.0000000" }, { asset_code: "USDC", asset_issuer: TESTNET.usdc.issuer, balance: "5.0000000" },
+    { asset_code: reserveCode, asset_issuer: reserveIssuer, balance: "1.0000000" }, { asset_code: reserveCode, asset_issuer: sdk.Keypair.random().publicKey(), balance: "9.0000000" }];
+  const funded = harness({ horizon: { loadAccount: async () => ({ balances, subentry_count: 3 }) } });
+  assert.deepEqual(await funded.vault.readUsdcLine(OWNER), { funded: true, trustline: true, balance: "5.0000000", xlm: "10.0000000", subentries: 3, lines: { USDC: "5.0000000", tRESERVE: "1.0000000" } });
   const down = harness({ horizon: { loadAccount: async () => { throw new Error("Network Error"); } } });
   await assert.rejects(down.vault.readUsdcLine(OWNER), /Network Error/);
 });
@@ -247,4 +250,112 @@ test("a vault client builds and signs only on its own deployment's network", asy
   assert.deepEqual(m.calls.passphrases, [sdk.Networks.PUBLIC]);
   assert.deepEqual(m.calls.networks, [sdk.Networks.PUBLIC]);
   assert.deepEqual(t.calls.networks, [sdk.Networks.TESTNET]);
+});
+
+// D5 allocation: swaps on the manifest's Soroswap router, called directly.
+const [USDC, XLM, RESERVE] = [TESTNET.usdc.contract, TESTNET.assets.XLM.address, TESTNET.assets.tRESERVE.address];
+const amounts = (...values) => sdk.nativeToScVal(values.map(i128));
+// The router's own failure as observed in a testnet simulation (min out above the quote, 2026-11-11).
+const routerFailure = (code) => `HostError: Error(Contract, #${code})\n   0: [Diagnostic Event] contract:${TESTNET.router}, topics:[error, Error(Contract, #${code})], data:"escalating Ok(ScErrorType::Contract) frame-exit to Err"`;
+function escalatedEvent(contract, code) {
+  const wire = sdk.xdr.DiagnosticEvent.fromXDR(FAILING_EVENT, "base64").toXdrObject();
+  wire.event.contractId = sdk.StrKey.decodeContract(contract);
+  wire.event.body.v0.topics[1].error.contractCode = code;
+  wire.event.body.v0.data = sdk.xdr.ScVal.scvString("escalating Ok(ScErrorType::Contract) frame-exit to Err").toXdrObject();
+  return sdk.xdr.DiagnosticEvent.fromXdrObject(wire);
+}
+
+test("quoteSwap simulates router_get_amounts_out on the manifest router with the i128 amount and the address path", async () => {
+  const h = harness({ views: { router_get_amounts_out: () => amounts(100000000, 654091321) } });
+  const quote = await h.vault.quoteSwap(BigInt(100000000), [USDC, XLM]);
+  assert.deepEqual(quote, { amountOut: BigInt(654091321), ledger: 70 });
+  const [call] = h.calls.contract;
+  assert.deepEqual(call, { fn: "router_get_amounts_out", args: [BigInt(100000000), [USDC, XLM]], contract: TESTNET.router });
+  assert.equal(h.calls.signed, 0);
+  await assert.rejects(harness({ views: {} }).vault.quoteSwap(BigInt(1), [USDC, XLM]), /No Soroswap testnet quote for USDC → XLM/);
+});
+
+test("swapExactIn signs swap_exact_tokens_for_tokens with the floor, the path, the owner and a 300-second deadline", async () => {
+  const h = harness({ polls: [{ status: "SUCCESS", ledger: 81, returnValue: amounts(100000000, 654000000) }] });
+  const signed = [];
+  const before = Math.floor(Date.now() / 1000);
+  const receipt = await h.vault.swapExactIn(OWNER, BigInt(100000000), h.vault.minBound(BigInt(654091321)), [USDC, XLM], (s) => signed.push(s));
+  const [call] = h.calls.contract;
+  assert.equal(call.fn, "swap_exact_tokens_for_tokens");
+  assert.equal(call.contract, TESTNET.router);
+  assert.deepEqual(call.args.slice(0, 4), [BigInt(100000000), BigInt(650820864), [USDC, XLM], OWNER]); // floor(654091321 × 0.995)
+  assert.ok(call.args[4] >= BigInt(before + 300) && call.args[4] <= BigInt(before + 301));
+  assert.deepEqual(h.calls.passphrases, [TESTNET.passphrase]);
+  assert.deepEqual(signed.map(s => s.hash), h.calls.hashes);
+  assert.ok(signed[0].maxTime >= before + 300 && signed[0].maxTime <= before + 301);
+  // The receipt is the confirmed transaction's own return: the router's last amount, in the output asset.
+  assert.deepEqual(receipt, { action: "Swap 10 USDC → XLM", hash: h.calls.hashes[0], ledger: 81, returned: "65.4 XLM" });
+});
+
+test("a router failure is reported with the router's code, not as a vault error", async () => {
+  const { vault } = harness();
+  assert.equal(vault.vaultError(new Error(routerFailure(507))), `The pool price moved beyond the 0.5% minimum between the quote and execution. Quote again and retry. (router ${TESTNET.router} error 507)`);
+  assert.match(vault.vaultError(new Error(routerFailure(503))), /deadline passed.*error 503\)/);
+  // A vault error code number from the router is still the router's.
+  assert.doesNotMatch(vault.vaultError(new Error(routerFailure(14))), /vault error/);
+  const h = harness({ polls: [{ status: "FAILED", resultXdr: trapped, diagnosticEventsXdr: [escalatedEvent(TESTNET.router, 507)] }] });
+  await assert.rejects(h.vault.swapExactIn(OWNER, BigInt(10), BigInt(9), [USDC, XLM]),
+    (err) => err.message === `${h.vault.ROUTER_ERRORS[507]} (router ${TESTNET.router} error 507) Transaction ${h.calls.hashes[0]} failed onchain; only the fee was charged.`);
+  // Observed in a testnet simulation: a swap to tRESERVE without its trustline names tRESERVE, not USDC.
+  assert.equal(vault.vaultError(new Error(`HostError: Error(Contract, #13)\n 5: [Failed Diagnostic Event (not emitted)] contract:${RESERVE}, topics:[error, Error(Contract, #13)], data:["trustline entry is missing for account", ${OWNER}]`)), "Add the tRESERVE trustline before this swap.");
+});
+
+test("an unknown outcome after signing carries the signed hash and time bound", async () => {
+  const h = harness({ polls: [() => new Error("Request failed with status code 503")] });
+  const signed = [];
+  await assert.rejects(h.vault.swapExactIn(OWNER, BigInt(10), BigInt(9), [USDC, XLM], (s) => signed.push(s)), (err) => {
+    assert.deepEqual(err.unknown, signed[0]);
+    assert.equal(err.unknown.hash, h.calls.hashes[0]);
+    return /Its outcome is unknown/.test(err.message);
+  });
+  const t = harness({ horizon: { loadAccount: async (a) => new sdk.Account(a, "1"), submitTransaction: async () => { throw Object.assign(new Error("Server responded: 504"), { response: { status: 504, data: {} } }); } } });
+  const trust = [];
+  await assert.rejects(t.vault.addUsdcTrustline(OWNER, "tRESERVE", (s) => trust.push(s)), (err) => err.unknown?.hash === trust[0].hash);
+});
+
+test("addUsdcTrustline adds a changeTrust for the asked manifest asset", async () => {
+  const submitted = [];
+  const h = harness({ horizon: { loadAccount: async (a) => new sdk.Account(a, "1"), submitTransaction: async (tx) => { submitted.push(tx); return { hash: Buffer.from(tx.hash()).toString("hex"), ledger: 5 }; } } });
+  const receipt = await h.vault.addUsdcTrustline(OWNER, "tRESERVE");
+  const [op] = submitted[0].operations;
+  assert.equal(op.type, "changeTrust");
+  assert.equal(`${op.line.code}:${op.line.issuer}`, TESTNET.assets.tRESERVE.classic);
+  assert.equal(receipt.action, "Add tRESERVE trustline");
+  await assert.rejects(h.vault.addUsdcTrustline(OWNER, "XLM"), /not a classic asset/);
+});
+
+test("checkTransaction confirms SUCCESS and FAILED, and treats NOT_FOUND as expired only past the time bound within retained history", async () => {
+  const signed = { hash: "ab".repeat(32), maxTime: 1000 };
+  const returns = { decimals: 7, unit: "XLM" };
+  const missing = (latest, oldest) => ({ status: "NOT_FOUND", latestLedgerCloseTime: latest, oldestLedgerCloseTime: oldest });
+  const h = harness({ gets: [{ status: "SUCCESS", ledger: 9, returnValue: amounts(1, 20000000) }, { status: "FAILED" }, missing(1001, 100), missing(999, 100), missing(1001, 800)] });
+  assert.deepEqual(await h.vault.checkTransaction(signed, "Swap", returns), { status: "SUCCESS", receipt: { action: "Swap", hash: signed.hash, ledger: 9, returned: "2 XLM" } });
+  assert.deepEqual(await h.vault.checkTransaction(signed, "Swap", returns), { status: "FAILED" });
+  assert.deepEqual(await h.vault.checkTransaction(signed, "Swap", returns), { status: "EXPIRED" });
+  // Still inside its time bound by the network's clock.
+  assert.deepEqual(await h.vault.checkTransaction(signed, "Swap", returns), { status: "PENDING" });
+  // Past its time bound, but the RPC's history no longer reaches back to when it was signed:
+  // it can no longer be included, and whether it was is unknown.
+  assert.deepEqual(await h.vault.checkTransaction(signed, "Swap", returns), { status: "OUTSIDE_HISTORY" });
+});
+
+test("a re-simulated retry rebuilds the arguments with a fresh deadline and keeps the signed-off minimum", async () => {
+  const h = harness({ polls: [{ status: "FAILED", resultXdr: resourceFailure }, { status: "SUCCESS", ledger: 9, returnValue: amounts(10, 20) }] });
+  const now = Date.now;
+  let clock = now();
+  Date.now = () => (clock += 60000);
+  try {
+    await h.vault.swapExactIn(OWNER, BigInt(10), BigInt(19), [USDC, XLM]);
+  } finally {
+    Date.now = now;
+  }
+  const swaps = h.calls.contract.filter(c => c.fn === "swap_exact_tokens_for_tokens");
+  assert.equal(swaps.length, 2);
+  assert.ok(swaps[1].args[4] > swaps[0].args[4]);
+  assert.deepEqual(swaps.map(c => c.args[1]), [BigInt(19), BigInt(19)]);
 });

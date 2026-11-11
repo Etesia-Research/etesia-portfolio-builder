@@ -335,7 +335,7 @@ export default function VaultDesk({ slug, network }) {
       <section className="funding-panel">
         <div className="col">
           <h5>① Deposit USDC · deposit_bounded</h5>
-          {allocated && <p className="data-note">Prefilled with the vault leg of your Builder allocation: {allocated} USDC{sharePrice ? ` ≈ ${num(Number(allocated) / sharePrice)} shares at the indexed share price of ${num(sharePrice)} USDC (${freshness(indexed.summary)})` : ` · indexed share price unavailable (${freshness(indexed.summary)})`}; the deposit preview reads the exact shares from the contract. Only this leg executes; the allocation's other legs stay quoted on the Builder and are not executed.</p>}
+          {allocated && <p className="data-note">Prefilled with {allocated} USDC{sharePrice ? ` ≈ ${num(Number(allocated) / sharePrice)} shares at the indexed share price of ${num(sharePrice)} USDC (${freshness(indexed.summary)})` : ` · indexed share price unavailable (${freshness(indexed.summary)})`}; the deposit preview reads the exact shares from the contract.</p>}
           <AmountForm client={client} kind="deposit" initial={allocated ?? ''} max={usdcBalance} disabled={!ready || !line?.trustline || position?.paused} onSubmit={amount => run('deposit', () => deposit(address, amount))} />
           {position?.paused && <p className="data-note">Deposits are paused on this vault.</p>}
         </div>

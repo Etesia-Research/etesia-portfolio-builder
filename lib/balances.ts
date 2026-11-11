@@ -12,8 +12,12 @@
 // Holdings are matched to the catalog instrument identities by BOTH code AND issuer
 // (a code alone can be a different/scam asset); XLM is the native balance.
 // Assets in the wallet but outside the universe are ignored. Unheld -> 0.
+// With a vault network (testnet mode), the account is read from that network's
+// Horizon and mapped by the manifest's classic identities instead (its USDC by
+// issuer, native XLM); manifest assets outside the universe are ignored.
 
 import { ASSET_CONTRACTS } from "@/lib/assets";
+import type { VaultNetworkConfig } from "@/lib/network";
 
 const HORIZON = "https://horizon.stellar.org";
 
@@ -34,9 +38,17 @@ const TK_BY_CODE_ISSUER: Record<string, string> = Object.fromEntries(
 const zeroHoldings = (): Record<string, number> =>
   Object.fromEntries(Object.keys(ASSET_CONTRACTS).map((tk) => [tk, 0]));
 
+// "CODE:ISSUER" -> universe ticker for a vault network's manifest assets.
+const manifestTickers = (net: VaultNetworkConfig): Record<string, string> => Object.fromEntries(
+  Object.values(net.assets)
+    .filter((asset) => asset.classic && asset.classic !== "native" && asset.symbol in ASSET_CONTRACTS)
+    .map((asset) => [asset.classic!, asset.symbol])
+);
+
 /** Fetch the account's real balances and map them onto the asset universe. */
-export async function fetchHoldings(address: string): Promise<Record<string, number>> {
-  const res = await fetch(`${HORIZON}/accounts/${encodeURIComponent(address)}`, {
+export async function fetchHoldings(address: string, net?: VaultNetworkConfig): Promise<Record<string, number>> {
+  const tickers = net ? manifestTickers(net) : TK_BY_CODE_ISSUER;
+  const res = await fetch(`${net ? net.horizonUrl : HORIZON}/accounts/${encodeURIComponent(address)}`, {
     cache: "no-store",
     headers: { Accept: "application/json" },
   });
@@ -52,7 +64,7 @@ export async function fetchHoldings(address: string): Promise<Record<string, num
     if (b.asset_type === "native") {
       out.XLM = amt;
     } else if (b.asset_code && b.asset_issuer) {
-      const tk = TK_BY_CODE_ISSUER[`${b.asset_code}:${b.asset_issuer}`];
+      const tk = tickers[`${b.asset_code}:${b.asset_issuer}`];
       if (tk) out[tk] = amt;
     }
   }

@@ -47,7 +47,7 @@ xBull, Lobstr Vault and HOT Wallet on Stellar mainnet. Select HOT Wallet in the
 picker, then approve in its extension or Telegram/mobile widget. Kit 2.8.0
 includes `HotWalletModule`; no extra dependency or API key is required.
 See the [HOT SDK Stellar integration](https://github.com/hot-dao/hot-sdk-js#stellar-connect).
-Connecting reads balances; execution remains simulated and requests no signatures.
+Connecting reads balances; mainnet execution remains simulated and requests no signatures.
 
 Local validation on 2026-09-19: production build, TypeScript and all 27 existing
 tests passed. Browser checks used a controlled HOT extension provider and stubbed
@@ -73,10 +73,13 @@ selects which network's vault the Builder shows; the two are never mixed. The ol
 `/stellar_tf_vault/testnet` signs real Stellar testnet transactions against the
 flagship vault of the pre-reset deployment (`data/testnet-manifest.json`, copied
 from `etesia-vault/deploy/testnet/pre-2026-12-16-reset.json`). It offers
-Freighter/Varial and xBull only; the Builder itself still signs nothing. In
-testnet mode, an allocation with an Etesia-TF leg links to
-`/stellar_tf_vault/testnet?amount=<vault-leg USDC>`, which prefills the deposit;
-the other legs stay quoted and are not executed. `/stellar_tf_vault/mainnet`
+Freighter/Varial and xBull only. The mainnet Builder signs nothing. In testnet
+mode the Builder reads balances from testnet Horizon, offers only the products
+with a Soroswap testnet market for the same asset (XLM, the Etesia-TF vault, USDC
+and the USTRY reserve through its labelled stand-in tRESERVE; AQUA, ETH, BTC, SHX
+and EURC are shown as not selectable), and executes every allocation leg as a
+wallet-signed testnet transaction (see the allocation run below).
+`/stellar_tf_vault/testnet?amount=<USDC>` still prefills a deposit. `/stellar_tf_vault/mainnet`
 shows the vault as not deployed, with every control disabled, until a mainnet
 manifest is added to the registry.
 
@@ -104,6 +107,41 @@ then **Preview** and **Sign & deposit**; the receipt shows the shares the
 contract returned. Then a partial **Sign & withdraw** within "Max withdraw" and
 **Sign & redeem all shares**. An unconfirmed transaction is reported with its
 hash as an unknown outcome; check the explorer before retrying.
+
+### Testnet allocation run (manual script)
+
+Same wallet setup, with test USDC from the Blend faucet. Expected page text is quoted.
+
+1. Open `/?network=testnet`. The banner reads "Testnet mode · market data from
+   mainnet daily closes · balances, quotes and execution on Stellar testnet, test
+   funds only". The AQUA, ETH, BTC and SHX cards read "Not selectable on testnet ·
+   no Soroswap testnet market for …" and ignore clicks.
+2. Connect; the funding list shows the testnet USDC and XLM balances. The EURC
+   reserve reads "Not selectable on testnet · no Soroswap testnet market for EURC"
+   and the USTRY reserve reads "USTRY stand-in on testnet: Etesia-issued tRESERVE
+   …". Select XLM and ETESIA-TF with the USTRY reserve, choose USDC (or XLM) as
+   the source, and build. With XLM, the funding leg keeps XLM back for fees and
+   the account reserve, so MAX swaps the rest.
+3. Under "Execution — Stellar testnet transactions signed by your wallet · test
+   funds only", check every leg before signing: amount in, expected and minimum
+   out, and the contract (the router `CCJUD55A…E7BRD`, the tRESERVE asset, the
+   vault). With XLM funding the "Funding swap · XLM → USDC" leg comes first.
+4. Press **Sign and execute** and approve each leg in the wallet: the tRESERVE
+   `changeTrust` (skipped as "Trustline already present" when the account has
+   it), the USDC → XLM and USDC → tRESERVE swaps, then the `deposit_bounded`.
+   Each confirmed leg shows "Stellar testnet transaction, not a simulation · …"
+   with its ledger, returned amount and explorer link.
+5. Reject one signature: the run stops with "Signature request was rejected in
+   the wallet. Nothing was submitted." and **Continue with the remaining legs**
+   quotes the rest again.
+6. Reload while a leg is "Submitted · confirming onchain…": after rebuilding, the
+   page lists it as "Pending transaction" and nothing can be signed until
+   **Check status** resolves it. Legs confirmed before the reload, and one that
+   resolves as confirmed, are listed as the earlier allocation's receipts; they
+   are not deducted from the rebuilt allocation, so its run stays blocked until
+   **Acknowledge and allow this run**, after which it executes every leg again.
+7. Open `/stellar_tf_vault/testnet`: the contract-read and indexed shares match.
+8. Switch to Mainnet: "Simulate execution" is unchanged and nothing is signed.
 
 ## Data and allocation
 

@@ -39,6 +39,11 @@ export type VaultNetworkConfig = NetworkConfig & {
   vault: string;
   usdc: { contract: string; code: string; issuer: string; decimals: number };
   assets: Record<string, ManifestAsset>;
+  // The manifest's Soroswap router, called directly for swap quotes and swaps.
+  router: string;
+  // Universe id -> manifest symbol of the asset bought for it on this network.
+  // Only these products have a market here; the vault and USDC need none.
+  markets: Record<string, string>;
 };
 
 // Every network's deployment manifest has the shape of the testnet one.
@@ -54,7 +59,8 @@ export const MAINNET: NetworkConfig = {
 
 // The flagship vault of a manifest on the given network. A manifest for
 // another network is rejected, so one network's contracts never get another's passphrase.
-export function vaultNetwork(source: Manifest, network: Endpoints): VaultNetworkConfig {
+// Each market must name an asset of the manifest.
+export function vaultNetwork(source: Manifest, network: Endpoints, markets: Record<string, string> = {}): VaultNetworkConfig {
   if (source.passphrase !== network.passphrase)
     throw new Error(`Manifest passphrase "${source.passphrase}" is not ${network.label}`);
   // Asset registry keyed by symbol, generated from the manifest at build time.
@@ -64,12 +70,16 @@ export function vaultNetwork(source: Manifest, network: Endpoints): VaultNetwork
   const [usdcCode, usdcIssuer] = (assets.USDC.classic ?? "").split(":");
   if (assets.USDC.address !== source.vaults.flagship.usdc || !usdcIssuer)
     throw new Error("Manifest USDC does not match the flagship vault");
+  for (const symbol of Object.values(markets))
+    if (!assets[symbol]) throw new Error(`Market asset ${symbol} is not in the manifest`);
   return {
     ...network,
     epoch: source.network_epoch,
     vault: source.vaults.flagship.id,
     usdc: { contract: assets.USDC.address, code: usdcCode, issuer: usdcIssuer, decimals: assets.USDC.decimals },
     assets,
+    router: source.aggregator_config.soroswap_router,
+    markets,
   };
 }
 
@@ -83,4 +93,4 @@ export const TESTNET = vaultNetwork(manifest, {
   explorerUrl: "https://stellar.expert/explorer/testnet",
   faucetUrl: "https://testnet.blend.capital",
   indexer: "vaults/flagship",
-});
+}, { xlm: "XLM", ustry: "tRESERVE" });

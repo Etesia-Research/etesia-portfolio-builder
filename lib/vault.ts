@@ -1,5 +1,5 @@
-// Vault client: USDC trustline, contract reads and the bounded
-// deposit / withdraw / redeem flows of the flagship vault.
+// Vault client: trustlines, contract reads, the bounded deposit / withdraw /
+// redeem flows of the flagship vault, and swaps on the manifest's Soroswap router.
 //
 // doc-checked: @stellar/stellar-sdk 17.4.0 type defs (rpc.Server
 //   simulateTransaction / prepareTransaction / sendTransaction /
@@ -11,6 +11,11 @@
 //   from etesia-vault/contracts/vault/src/lib.rs (deposit_bounded,
 //   withdraw_bounded, redeem_bounded, preview_*, balance, convert_to_assets,
 //   max_withdraw, liquid_assets, state) and error codes from types.rs.
+//   Router ABI and CombinedRouterError codes from soroswap-docs
+//   amm/technical-reference/contracts/soroswap-router and error-codes:
+//   router_get_amounts_out(amount_in: i128, path: Vec<Address>) -> Vec<i128>,
+//   swap_exact_tokens_for_tokens(amount_in: i128, amount_out_min: i128,
+//   path: Vec<Address>, to: Address, deadline: u64) -> Vec<i128>.
 //
 // Flow per action: preview_* simulation sets the bound, prepareTransaction
 // simulates the call itself and assembles footprint/auth/fees, the wallet
@@ -59,7 +64,23 @@ export const VAULT_ERRORS: Record<number, string> = {
   20: "Reward accounting failed.",
 };
 
+// Soroswap router CombinedRouterError codes (soroswap-docs error-codes).
+export const ROUTER_ERRORS: Record<number, string> = {
+  502: "The swap amount must not be negative.",
+  503: "The swap deadline passed before it was applied. Quote again and retry.",
+  507: "The pool price moved beyond the 0.5% minimum between the quote and execution. Quote again and retry.",
+  509: "There is no Soroswap pair for this route.",
+  510: "The swap amount is too small.",
+  511: "The Soroswap pool does not have enough liquidity for this swap.",
+  512: "The swap input amount is too small.",
+  513: "The swap output would be zero.",
+  514: "The swap route is invalid.",
+};
+
+// A contract's own error, as the host reports it: a panic with an error code,
+// or (observed from the Soroswap router on testnet) a returned Err.
 const FAILING = "failing with contract error";
+const ESCALATED = "escalating Ok(ScErrorType::Contract) frame-exit to Err";
 
 // Decimal string <-> integer units, without floating point.
 export function toUnits(amount: string, decimals: number): bigint {
@@ -143,16 +164,22 @@ export function supplyAccrual(holdings: Holding[] = [], events?: Indexed, nextLe
   });
 }
 
-export type UsdcLine = { funded: boolean; trustline: boolean; balance: string | null; xlm: string | null };
+// lines: balances of the manifest's classic assets the account trusts, by symbol.
+export type UsdcLine = { funded: boolean; trustline: boolean; balance: string | null; xlm: string | null; subentries: number; lines: Record<string, string> };
 
 export type Receipt = { action: string; hash: string; ledger: number; returned?: string };
-type Returned = { decimals: number; unit: string };
+export type Returned = { decimals: number; unit: string };
+// A signed envelope: its hash and the end of its time bound (unix seconds).
+export type Signed = { hash: string; maxTime: number };
+export type OnSigned = (signed: Signed) => void;
 const SHARES: Returned = { decimals: SHARE_DECIMALS, unit: "shares" };
 
 // SDK 17 returns the hash as a Uint8Array.
 const txHash = (tx: { hash(): Uint8Array }) => Array.from(tx.hash(), (byte) => byte.toString(16).padStart(2, "0")).join("");
-const unknownOutcome = (hash: string, why: string) =>
-  new Error(`Transaction ${hash} ${why}. Its outcome is unknown; check the explorer before retrying.`);
+const signedOf = (tx: Transaction): Signed => ({ hash: txHash(tx), maxTime: Number(tx.timeBounds?.maxTime ?? 0) });
+// Carries the signed envelope, so a caller never signs again while it could still be included.
+const unknownOutcome = (signed: Signed, why: string) =>
+  Object.assign(new Error(`Transaction ${signed.hash} ${why}. Its outcome is unknown; check the explorer before retrying.`), { unknown: signed });
 
 // A resource or footprint failure is fixed by simulating again, so the
 // transaction is re-prepared and re-signed once.
@@ -171,38 +198,46 @@ export function vaultClient(net: VaultNetworkConfig) {
   const server = new rpc.Server(net.rpcUrl);
   const horizon = new Horizon.Server(net.horizonUrl);
   const vault = new Contract(net.vault);
+  const router = new Contract(net.router);
   const usdcAsset = new Asset(net.usdc.code, net.usdc.issuer);
   const USDC: Returned = { decimals: net.usdc.decimals, unit: "USDC" };
 
   // The vault's own failure event in a simulation's event log. An inner contract
   // (USDC SAC, oracle, Blend) reuses low error numbers and the vault re-reports
   // its code as "contract call failed", so both the contract and the text must match.
-  const VAULT_FAILURE = new RegExp(`contract:${net.vault}, topics:\\[error, Error\\(Contract, #(\\d+)\\)\\], data:\\["${FAILING}"`);
+  const failure = (contract: string) => new RegExp(`contract:${contract}, topics:\\[error, Error\\(Contract, #(\\d+)\\)\\], data:(?:\\["${FAILING}"|"${ESCALATED.replace(/[()]/g, "\\$&")}")`);
+  const VAULT_FAILURE = failure(net.vault);
+  const ROUTER_FAILURE = failure(net.router);
 
   // Turn any simulation, submission or wallet failure into a user message.
   function vaultError(err: unknown): string {
     const message = err instanceof Error ? err.message : String(err ?? "");
+    const untrusted = /contract:(\w+), topics:\[error, Error\(Contract, #\d+\)\], data:\["trustline entry is missing/.exec(message)?.[1];
+    const symbol = untrusted && assetSymbol(untrusted);
+    if (symbol && symbol !== untrusted && symbol !== "USDC") return `Add the ${symbol} trustline before this swap.`;
     if (/trustline entry is missing/i.test(message)) return "Add the USDC trustline before depositing.";
     if (/resulting balance is not within the allowed range|balance is not sufficient/i.test(message))
       return "The USDC transfer would leave a balance out of range: not enough USDC for this deposit, or the trustline limit reached for this withdrawal.";
     const code = Number(VAULT_FAILURE.exec(message)?.[1]);
     if (VAULT_ERRORS[code]) return `${VAULT_ERRORS[code]} (vault error ${code})`;
+    const routerCode = Number(ROUTER_FAILURE.exec(message)?.[1]);
+    if (routerCode) return `${ROUTER_ERRORS[routerCode] ?? "The Soroswap router rejected the swap."} (router ${net.router} error ${routerCode})`;
     if (/Error\(Auth,/.test(message)) return "Authorization failed in simulation: the vault call must be signed by the connected account.";
     if (/Account not found/i.test(message)) return `This account is not funded on ${net.label} yet. Fund it with XLM first.`;
     return (message.split("\n")[0] || "Unknown error.");
   }
 
-  function buildCall(source: Account, fn: string, args: xdr.ScVal[]): Transaction {
+  function buildCall(source: Account, fn: string, args: xdr.ScVal[], contract = vault): Transaction {
     return new TransactionBuilder(source, { fee: BASE_FEE, networkPassphrase: net.passphrase })
-      .addOperation(vault.call(fn, ...args))
+      .addOperation(contract.call(fn, ...args))
       .setTimeout(DEADLINE_SECONDS)
       .build();
   }
 
   // Simulate a read-only vault call. Simulation needs no funded source account.
-  async function read(fn: string, args: xdr.ScVal[] = []): Promise<{ value: any; ledger: number }> {
+  async function read(fn: string, args: xdr.ScVal[] = [], contract = vault): Promise<{ value: any; ledger: number }> {
     const source = new Account(Keypair.random().publicKey(), "0");
-    const sim = await server.simulateTransaction(buildCall(source, fn, args));
+    const sim = await server.simulateTransaction(buildCall(source, fn, args, contract));
     if (rpc.Api.isSimulationError(sim)) throw new Error(sim.error);
     return { value: scValToNative(sim.result!.retval), ledger: sim.latestLedger };
   }
@@ -266,54 +301,71 @@ export function vaultClient(net: VaultNetworkConfig) {
     try {
       account = await horizon.loadAccount(owner);
     } catch (err: any) {
-      if (err instanceof NotFoundError) return { funded: false, trustline: false, balance: null, xlm: null };
+      if (err instanceof NotFoundError) return { funded: false, trustline: false, balance: null, xlm: null, subentries: 0, lines: {} };
       throw err;
     }
     const line = account.balances.find((b: any) => b.asset_code === net.usdc.code && b.asset_issuer === net.usdc.issuer);
     const xlm = account.balances.find((b: any) => b.asset_type === "native");
-    return { funded: true, trustline: Boolean(line), balance: line ? line.balance : null, xlm: xlm ? xlm.balance : null };
+    const lines: Record<string, string> = {};
+    for (const asset of Object.values(net.assets)) {
+      const held = account.balances.find((b: any) => `${b.asset_code}:${b.asset_issuer}` === asset.classic);
+      if (held) lines[asset.symbol] = held.balance;
+    }
+    return { funded: true, trustline: Boolean(line), balance: line ? line.balance : null, xlm: xlm ? xlm.balance : null,
+      subentries: Number(account.subentry_count ?? 0), lines };
   }
 
-  async function addUsdcTrustline(owner: string): Promise<Receipt> {
+  // A classic manifest asset's trustline (USDC by default; tRESERVE before a reserve swap).
+  async function addUsdcTrustline(owner: string, symbol = "USDC", onSigned?: OnSigned): Promise<Receipt> {
+    const [code, issuer] = (net.assets[symbol]?.classic ?? "").split(":");
+    if (!issuer) throw new Error(`${symbol} is not a classic asset of this deployment.`);
     const account = await horizon.loadAccount(owner);
     const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: net.passphrase })
-      .addOperation(Operation.changeTrust({ asset: usdcAsset }))
+      .addOperation(Operation.changeTrust({ asset: symbol === "USDC" ? usdcAsset : new Asset(code, issuer) }))
       .setTimeout(DEADLINE_SECONDS)
       .build();
-    const signed = TransactionBuilder.fromXDR(await signTx(tx.toXDR(), net.passphrase), net.passphrase);
-    const hash = txHash(signed);
+    const signed = TransactionBuilder.fromXDR(await signTx(tx.toXDR(), net.passphrase), net.passphrase) as Transaction;
+    const envelope = signedOf(signed);
+    const hash = envelope.hash;
+    onSigned?.(envelope);
     try {
       const result = await horizon.submitTransaction(signed);
-      return { action: "Add USDC trustline", hash: result.hash, ledger: result.ledger };
+      return { action: `Add ${symbol} trustline`, hash: result.hash, ledger: result.ledger };
     } catch (err: any) {
       // SDK 17: TransactionFailedError / BadResponseError carry {status, data}.
       const codes = err?.response?.data?.extras?.result_codes;
       if (codes?.operations?.includes("op_low_reserve"))
         throw new Error(`Fund the account with more ${net.label} XLM: the trustline raises its minimum balance by 0.5 XLM.`);
       if (codes) throw new Error(`Trustline transaction ${hash} was rejected (${[codes.transaction, ...(codes.operations ?? [])].join(", ")}).`);
-      throw unknownOutcome(hash, `could not be confirmed (${vaultError(err)})`);
+      throw unknownOutcome(envelope, `could not be confirmed (${vaultError(err)})`);
     }
   }
 
-  // The vault's own error code from an included transaction's diagnostic events.
-  function onchainVaultCode(events: xdr.DiagnosticEvent[] = []): number | undefined {
-    const failure = humanizeEvents(events).find((e) => e.contractId === net.vault && e.topics[0] === "error"
-      && Array.isArray(e.data) && e.data[0] === FAILING);
+  // The vault's (or another contract's) own error code from an included transaction's diagnostic events.
+  function onchainVaultCode(events: xdr.DiagnosticEvent[] = [], contract = net.vault): number | undefined {
+    const failure = humanizeEvents(events).find((e) => e.contractId === contract && e.topics[0] === "error"
+      && ((Array.isArray(e.data) && e.data[0] === FAILING) || e.data === ESCALATED));
     return failure?.topics[1]?.code;
   }
 
-  async function invoke(owner: string, action: string, fn: string, args: xdr.ScVal[], returns: Returned, retried = false): Promise<Receipt> {
-    const prepared = await server.prepareTransaction(buildCall(await server.getAccount(owner), fn, args));
-    const signed = TransactionBuilder.fromXDR(await signTx(prepared.toXDR(), net.passphrase), net.passphrase);
-    const hash = txHash(signed);
+  // onSigned receives each signed envelope before it is submitted. args builds
+  // the call's arguments for each attempt, so a re-simulated retry carries a
+  // fresh deadline; its minimum stays the bound shown before signing.
+  async function invoke(owner: string, action: string, contract: Contract, fn: string, args: () => xdr.ScVal[], returns: Returned, onSigned?: OnSigned, retried = false): Promise<Receipt> {
+    const prepared = await server.prepareTransaction(buildCall(await server.getAccount(owner), fn, args(), contract));
+    const signed = TransactionBuilder.fromXDR(await signTx(prepared.toXDR(), net.passphrase), net.passphrase) as Transaction;
+    const envelope = signedOf(signed);
+    const hash = envelope.hash;
+    onSigned?.(envelope);
+    const retry = () => invoke(owner, action, contract, fn, args, returns, onSigned, true);
     let sent;
     try {
       sent = await server.sendTransaction(signed);
     } catch (err) {
-      throw unknownOutcome(hash, `could not be confirmed as submitted (${vaultError(err)})`);
+      throw unknownOutcome(envelope, `could not be confirmed as submitted (${vaultError(err)})`);
     }
     if (sent.status === "ERROR") {
-      if (!retried && needsResimulation(sent.errorResult)) return invoke(owner, action, fn, args, returns, true);
+      if (!retried && needsResimulation(sent.errorResult)) return retry();
       const type = sent.errorResult?.result.type ?? "unknown";
       if (type === "txTooLate") throw new Error(`The signature took longer than the transaction's ${DEADLINE_SECONDS}-second window, so it was not submitted. Preview again and retry.`);
       throw new Error(`Transaction rejected before inclusion (${type}).`);
@@ -323,19 +375,62 @@ export function vaultClient(net: VaultNetworkConfig) {
     try {
       final = await server.pollTransaction(hash, { attempts: POLL_ATTEMPTS });
     } catch (err) {
-      throw unknownOutcome(hash, `was submitted but its status could not be read (${vaultError(err)})`);
+      throw unknownOutcome(envelope, `was submitted but its status could not be read (${vaultError(err)})`);
     }
-    if (final.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-      const returned = final.returnValue ? `${fromUnits(BigInt(scValToNative(final.returnValue)), returns.decimals)} ${returns.unit}` : undefined;
-      return { action, hash, ledger: final.ledger, returned };
-    }
+    if (final.status === rpc.Api.GetTransactionStatus.SUCCESS)
+      return { action, hash, ledger: final.ledger, returned: returnedText(final.returnValue, returns) };
     if (final.status === rpc.Api.GetTransactionStatus.FAILED) {
-      if (!retried && needsResimulation(final.resultXdr)) return invoke(owner, action, fn, args, returns, true);
+      if (!retried && needsResimulation(final.resultXdr)) return retry();
       const code = onchainVaultCode(final.diagnosticEventsXdr);
       if (code && VAULT_ERRORS[code]) throw new Error(`${VAULT_ERRORS[code]} (vault error ${code}) Transaction ${hash} failed onchain; only the fee was charged.`);
+      const routerCode = onchainVaultCode(final.diagnosticEventsXdr, net.router);
+      if (routerCode) throw new Error(`${ROUTER_ERRORS[routerCode] ?? "The Soroswap router rejected the swap."} (router ${net.router} error ${routerCode}) Transaction ${hash} failed onchain; only the fee was charged.`);
       throw new Error(`Transaction ${hash} failed onchain (${final.resultXdr.result.type}).`);
     }
-    throw unknownOutcome(hash, `was not found within ${POLL_ATTEMPTS} seconds, past its time bound`);
+    throw unknownOutcome(envelope, `was not found within ${POLL_ATTEMPTS} seconds, past its time bound`);
+  }
+
+  // A contract's returned amount: an i128, or the last of a router's Vec<i128>.
+  function returnedText(value: xdr.ScVal | undefined, returns: Returned): string | undefined {
+    if (!value) return undefined;
+    const native = scValToNative(value);
+    return `${fromUnits(BigInt(Array.isArray(native) ? native.at(-1) : native), returns.decimals)} ${returns.unit}`;
+  }
+
+  // The status of a signed envelope whose outcome was unknown. NOT_FOUND within
+  // its time bound stays pending: it could still be included. Past the time
+  // bound it can no longer be included; it counts as expired when the RPC
+  // history reaches back to before it was signed, and otherwise its outcome is
+  // outside the retained history (it may have been included earlier).
+  async function checkTransaction(signed: Signed, action: string, returns: Returned):
+    Promise<{ status: "SUCCESS"; receipt: Receipt } | { status: "FAILED" | "EXPIRED" | "OUTSIDE_HISTORY" | "PENDING" }> {
+    const tx = await server.getTransaction(signed.hash);
+    if (tx.status === rpc.Api.GetTransactionStatus.SUCCESS)
+      return { status: "SUCCESS", receipt: { action, hash: signed.hash, ledger: tx.ledger, returned: returnedText(tx.returnValue, returns) } };
+    if (tx.status === rpc.Api.GetTransactionStatus.FAILED) return { status: "FAILED" };
+    if (!(signed.maxTime > 0 && tx.latestLedgerCloseTime > signed.maxTime)) return { status: "PENDING" };
+    return { status: tx.oldestLedgerCloseTime < signed.maxTime - DEADLINE_SECONDS ? "EXPIRED" : "OUTSIDE_HISTORY" };
+  }
+
+  const pathArg = (path: string[]) => nativeToScVal(path.map((contract) => Address.fromString(contract)));
+  const assetOf = (contract: string) => Object.values(net.assets).find((asset) => asset.address === contract);
+  const swapReturns = (path: string[]): Returned => ({ decimals: assetOf(path.at(-1)!)?.decimals ?? 7, unit: assetSymbol(path.at(-1)!) });
+
+  // Router quote: the output of an exact input along the path (simulated, nothing signed).
+  async function quoteSwap(amountIn: bigint, path: string[]): Promise<{ amountOut: bigint; ledger: number }> {
+    try {
+      const { value, ledger } = await read("router_get_amounts_out", [i128(amountIn), pathArg(path)], router);
+      return { amountOut: BigInt((value as bigint[]).at(-1)!), ledger };
+    } catch (err) {
+      throw new Error(`No Soroswap testnet quote for ${path.map(assetSymbol).join(" → ")}: ${vaultError(err)}`);
+    }
+  }
+
+  // Exact-in swap on the router to the connected account, bounded by minOut and a deadline.
+  async function swapExactIn(owner: string, amountIn: bigint, minOut: bigint, path: string[], onSigned?: OnSigned): Promise<Receipt> {
+    const action = `Swap ${fromUnits(amountIn, assetOf(path[0])?.decimals ?? 7)} ${assetSymbol(path[0])} → ${assetSymbol(path.at(-1)!)}`;
+    return invoke(owner, action, router, "swap_exact_tokens_for_tokens",
+      () => [i128(amountIn), i128(minOut), pathArg(path), address(owner), u64(deadline())], swapReturns(path), onSigned);
   }
 
   // Preview for the form, shown before anything is signed; the flows below
@@ -346,16 +441,16 @@ export function vaultClient(net: VaultNetworkConfig) {
   }
 
   // receiver, from/owner and operator are all the connected account.
-  async function deposit(owner: string, amount: string): Promise<Receipt> {
+  async function deposit(owner: string, amount: string, onSigned?: OnSigned): Promise<Receipt> {
     const minShares = minBound(await preview("deposit", amount));
-    return invoke(owner, `Deposit ${amount} USDC`, "deposit_bounded",
-      [i128(toUnits(amount, USDC.decimals)), address(owner), address(owner), address(owner), i128(minShares), u64(deadline())], SHARES);
+    return invoke(owner, `Deposit ${amount} USDC`, vault, "deposit_bounded",
+      () => [i128(toUnits(amount, USDC.decimals)), address(owner), address(owner), address(owner), i128(minShares), u64(deadline())], SHARES, onSigned);
   }
 
   async function withdraw(owner: string, amount: string): Promise<Receipt> {
     const maxShares = maxBound(await preview("withdraw", amount));
-    return invoke(owner, `Withdraw ${amount} USDC`, "withdraw_bounded",
-      [i128(toUnits(amount, USDC.decimals)), address(owner), address(owner), address(owner), i128(maxShares), u64(deadline())], SHARES);
+    return invoke(owner, `Withdraw ${amount} USDC`, vault, "withdraw_bounded",
+      () => [i128(toUnits(amount, USDC.decimals)), address(owner), address(owner), address(owner), i128(maxShares), u64(deadline())], SHARES);
   }
 
   // Full exit: redeem the whole share balance for USDC.
@@ -363,10 +458,11 @@ export function vaultClient(net: VaultNetworkConfig) {
     const shares = BigInt((await read("balance", [address(owner)])).value);
     if (shares <= BigInt(0)) throw new Error("This account holds no vault shares.");
     const redeemable = BigInt((await read("preview_redeem", [i128(shares)])).value);
-    return invoke(owner, `Full exit: redeem ${fromUnits(shares, SHARE_DECIMALS)} shares`, "redeem_bounded",
-      [i128(shares), address(owner), address(owner), address(owner), i128(minBound(redeemable)), u64(deadline())], USDC);
+    return invoke(owner, `Full exit: redeem ${fromUnits(shares, SHARE_DECIMALS)} shares`, vault, "redeem_bounded",
+      () => [i128(shares), address(owner), address(owner), address(owner), i128(minBound(redeemable)), u64(deadline())], USDC);
   }
 
-  return { net, vaultError, readPosition, readIndexed, readUsdcLine, addUsdcTrustline, onchainVaultCode, preview, deposit, withdraw, exitAll, assetSymbol, targetLabel, eventDetail };
+  return { net, vaultError, readPosition, readIndexed, readUsdcLine, addUsdcTrustline, onchainVaultCode, preview, deposit, withdraw, exitAll, assetSymbol, targetLabel, eventDetail,
+    quoteSwap, swapExactIn, checkTransaction, swapReturns, SHARES };
 }
 export type VaultClient = ReturnType<typeof vaultClient>;

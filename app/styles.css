@@ -692,6 +692,8 @@
     min-height: 188px;
   }
   .coin-card:hover { background: var(--paper-2); }
+  .coin-card:disabled { opacity: 0.5; cursor: not-allowed; }
+  .coin-card:disabled:hover { background: var(--paper); }
   .coin-card.selected { background: #1d1a14; color: var(--paper); }
   .coin-card.selected .label, .coin-card.selected .stat-label { color: rgba(243,238,227,0.6); }
   .coin-card.selected .bar-track { background: rgba(243,238,227,0.2); }

@@ -11,8 +11,9 @@
 //   FreighterModule in favour of VarialModule (Freighter is now Varial); both
 //   use the module id 'varial'.
 //
-// The network comes from lib/network.ts. The mainnet Builder never signs.
-// A vault page signs on its own network: the wallet's network is checked with getNetwork()
+// The network comes from lib/network.ts. The mainnet Builder never signs; the
+// testnet Builder (?network=testnet) signs its allocation legs on testnet.
+// A testnet page or vault page signs on its own network: the wallet's network is checked with getNetwork()
 // on connect, before every signature and on window focus, and signing is
 // blocked on a passphrase mismatch. xBull cannot report its network, so it
 // relies on the passphrase that signTx always passes.
