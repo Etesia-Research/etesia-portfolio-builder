@@ -39,6 +39,7 @@ function harness(initialState = []) {
     },
     "@/components/AllocationSimulation": () => null,
     "@/components/ExecutionSimulation": () => null,
+    "next/dynamic": (loader) => Object.assign(() => null, { loader }),
     "@/stores/useStellarWalletStore": (selector) => selector(wallet),
     "@/stores/useBalanceStore": (selector) => selector(balances),
     "@/stores/usePriceStore": (selector) => selector(prices),
@@ -324,4 +325,15 @@ test("an allocation with a vault leg links its USDC amount to the testnet deposi
   assert.equal(link(tree).props.href, "/testnet?amount=40.2500000");
   assert.match(text(tree), /other legs stay quoted above and are not executed/);
   assert.equal(link(h.AllocStage({ allocation: allocation({ xlm: { allocation_fraction: 1, notional_usdc: 100, quantity: 300 } }), coins: [], onReset() {} })), undefined);
+});
+
+test("only the Etesia-TF card mounts the indexed testnet vault entry, and the basket note keeps the simulated $1 share price", () => {
+  const h = harness();
+  const card = (coin) => nodes(h.CoinCard({ coin: { name: coin.tk, marketCap: {}, mcap: null, sharpe: null, ...coin }, selected: false, hasBasket: false, onToggle() {}, maxMcap: 1 }));
+  const entry = card({ id: "etesia-tf", tk: "ETESIA-TF", simulated: true }).find(node => node.type?.loader);
+  assert.match(String(entry.type.loader), /components\/VaultCatalogEntry/);
+  assert.equal(card({ id: "xlm", tk: "XLM" }).some(node => node.type?.loader), false);
+  const note = text(h.Sidecar({ basket: ["ETESIA-TF"], coins: [{ tk: "ETESIA-TF", name: "Etesia TF Vault", simulated: true }], analytics: null, analyticsLoading: false, removeFromBasket() {} }));
+  assert.ok(note.includes("a simulated $1 share price: there is no mainnet vault. The indexed testnet share price on its card is display only."));
+  assert.ok(!/assumed \$1/.test(source));
 });

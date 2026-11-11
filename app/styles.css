@@ -1152,3 +1152,16 @@ button.coin-card:focus-visible { outline: 2px solid var(--accent); outline-offse
   .factsheet-section, .factsheet-hero, .factsheet-composition { break-inside: avoid; }
   .factsheet { print-color-adjust: exact; }
 }
+
+/* Etesia-TF catalog entry: indexed testnet vault metrics (D5-06) */
+.product-indexed { margin: 0 18px 16px; padding-top: 10px; border-top: 1px solid currentColor; font-family: 'IBM Plex Mono', monospace; font-size: 11px; overflow-wrap: anywhere; }
+.product-indexed h5 { margin: 0 0 4px; font-size: 9px; font-weight: 500; letter-spacing: 0.18em; text-transform: uppercase; }
+.product-indexed dl { margin: 0; }
+.product-indexed dl > div { padding: 6px 0; border-bottom: 1px solid rgba(29,26,20,.16); }
+.product-indexed dt { font-size: 9px; letter-spacing: 0.12em; text-transform: uppercase; opacity: 0.7; }
+.product-indexed dd { margin: 2px 0 0; }
+.product-indexed dd.data-note { margin-top: 2px; }
+.product-indexed [data-status="stale"], .product-indexed [data-status="missing"], .product-indexed [data-status="error"] { color: var(--warn); }
+.product-card-wrap.is-selected .product-indexed dl > div { border-bottom-color: rgba(243,238,227,0.2); }
+.product-card-wrap.is-selected .product-indexed [data-status="stale"], .product-card-wrap.is-selected .product-indexed [data-status="missing"], .product-card-wrap.is-selected .product-indexed [data-status="error"] { color: #e3a657; }
+.product-indexed a { color: inherit; }

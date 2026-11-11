@@ -213,3 +213,105 @@ test("the mainnet execution row is labelled as simulated at $1 per share", () =>
   assert.ok(source.includes("'Simulated at $1 per share · no mainnet vault · no swap quote'"));
   assert.ok(!/[Aa]ssumed \$1/.test(source));
 });
+
+function catalogEntry(quantRequest) {
+  return load("components/VaultCatalogEntry.jsx", { "@/lib/vault": vaultLib(quantRequest), "@/lib/network": network });
+}
+
+test("the mainnet catalog entry shows the indexed testnet vault metrics, each with its freshness", () => {
+  const { IndexedVaultEntry } = catalogEntry();
+  const html = renderToStaticMarkup(React.createElement(IndexedVaultEntry, { indexed: fixtures }));
+  for (const text of ["Testnet vault (pre-reset), indexed", "1.0006921 USDC", "1,000.8164 USDC",
+    "USDC 90.00% vs 2.5% target · XLM 10.00% vs 12% target · tRESERVE — vs 85.5% target · holdings at 2026-11-11 12:50 UTC · target epoch 3 expired at 2026-11-11 12:26 UTC",
+    'data-status="stale">Latest snapshot at 2026-11-11 12:55 UTC failed (holdings vault:Pricing); showing the last successful snapshot at 2026-11-11 12:50 UTC.',
+    "2026-11-11 05:00 UTC · plan · nonce 46 · equity 1000.5 → 1000.4 USDC", `${TESTNET.explorerUrl}/tx/${hash("a")}`,
+    "USDC +0.0123 interest over 1 of 2 snapshot intervals from 2026-11-11 04:00 UTC to 2026-11-11 12:50 UTC", "0.07% over 2.54 days · not annualized",
+    "0.00% over 12 snapshots from 2026-11-11 00:00 UTC to 2026-11-11 11:00 UTC · share price, not annualized", "Stale · indexed as of 2026-11-11T12:00:00+00:00",
+    "Fresh · indexed as of 2026-11-11T12:55:00+00:00 · 2 min old", "events · Fresh · indexed as of 2026-11-11T12:57:00+00:00",
+    "Not used in the allocation or the simulated execution, which price the vault at $1 per share."]) {
+    assert.ok(html.includes(text), text);
+  }
+  assert.ok(!html.includes("unavailable"));
+});
+
+test("the catalog entry labels stale, missing, failed and loading views and never shows a stand-in number", () => {
+  const { IndexedVaultEntry } = catalogEntry();
+  const render = (indexed) => renderToStaticMarkup(React.createElement(IndexedVaultEntry, { indexed }));
+  const degraded = render({
+    summary: { status: "error", error: "Quant request timed out" },
+    allocations: { ...fixtures.allocations, ...header("missing"), holdings: [], targets: [] },
+    events: { ...fixtures.events, ...header("stale", "2026-11-11T11:00:00+00:00", 7000), events: [] },
+    performance: { ...fixtures.performance, actual: { ...fixtures.performance.actual, return_fraction: null } },
+  });
+  assert.ok(degraded.includes("Unavailable · Quant request timed out"));
+  assert.ok(degraded.includes("Missing · the indexer has no data for this view yet"));
+  assert.ok(degraded.includes('data-status="stale">Stale · indexed as of 2026-11-11T11:00:00+00:00 · 117 min old'));
+  assert.ok(degraded.includes("None in the latest 0 indexed events"));
+  // Share price, TVL, allocation, Blend yield and the null actual return.
+  assert.equal(degraded.match(/<dd>unavailable<\/dd>/g).length, 5);
+  assert.ok(!/\d USDC|vs \d/.test(degraded));
+  // A snapshot whose holdings() failed throughout has no allocation, and no target is stated as such.
+  const noTarget = render({ ...fixtures, allocations: { ...fixtures.allocations, targets: [] } });
+  assert.ok(noTarget.includes("USDC 90.00% · XLM 10.00% · no published target"));
+  const failed = render({ ...fixtures, allocations: { ...fixtures.allocations, holdings: fixtures.allocations.holdings.slice(3) } });
+  assert.equal(failed.match(/<dd>unavailable<\/dd>/g).length, 2); // allocation and Blend yield
+  const loading = render({});
+  assert.equal(loading.match(/<dd>…<\/dd>/g).length, 7);
+  assert.ok(loading.includes("Reading the indexer…") && !loading.includes("unavailable"));
+});
+
+test("a failed allocations, events, performance or history request leaves its metrics unavailable without breaking the page", () => {
+  const { IndexedVaultEntry } = catalogEntry();
+  const down = { status: "error", error: "Quant request failed with 504" };
+  const html = renderToStaticMarkup(React.createElement(IndexedVaultEntry, { indexed: { ...fixtures, allocations: down, events: down, performance: down, history: down } }));
+  // Allocation, last rebalance, Blend yield, actual return and max drawdown.
+  assert.equal(html.match(/<dd>unavailable<\/dd>/g).length, 5);
+  assert.ok(html.includes("1.0006921 USDC") && html.includes("Unavailable · Quant request failed with 504"));
+  assert.ok(!html.includes("showing the last successful snapshot"));
+});
+
+test("the catalog entry compares against the newest target and shows the latest rebalance or unwind", () => {
+  const { IndexedVaultEntry } = catalogEntry();
+  const newer = { ...fixtures.allocations.targets[0], ledger: 5679600, tx_hash: hash("g"), epoch: 4, expiry: 1794500000, assets: [XLM, USDC], weights_bps: [3000, 7000] };
+  const unwind = { id: "0004", ledger: 5679800, closed_at: "2026-11-11T11:00:00Z", tx_hash: hash("h"), contract: TESTNET.vault, kind: "unwind", topics: ["unwind"], data: [47] };
+  const html = renderToStaticMarkup(React.createElement(IndexedVaultEntry, { indexed: { ...fixtures,
+    allocations: { ...fixtures.allocations, targets: [...fixtures.allocations.targets, newer] },
+    events: { ...fixtures.events, events: [...fixtures.events.events, unwind] } } }));
+  // The newest target, not expired at the 12:50 snapshot; tRESERVE is in neither the holdings nor this target.
+  assert.ok(html.includes("USDC 90.00% vs 70% target · XLM 10.00% vs 30% target · holdings at 2026-11-11 12:50 UTC</dd>"));
+  assert.ok(html.includes("2026-11-11 11:00 UTC · unwind · [47]") && html.includes(`${TESTNET.explorerUrl}/tx/${hash("h")}`));
+  // A held asset outside the target is compared with 0%.
+  const held = renderToStaticMarkup(React.createElement(IndexedVaultEntry, { indexed: { ...fixtures,
+    allocations: { ...fixtures.allocations, targets: [{ ...newer, assets: [USDC], weights_bps: [10000] }] } } }));
+  assert.ok(held.includes("USDC 90.00% vs 100% target · XLM 10.00% vs 0% target"));
+});
+
+test("Blend yield shows no unmeasured zero, says when nothing is supplied, and max drawdown reads the indexed share price", () => {
+  const { IndexedVaultEntry } = catalogEntry();
+  const render = (indexed) => renderToStaticMarkup(React.createElement(IndexedVaultEntry, { indexed: { ...fixtures, ...indexed } }));
+  const position = (ledger) => ({ ...fixtures.events.events[2], id: String(ledger), ledger });
+  // A vault supply or withdraw in every interval: no interval measures interest.
+  const moved = render({ events: { ...fixtures.events, events: [...fixtures.events.events, position(5679800)] } });
+  assert.ok(!moved.includes("USDC +0") && !moved.includes("interest over"));
+  assert.equal(moved.match(/<dd>unavailable<\/dd>/g).length, 1);
+  // The latest interval reaches the indexer's next ledger, so its events may not be indexed yet.
+  const behind = render({ summary: { ...fixtures.summary, indexer: { ...fixtures.summary.indexer, next_ledger: 5679990 } } });
+  assert.ok(!behind.includes("interest over") && behind.match(/<dd>unavailable<\/dd>/g).length === 1);
+  const unsupplied = fixtures.allocations.holdings.map(h => h.assets ? { ...h, assets: h.assets.map(a => ({ ...a, supply: 0 })) } : h);
+  assert.ok(render({ allocations: { ...fixtures.allocations, holdings: unsupplied } }).includes("<dd>No Blend supply in the latest snapshot</dd>"));
+  const prices = [1, 1.1, 0.99, 1.05];
+  const dip = render({ history: { ...fixtures.history, points: fixtures.history.points.slice(0, 4).map((p, i) => ({ ...p, share_price_usdc: prices[i] })) } });
+  assert.ok(dip.includes("10.00% over 4 snapshots from 2026-11-11 00:00 UTC to 2026-11-11 03:00 UTC · share price, not annualized"));
+  const one = render({ history: { ...fixtures.history, points: fixtures.history.points.slice(0, 1) } });
+  assert.equal(one.match(/<dd>unavailable<\/dd>/g).length, 1);
+});
+
+test("the catalog entry reads the flagship views through the quant proxy without an owner and refreshes every 300 s", async () => {
+  const paths = [], intervals = [];
+  const runEffects = { ...React, useState: (initial) => [initial, () => {}], useEffect: (fn) => { fn(); } };
+  const { default: VaultCatalogEntry } = load("components/VaultCatalogEntry.jsx", { react: runEffects, "@/lib/network": network,
+    "@/lib/vault": vaultLib(async (p) => { paths.push(p); return header("missing"); }) }, { setInterval: (fn, ms) => intervals.push(ms), clearInterval() {} });
+  renderToStaticMarkup(React.createElement(VaultCatalogEntry));
+  assert.deepEqual(paths.sort(), ["vaults/flagship/allocations?limit=288", "vaults/flagship/events?limit=100", "vaults/flagship/history?limit=288", "vaults/flagship/performance", "vaults/flagship/summary"]);
+  assert.deepEqual(intervals, [300000]);
+});

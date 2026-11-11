@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useMemo, useEffect, useRef } from "react";
+import dynamic from "next/dynamic";
 import useStellarWalletStore from "@/stores/useStellarWalletStore";
 import { initWalletKit, connectWallet, disconnectWallet } from "@/components/stellar/walletKit";
 import usePriceStore from "@/stores/usePriceStore";
@@ -12,6 +13,7 @@ import useBalanceStore from "@/stores/useBalanceStore";
 import { fetchHoldings } from "@/lib/balances";
 import { MAINNET } from "@/lib/network";
 
+const VaultCatalogEntry = dynamic(() => import("@/components/VaultCatalogEntry"), { ssr: false, loading: () => null });
 const EMPTY_HOLDINGS = {};
 const RESERVE_IDS = new Set(['usdc', 'eurc', 'ustry']);
 
@@ -186,6 +188,7 @@ function CoinCard({ coin, selected, correlation, correlationLoading, hasBasket, 
       {hasBasket && !correlationLoading && corr == null && <div className="data-note">{correlation?.reason || correlation?.error || 'Correlation unavailable'}</div>}
     </button>
     {coin.id === 'etesia-tf' && <a className="product-info" href="/stellar_tf_vault" aria-label="Etesia-TF strategy factsheet"><span aria-hidden="true">ⓘ</span> Strategy factsheet <span aria-hidden="true">↗</span></a>}
+    {coin.id === 'etesia-tf' && <VaultCatalogEntry />}
     </div>
   );
 }
@@ -213,7 +216,7 @@ function Sidecar({ basket, coins, removeFromBasket, analytics, analyticsLoading 
     </div>}
     <p className="data-note">Sharpe uses the arithmetic mean of daily portfolio returns, not CAGR or an average of product ratios. With negative returns, lower volatility can make Sharpe more negative.</p>
     <p className="data-note">ρ compares each product with this basket over up to three years, using equal capital at the start of the window and fixed quantities thereafter.</p>
-    {basket.includes('ETESIA-TF') && <p className="data-note">Basket metrics include simulated vault returns. The vault is included in allocation using simulated history and an assumed $1 share price.</p>}
+    {basket.includes('ETESIA-TF') && <p className="data-note">Basket metrics include simulated vault returns. The vault is included in allocation using simulated history and a simulated $1 share price: there is no mainnet vault. The indexed testnet share price on its card is display only.</p>}
   </aside>;
 }
 
