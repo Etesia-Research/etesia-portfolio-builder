@@ -1,5 +1,6 @@
 // Vault client: trustlines, contract reads, the bounded deposit / withdraw /
-// redeem flows of the flagship vault, and swaps on the manifest's Soroswap router.
+// redeem flows of the flagship vault, and testnet swaps quoted and built by the
+// Soroswap Aggregator API (through the Builder's /api/soroswap route).
 //
 // doc-checked: @stellar/stellar-sdk 17.4.0 type defs (rpc.Server
 //   simulateTransaction / prepareTransaction / sendTransaction /
@@ -13,14 +14,22 @@
 //   max_withdraw, liquid_assets, state) and error codes from types.rs.
 //   Router ABI and CombinedRouterError codes from soroswap-docs
 //   amm/technical-reference/contracts/soroswap-router and error-codes:
-//   router_get_amounts_out(amount_in: i128, path: Vec<Address>) -> Vec<i128>,
 //   swap_exact_tokens_for_tokens(amount_in: i128, amount_out_min: i128,
-//   path: Vec<Address>, to: Address, deadline: u64) -> Vec<i128>.
+//   path: Vec<Address>, to: Address, deadline: u64) -> Vec<i128>. Soroswap
+//   API flow from soroswap-docs api/quickstart, api-reference/quote/quote and
+//   build, api/stellar-gotchas and api/errors: /quote, then /quote/build with
+//   the quote unchanged and from = the signer; the built XDR is already
+//   simulated (never re-prepared) and valid 180 s; 428 CREATE_TRUSTLINE; 429
+//   with Retry-After. A testnet build decoded on 2026-11-11 invokes the
+//   manifest router's swap_exact_tokens_for_tokens with source-account auth.
 //
-// Flow per action: preview_* simulation sets the bound, prepareTransaction
+// Flow per vault action: preview_* simulation sets the bound, prepareTransaction
 // simulates the call itself and assembles footprint/auth/fees, the wallet
 // signs (signTx checks the wallet network first), then sendTransaction and
-// pollTransaction. Only a SUCCESS status from getTransaction becomes a receipt.
+// pollTransaction. A swap is quoted and built by the API, checked against its
+// quote, then signed, sent and polled the same way (submitted through our own
+// RPC, not the API's /send, so the pending-hash rules below apply unchanged).
+// Only a SUCCESS status from getTransaction becomes a receipt.
 // Once signed, any failure to submit or confirm reports the hash as an
 // unknown outcome, because the transaction may still be included.
 
@@ -39,6 +48,15 @@ export const DEADLINE_SECONDS = 300;
 // At least one second apart, so polling outlasts the transaction's time bound
 // and a NOT_FOUND result means it can no longer be included.
 export const POLL_ATTEMPTS = DEADLINE_SECONDS + 30;
+// Time bound of an API-built Soroban swap (soroswap-docs api/stellar-gotchas).
+export const API_TX_SECONDS = 180;
+// 429 answers waited out (Retry-After) before a Soroswap call gives up.
+export const SOROSWAP_RETRIES = 3;
+// Clock difference allowed between the API's build and this browser.
+export const API_TX_SLACK = 30;
+// Highest fee accepted on an API-built swap, in stroops: the 1 XLM per
+// transaction the run keeps back for fees (lib/execution.ts FEE_ALLOWANCE).
+export const MAX_SWAP_FEE = BigInt(10000000);
 
 // Vault Error enum (contracts/vault/src/types.rs).
 export const VAULT_ERRORS: Record<number, string> = {
@@ -173,6 +191,9 @@ export type Returned = { decimals: number; unit: string };
 export type Signed = { hash: string; maxTime: number };
 export type OnSigned = (signed: Signed) => void;
 const SHARES: Returned = { decimals: SHARE_DECIMALS, unit: "shares" };
+// A Soroswap API quote: its expected and minimum output (otherAmountThreshold),
+// and the response itself, sent back unchanged to /quote/build.
+export type SwapQuote = { amountOut: bigint; minOut: bigint; quote: Record<string, unknown> };
 
 // SDK 17 returns the hash as a Uint8Array.
 const txHash = (tx: { hash(): Uint8Array }) => Array.from(tx.hash(), (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -181,15 +202,16 @@ const signedOf = (tx: Transaction): Signed => ({ hash: txHash(tx), maxTime: Numb
 const unknownOutcome = (signed: Signed, why: string) =>
   Object.assign(new Error(`Transaction ${signed.hash} ${why}. Its outcome is unknown; check the explorer before retrying.`), { unknown: signed });
 
-// A resource or footprint failure is fixed by simulating again, so the
-// transaction is re-prepared and re-signed once.
+// A resource, footprint or refundable-fee failure is fixed by simulating
+// again, so the transaction is re-prepared (a swap re-quoted and rebuilt) and
+// re-signed once.
 export function needsResimulation(result: xdr.TransactionResult | undefined): boolean {
   const outcome = result?.result;
   if (outcome?.type === "txSorobanInvalid") return true;
   if (outcome?.type !== "txFailed") return false;
   const op = outcome.results[0];
   return op?.type === "opInner" && op.tr.type === "invokeHostFunction"
-    && op.tr.invokeHostFunctionResult.type === "invokeHostFunctionResourceLimitExceeded";
+    && ["invokeHostFunctionResourceLimitExceeded", "invokeHostFunctionInsufficientRefundableFee"].includes(op.tr.invokeHostFunctionResult.type);
 }
 
 // Every network-bound read and flow of one vault deployment. A page builds the
@@ -198,7 +220,6 @@ export function vaultClient(net: VaultNetworkConfig) {
   const server = new rpc.Server(net.rpcUrl);
   const horizon = new Horizon.Server(net.horizonUrl);
   const vault = new Contract(net.vault);
-  const router = new Contract(net.router);
   const usdcAsset = new Asset(net.usdc.code, net.usdc.issuer);
   const USDC: Returned = { decimals: net.usdc.decimals, unit: "USDC" };
 
@@ -235,9 +256,9 @@ export function vaultClient(net: VaultNetworkConfig) {
   }
 
   // Simulate a read-only vault call. Simulation needs no funded source account.
-  async function read(fn: string, args: xdr.ScVal[] = [], contract = vault): Promise<{ value: any; ledger: number }> {
+  async function read(fn: string, args: xdr.ScVal[] = []): Promise<{ value: any; ledger: number }> {
     const source = new Account(Keypair.random().publicKey(), "0");
-    const sim = await server.simulateTransaction(buildCall(source, fn, args, contract));
+    const sim = await server.simulateTransaction(buildCall(source, fn, args));
     if (rpc.Api.isSimulationError(sim)) throw new Error(sim.error);
     return { value: scValToNative(sim.result!.retval), ledger: sim.latestLedger };
   }
@@ -353,11 +374,17 @@ export function vaultClient(net: VaultNetworkConfig) {
   // fresh deadline; its minimum stays the bound shown before signing.
   async function invoke(owner: string, action: string, contract: Contract, fn: string, args: () => xdr.ScVal[], returns: Returned, onSigned?: OnSigned, retried = false): Promise<Receipt> {
     const prepared = await server.prepareTransaction(buildCall(await server.getAccount(owner), fn, args(), contract));
-    const signed = TransactionBuilder.fromXDR(await signTx(prepared.toXDR(), net.passphrase), net.passphrase) as Transaction;
+    return submit(prepared, action, returns, DEADLINE_SECONDS, onSigned,
+      retried ? null : () => invoke(owner, action, contract, fn, args, returns, onSigned, true));
+  }
+
+  // Sign, send and poll a built transaction. retry (once) builds it again after
+  // a resource or footprint failure; window is its time bound in seconds.
+  async function submit(tx: Transaction, action: string, returns: Returned, window: number, onSigned?: OnSigned, retry?: (() => Promise<Receipt>) | null): Promise<Receipt> {
+    const signed = TransactionBuilder.fromXDR(await signTx(tx.toXDR(), net.passphrase), net.passphrase) as Transaction;
     const envelope = signedOf(signed);
     const hash = envelope.hash;
     onSigned?.(envelope);
-    const retry = () => invoke(owner, action, contract, fn, args, returns, onSigned, true);
     let sent;
     try {
       sent = await server.sendTransaction(signed);
@@ -365,9 +392,9 @@ export function vaultClient(net: VaultNetworkConfig) {
       throw unknownOutcome(envelope, `could not be confirmed as submitted (${vaultError(err)})`);
     }
     if (sent.status === "ERROR") {
-      if (!retried && needsResimulation(sent.errorResult)) return retry();
+      if (retry && needsResimulation(sent.errorResult)) return retry();
       const type = sent.errorResult?.result.type ?? "unknown";
-      if (type === "txTooLate") throw new Error(`The signature took longer than the transaction's ${DEADLINE_SECONDS}-second window, so it was not submitted. Preview again and retry.`);
+      if (type === "txTooLate") throw new Error(`The signature took longer than the transaction's ${window}-second window, so it was not submitted. Preview again and retry.`);
       throw new Error(`Transaction rejected before inclusion (${type}).`);
     }
     if (sent.status === "TRY_AGAIN_LATER") throw new Error("The network did not queue the transaction. Try again.");
@@ -380,7 +407,7 @@ export function vaultClient(net: VaultNetworkConfig) {
     if (final.status === rpc.Api.GetTransactionStatus.SUCCESS)
       return { action, hash, ledger: final.ledger, returned: returnedText(final.returnValue, returns) };
     if (final.status === rpc.Api.GetTransactionStatus.FAILED) {
-      if (!retried && needsResimulation(final.resultXdr)) return retry();
+      if (retry && needsResimulation(final.resultXdr)) return retry();
       const code = onchainVaultCode(final.diagnosticEventsXdr);
       if (code && VAULT_ERRORS[code]) throw new Error(`${VAULT_ERRORS[code]} (vault error ${code}) Transaction ${hash} failed onchain; only the fee was charged.`);
       const routerCode = onchainVaultCode(final.diagnosticEventsXdr, net.router);
@@ -412,25 +439,88 @@ export function vaultClient(net: VaultNetworkConfig) {
     return { status: tx.oldestLedgerCloseTime < signed.maxTime - DEADLINE_SECONDS ? "EXPIRED" : "OUTSIDE_HISTORY" };
   }
 
-  const pathArg = (path: string[]) => nativeToScVal(path.map((contract) => Address.fromString(contract)));
   const assetOf = (contract: string) => Object.values(net.assets).find((asset) => asset.address === contract);
   const swapReturns = (path: string[]): Returned => ({ decimals: assetOf(path.at(-1)!)?.decimals ?? 7, unit: assetSymbol(path.at(-1)!) });
 
-  // Router quote: the output of an exact input along the path (simulated, nothing signed).
-  async function quoteSwap(amountIn: bigint, path: string[]): Promise<{ amountOut: bigint; ledger: number }> {
+  // A call to the Builder's Soroswap route, which holds the API key. A 429 is
+  // waited out for its Retry-After seconds, at most SOROSWAP_RETRIES times.
+  async function soroswap(step: "quote" | "build", body: object, attempt = 0): Promise<any> {
+    const response = await fetch(`/api/soroswap/${step}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(30000),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (response.ok) return data;
+    const wait = Number(response.headers.get("Retry-After") ?? data.retryAfter) || 1;
+    if (response.status === 429 && attempt < SOROSWAP_RETRIES) {
+      await new Promise((resolve) => setTimeout(resolve, wait * 1000));
+      return soroswap(step, body, attempt + 1);
+    }
+    if (response.status === 428) {
+      // The trustline legs add the manifest's assets before their swaps; a
+      // trustline asked for here is reported, never signed from the API's XDR.
+      const { assetCode, assetIssuer } = data.actionData ?? {};
+      const asset = Object.values(net.assets).find((a) => a.classic === `${assetCode}:${assetIssuer}`);
+      throw new Error(`Add the ${asset?.symbol ?? `${assetCode}:${assetIssuer}`} trustline before this swap (Soroswap API 428 ${data.action ?? "CREATE_TRUSTLINE"}).`);
+    }
+    if (response.status === 429) throw new Error(`The Soroswap API rate limit was reached. Try again in ${wait} seconds.`);
+    const detail = [data.message ?? data.error, data.detail].flat().filter(Boolean).join(" · ");
+    // Only "No path found" means the pair has no route; any other failure is the API's or ours.
+    throw Object.assign(new Error(`Soroswap API ${response.status}${detail ? `: ${detail}` : ""}`), { noPath: response.status === 400 && /No path found/i.test(detail) });
+  }
+
+  // API quote of an exact input from path[0] to its last asset (nothing
+  // signed). The minimum is the API's otherAmountThreshold at the network's
+  // slippage. noPath marks an API answer that the pair has no route.
+  async function quoteSwap(amountIn: bigint, path: string[]): Promise<SwapQuote> {
+    const [assetIn, assetOut] = [path[0], path.at(-1)!];
     try {
-      const { value, ledger } = await read("router_get_amounts_out", [i128(amountIn), pathArg(path)], router);
-      return { amountOut: BigInt((value as bigint[]).at(-1)!), ledger };
+      const quote = await soroswap("quote", { network: net.soroswap.network, assetIn, assetOut, amount: String(amountIn) });
+      const [amountOut, minOut] = [String(quote.amountOut), String(quote.otherAmountThreshold)];
+      if (quote.assetIn !== assetIn || quote.assetOut !== assetOut || quote.amountIn !== String(amountIn) || quote.tradeType !== "EXACT_IN"
+        || !/^\d+$/.test(amountOut) || !/^[1-9]\d*$/.test(minOut) || BigInt(minOut) > BigInt(amountOut))
+        throw new Error("the quote does not match the requested swap or its output would be zero");
+      return { amountOut: BigInt(amountOut), minOut: BigInt(minOut), quote };
     } catch (err) {
-      throw new Error(`No Soroswap testnet quote for ${path.map(assetSymbol).join(" → ")}: ${vaultError(err)}`);
+      throw Object.assign(new Error(`No Soroswap testnet quote for ${assetSymbol(assetIn)} → ${assetSymbol(assetOut)}: ${vaultError(err)}`), { noPath: (err as { noPath?: boolean }).noPath === true });
     }
   }
 
-  // Exact-in swap on the router to the connected account, bounded by minOut and a deadline.
-  async function swapExactIn(owner: string, amountIn: bigint, minOut: bigint, path: string[], onSigned?: OnSigned): Promise<Receipt> {
-    const action = `Swap ${fromUnits(amountIn, assetOf(path[0])?.decimals ?? 7)} ${assetSymbol(path[0])} → ${assetSymbol(path.at(-1)!)}`;
-    return invoke(owner, action, router, "swap_exact_tokens_for_tokens",
-      () => [i128(amountIn), i128(minOut), pathArg(path), address(owner), u64(deadline())], swapReturns(path), onSigned);
+  // The built transaction must be the quoted swap and nothing else: the
+  // owner's single swap_exact_tokens_for_tokens on the manifest router, with
+  // its five arguments: the quote's amount in, its minimum out, its two assets,
+  // and to = owner. Its time bound ends within API_TX_SECONDS (plus clock
+  // slack), so the pending and expiry rules hold, and its fee is at most MAX_SWAP_FEE.
+  function checkBuilt(tx: Transaction, owner: string, quoted: SwapQuote, path: string[]) {
+    const op = tx.operations[0];
+    const call = tx.operations.length === 1 && op.type === "invokeHostFunction" && op.func.type === "hostFunctionTypeInvokeContract" ? op.func.invokeContract : null;
+    const [amountIn, minOut, route, to] = call ? call.args.map((arg) => scValToNative(arg)) : [];
+    const now = Math.floor(Date.now() / 1000), maxTime = Number(tx.timeBounds?.maxTime ?? 0);
+    if (tx.source !== owner || !call || Address.fromScAddress(call.contractAddress).toString() !== net.router || String(call.functionName) !== "swap_exact_tokens_for_tokens"
+      || call.args.length !== 5 || amountIn !== BigInt(quoted.quote.amountIn as string) || minOut !== quoted.minOut || !Array.isArray(route) || route[0] !== path[0] || route.at(-1) !== path.at(-1) || to !== owner
+      || !(maxTime > now && maxTime <= now + API_TX_SECONDS + API_TX_SLACK) || BigInt(tx.fee) > MAX_SWAP_FEE)
+      throw new Error("The Soroswap API built a transaction that is not the quoted swap on the manifest router. Nothing was signed.");
+  }
+
+  // Exact-in swap to the connected account: quoted, built by the API, checked,
+  // then signed and submitted. floor is the least minimum accepted (the funding
+  // swap's budgeted USDC). A quote answered "No path found" is marked unquoted;
+  // a resource failure is quoted and built again once.
+  async function swapExactIn(owner: string, amountIn: bigint, path: string[], onSigned?: OnSigned, floor = BigInt(0), retried = false): Promise<Receipt> {
+    const [assetIn, assetOut] = [path[0], path.at(-1)!];
+    let quoted;
+    try {
+      quoted = await quoteSwap(amountIn, path);
+    } catch (err) {
+      throw Object.assign(err as Error, { unquoted: !retried && (err as { noPath?: boolean }).noPath === true });
+    }
+    const out = swapReturns(path);
+    if (quoted.minOut < floor)
+      throw new Error(`The ${assetSymbol(assetIn)} → ${assetSymbol(assetOut)} quote's minimum (${fromUnits(quoted.minOut, out.decimals)} ${out.unit}) is now below the ${fromUnits(floor, out.decimals)} ${out.unit} the allocation was budgeted from. Rebuild the allocation.`);
+    const { xdr: built } = await soroswap("build", { network: net.soroswap.network, quote: quoted.quote, from: owner });
+    const tx = TransactionBuilder.fromXDR(built, net.passphrase) as Transaction;
+    checkBuilt(tx, owner, quoted, path);
+    const action = `Swap ${fromUnits(amountIn, assetOf(assetIn)?.decimals ?? 7)} ${assetSymbol(assetIn)} → ${assetSymbol(assetOut)}`;
+    return submit(tx, action, out, API_TX_SECONDS, onSigned, retried ? null : () => swapExactIn(owner, amountIn, path, onSigned, floor, true));
   }
 
   // Preview for the form, shown before anything is signed; the flows below

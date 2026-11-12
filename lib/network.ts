@@ -39,8 +39,12 @@ export type VaultNetworkConfig = NetworkConfig & {
   vault: string;
   usdc: { contract: string; code: string; issuer: string; decimals: number };
   assets: Record<string, ManifestAsset>;
-  // The manifest's Soroswap router, called directly for swap quotes and swaps.
+  // The manifest's Soroswap router: the contract every API-built testnet swap
+  // must invoke (lib/vault.ts checks the built transaction before signing).
   router: string;
+  // Soroswap Aggregator API settings of this network's swaps. The Builder's
+  // /api/soroswap route forces protocols and slippageBps from here.
+  soroswap: { network: "testnet" | "mainnet"; protocols: string[]; slippageBps: number };
   // Universe id -> manifest symbol of the asset bought for it on this network.
   // Only these products have a market here; the vault and USDC need none.
   markets: Record<string, string>;
@@ -48,7 +52,7 @@ export type VaultNetworkConfig = NetworkConfig & {
 
 // Every network's deployment manifest has the shape of the testnet one.
 export type Manifest = typeof manifest;
-export type Endpoints = NetworkConfig & Pick<VaultNetworkConfig, "rpcUrl" | "explorerUrl" | "faucetUrl" | "indexer">;
+export type Endpoints = NetworkConfig & Pick<VaultNetworkConfig, "rpcUrl" | "explorerUrl" | "faucetUrl" | "indexer" | "soroswap">;
 
 export const MAINNET: NetworkConfig = {
   label: "Stellar mainnet",
@@ -93,4 +97,8 @@ export const TESTNET = vaultNetwork(manifest, {
   explorerUrl: "https://stellar.expert/explorer/testnet",
   faucetUrl: "https://testnet.blend.capital",
   indexer: "vaults/flagship",
+  // Testnet quotes come only from Soroswap pools (soroswap-docs api/quickstart
+  // "Testnet"); GET /protocols?network=testnet returned ["soroswap","sdex"] on
+  // 2026-11-11. 50 bps is the 0.5% bound of every other leg.
+  soroswap: { network: "testnet", protocols: ["soroswap"], slippageBps: 50 },
 }, { xlm: "XLM", ustry: "tRESERVE" });

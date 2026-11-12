@@ -22,11 +22,18 @@ Set these **server-only** variables in the ignored `.env.local`:
 ```dotenv
 ETESIA_API_URL=https://your-quant-api.example
 ETESIA_API_KEY=your-private-server-key
+SOROSWAP_API_KEY=sk_your-soroswap-key
 ```
 
 A hostname without a scheme is interpreted as HTTPS. The browser calls the
 allowlisted `/api/quant/` proxy; the bearer key never enters browser requests.
-No Soroswap credential is needed in the frontend. The quant service owns quotes.
+No Soroswap credential is needed in the frontend. The quant service owns the
+mainnet quotes. Testnet allocation swaps call the allowlisted
+`/api/soroswap/quote` and `/api/soroswap/build` route, which holds
+`SOROSWAP_API_KEY`, accepts only testnet manifest assets, forces the Soroswap
+venue and the 0.5% slippage on `/quote`, and builds on `/build` only a Soroswap
+router quote on that venue whose minimum is the API's at that slippage; the
+browser signs the built transaction and submits it through Stellar RPC itself.
 
 ```sh
 pnpm install --frozen-lockfile
@@ -124,8 +131,10 @@ Same wallet setup, with test USDC from the Blend faucet. Expected page text is q
    the account reserve, so MAX swaps the rest.
 3. Under "Execution — Stellar testnet transactions signed by your wallet · test
    funds only", check every leg before signing: amount in, expected and minimum
-   out, and the contract (the router `CCJUD55A…E7BRD`, the tRESERVE asset, the
-   vault). With XLM funding the "Funding swap · XLM → USDC" leg comes first.
+   out (a swap's minimum is the Soroswap API quote's `otherAmountThreshold`; the
+   funding swap also shows the budgeted USDC its minimum must cover), and
+   the contract (the router `CCJUD55A…E7BRD`, which every API-built swap invokes,
+   the tRESERVE asset, the vault). With XLM funding the "Funding swap · XLM → USDC" leg comes first.
 4. Press **Sign and execute** and approve each leg in the wallet: the tRESERVE
    `changeTrust` (skipped as "Trustline already present" when the account has
    it), the USDC → XLM and USDC → tRESERVE swaps, then the `deposit_bounded`.

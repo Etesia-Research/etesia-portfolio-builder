@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import useStellarWalletStore from "@/stores/useStellarWalletStore";
-import { SHARE_DECIMALS, fromUnits, minBound, vaultClient } from "@/lib/vault";
+import { API_TX_SECONDS, DEADLINE_SECONDS, SHARE_DECIMALS, fromUnits, minBound, vaultClient } from "@/lib/vault";
 import { atomicAmount, runKeep, testnetCheck, testnetLegs, tokenUnits, xlmFundingIn } from "@/lib/execution";
 
 // Testnet execution of a Builder allocation: every leg is a real Stellar testnet
@@ -52,9 +52,10 @@ export function legLabel(leg) {
 
 const returnsFor = (client, leg) => leg.kind === "vault" ? client.SHARES : leg.kind === "trustline" ? { decimals: 7, unit: leg.symbol } : client.swapReturns(leg.path);
 
-// Expected and minimum output of each leg before signing: router quotes for
-// swaps (the funding swap's minimum is the USDC the plan was budgeted from),
-// the vault's preview for the deposit.
+// Expected and minimum output of each leg before signing: Soroswap API quotes
+// for swaps, with the API's otherAmountThreshold as the minimum (the funding
+// swap also shows the USDC the plan was budgeted from, the least minimum it is
+// signed with), the vault's preview for the deposit.
 export async function quoteLegs(client, legs) {
   const entries = await Promise.all(legs.map(async (leg) => {
     try {
@@ -63,8 +64,8 @@ export async function quoteLegs(client, legs) {
         const shares = await client.preview("deposit", fromUnits(leg.amountIn, client.net.usdc.decimals));
         return [leg.key, { amountOut: shares, minOut: minBound(shares) }];
       }
-      const { amountOut } = await client.quoteSwap(leg.amountIn, leg.path);
-      return [leg.key, { amountOut, minOut: leg.kind === "funding" ? leg.minOut : minBound(amountOut) }];
+      const { amountOut, minOut } = await client.quoteSwap(leg.amountIn, leg.path);
+      return [leg.key, { amountOut, minOut, ...(leg.kind === "funding" && { budgeted: leg.minOut }) }];
     } catch (err) {
       return [leg.key, { error: client.vaultError(err) }];
     }
@@ -84,8 +85,9 @@ export async function resolveRecord(client, store, owner, record) {
 // Before anything can be signed: resolve the owner's stored envelopes (an
 // unresolved one blocks the run; one that may have executed is listed as an
 // earlier allocation's), read the account, fix the USDC capital (with XLM
-// funding, the funding quote's 0.5% minimum on the XLM left after the run's
-// keep-back), plan and quote the legs.
+// funding, 0.5% below the funding quote's minimum on the XLM left after the
+// run's keep-back, so the swap's re-quote at signing may be up to 0.5% lower
+// and its built minimum still covers the capital), plan and quote the legs.
 export async function prepareRun(client, allocation, net, store) {
   const { owner, funding } = allocation;
   const open = [], earlier = [];
@@ -104,8 +106,8 @@ export async function prepareRun(client, allocation, net, store) {
   let capital, fundingIn;
   if (funding.symbol === "XLM") {
     fundingIn = xlmFundingIn(atomicAmount(funding.amount), testnetLegs(allocation, BigInt(0), net).legs, account);
-    const { amountOut } = await client.quoteSwap(fundingIn, [net.assets.XLM.address, net.usdc.contract]);
-    capital = minBound(amountOut);
+    const { minOut } = await client.quoteSwap(fundingIn, [net.assets.XLM.address, net.usdc.contract]);
+    capital = minBound(minOut);
   } else capital = atomicAmount(funding.amount);
   const { legs, kept } = testnetLegs(allocation, capital, net, fundingIn);
   const quotes = await quoteLegs(client, legs);
@@ -116,26 +118,16 @@ async function executeLeg(client, owner, leg, account, onSigned) {
   if (leg.kind === "trustline") return leg.symbol in account.lines ? null : client.addUsdcTrustline(owner, leg.symbol, onSigned);
   if (leg.amountIn <= BigInt(0)) throw new Error("The leg amount is below one atomic unit.");
   if (leg.kind === "vault") return client.deposit(owner, fromUnits(leg.amountIn, client.net.usdc.decimals), onSigned);
-  // Quoted again right before the signature; a swap without a quote is not executed.
-  let amountOut;
-  try {
-    ({ amountOut } = await client.quoteSwap(leg.amountIn, leg.path));
-  } catch (err) {
-    throw Object.assign(err, { unquoted: leg.kind === "swap" });
-  }
-  let minOut = minBound(amountOut);
-  if (leg.kind === "funding") {
-    if (amountOut < leg.minOut)
-      throw new Error(`The XLM → USDC quote (${tokenUnits(amountOut)} USDC) is now below the ${tokenUnits(leg.minOut)} USDC the allocation was budgeted from. Rebuild the allocation.`);
-    if (minOut < leg.minOut) minOut = leg.minOut;
-  }
-  if (minOut <= BigInt(0)) throw new Error("The swap output would be zero.");
-  return client.swapExactIn(owner, leg.amountIn, minOut, leg.path, onSigned);
+  // Quoted again and built by the Soroswap API right before the signature; a
+  // swap without a quote is not executed. The funding swap's built minimum
+  // must cover the USDC the allocation was budgeted from.
+  return client.swapExactIn(owner, leg.amountIn, leg.path, onSigned, leg.kind === "funding" ? leg.minOut : BigInt(0));
 }
 
 // Run the legs that are not done, in order, stopping at the first failure or
-// unknown outcome. A swap without a live quote is not executed, nor its
-// trustline, and the other legs still run. Before each leg the run stops when
+// unknown outcome. A swap the Soroswap API finds no path for is not executed,
+// nor its trustline, and the other legs still run; any other quote failure
+// (rate limit, API outage, missing key) stops the run. Before each leg the run stops when
 // it is no longer active (the panel left or the allocation changed) and refuses
 // while the store holds a record from outside this run. update(key, state)
 // records each leg's state.
@@ -147,6 +139,7 @@ export async function runLegs({ client, owner, generatedAt, legs, states, store,
     try {
       await client.quoteSwap(leg.amountIn, leg.path);
     } catch (err) {
+      if (!err?.noPath) throw new Error(`${client.vaultError(err)} Nothing was signed; run again once the Soroswap API answers.`);
       unquoted.add(leg.symbol);
       update(leg.key, { status: "unavailable", error: client.vaultError(err) });
     }
@@ -172,7 +165,7 @@ export async function runLegs({ client, owner, generatedAt, legs, states, store,
       if (record) store?.put(owner, { ...record, outcome: { status: "SUCCESS", receipt } });
       update(leg.key, receipt ? { status: "confirmed", receipt } : { status: "skipped" });
     } catch (err) {
-      if (err?.unquoted) {
+      if (err?.unquoted && leg.kind === "swap") {
         update(leg.key, { status: "unavailable", error: client.vaultError(err) });
         continue;
       }
@@ -218,7 +211,7 @@ export function ExecutionPanel({ net, owner, plan, states, open, earlier, prepEr
   const contract = (leg) => leg.kind === "vault" ? net.vault : leg.kind === "trustline" ? net.assets[leg.symbol].classic : net.router;
   return <section className="execution-routes">
     <h4>Execution — Stellar testnet transactions signed by your wallet · test funds only</h4>
-    <p className="data-note">One transaction per leg, each signed in your wallet: the funding swap (with XLM funding), trustlines for received assets, Soroswap swaps on the router {net.router}, then the vault deposit. Soroswap testnet pool quote; testnet prices are not market prices. Minimum outputs allow 0.5% below the quote, each swap is quoted again right before its signature, and every transaction expires 300 seconds after it is built.</p>
+    <p className="data-note">One transaction per leg, each signed in your wallet: the funding swap (with XLM funding), trustlines for received assets, Soroswap swaps quoted and built by the Soroswap Aggregator API on its testnet Soroswap pools (each invokes the router {net.router}), then the vault deposit. Soroswap testnet pool quote; testnet prices are not market prices. A swap's minimum output is the API's minimum at {net.soroswap.slippageBps / 100}% slippage (the funding swap is signed only while that minimum covers its budgeted USDC) and the deposit's allows 0.5% below its preview. Each swap is quoted and built again right before its signature and expires {API_TX_SECONDS} seconds after it is built; the other transactions expire after {DEADLINE_SECONDS} seconds.</p>
     {!storageOk && <p role="alert" className="data-note" style={{ color: 'var(--warn)' }}>Browser storage is unavailable, so a reload cannot recover a transaction that is still pending. Check your account on the explorer (<a href={`${net.explorerUrl}/account/${owner}`} target="_blank" rel="noreferrer">{owner}</a>) before running again.</p>}
     {networkError && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>{networkError}</p>}
     {wrongAccount && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>The connected account is not the one this allocation was built for. Rebuild it to execute.</p>}
@@ -241,7 +234,7 @@ export function ExecutionPanel({ net, owner, plan, states, open, earlier, prepEr
         const input = leg.kind === "trustline" ? "No amount · raises the account's minimum balance by 0.5 XLM"
           : leg.kind === "funding" ? `${tokenUnits(leg.amountIn)} XLM${leg.amountIn !== atomicAmount(plan.entered) ? ` of the ${plan.entered} XLM entered` : ''} · keeps ${tokenUnits(plan.xlmKept)} XLM back for fees and the account reserve`
           : `${tokenUnits(leg.amountIn)} USDC`;
-        const output = leg.kind === "trustline" ? null : quote?.error ? `Unavailable · ${quote.error}` : quote ? `expected ${units(quote.amountOut, decimals)} ${unit} · minimum ${units(quote.minOut, decimals)} ${unit}` : 'Quoting…';
+        const output = leg.kind === "trustline" ? null : quote?.error ? `Unavailable · ${quote.error}` : quote ? `expected ${units(quote.amountOut, decimals)} ${unit} · minimum ${units(quote.minOut, decimals)} ${unit}${quote.budgeted != null ? ` · budgeted ${units(quote.budgeted, decimals)} ${unit}` : ''}` : 'Quoting…';
         return <div className="execution-quote" key={leg.key} data-leg={leg.key} data-status={state?.status ?? "pending"}>
           <strong>{index + 1}. {legLabel(leg)}</strong>
           <span>{input}{output ? ` → ${output}` : ''}</span>
@@ -255,7 +248,7 @@ export function ExecutionPanel({ net, owner, plan, states, open, earlier, prepEr
       <div className="simulated-execution">
         <button className="btn lg" disabled={blocked} onClick={onRun}><span className="dot" />{running ? 'Executing… follow your wallet' : finished ? 'All legs executed' : started ? 'Continue with the remaining legs' : `Sign and execute ${plan.legs.length} ${plan.legs.length === 1 ? 'leg' : 'legs'}`}<span>→</span></button>
         {unknown.length > 0 && <p className="data-note">A leg's outcome is unknown: check its status before continuing. It is never signed again while its signed transaction could still be included.</p>}
-        {plan.legs.some((leg) => leg.kind === "swap" && plan.quotes[leg.key]?.error) && <p className="data-note">A swap without a live quote is not executed, nor its trustline; the other legs still run, and Continue quotes it again.</p>}
+        {plan.legs.some((leg) => leg.kind === "swap" && plan.quotes[leg.key]?.error) && <p className="data-note">A swap the Soroswap API finds no path for is not executed, nor its trustline; the other legs still run, and Continue quotes it again. Any other quote failure stops the run.</p>}
         {runError && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>{runError}</p>}
       </div>
       {plan.legs.filter((leg) => states[leg.key]?.status === "confirmed").map((leg) =>

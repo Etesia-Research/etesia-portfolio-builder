@@ -5,7 +5,10 @@
 //
 // Deploying Etesia-TF on mainnet is configuration only: copy its manifest to
 // data/mainnet-manifest.json and set
-//   mainnet: vaultNetwork(mainnetManifest, { ...MAINNET, wallets, rpcUrl, explorerUrl, faucetUrl: null, indexer })
+//   mainnet: vaultNetwork(mainnetManifest, { ...MAINNET, wallets, rpcUrl, explorerUrl, faucetUrl: null, indexer, soroswap })
+// with soroswap = { network: "mainnet", protocols, slippageBps } (lib/network.ts);
+// its swaps go through the Soroswap API only once app/api/soroswap/[step]/route.ts
+// also lists mainnet in its NETWORKS map.
 // vaultNetwork() rejects a manifest whose passphrase is not mainnet's.
 
 import { TESTNET, type VaultNetworkConfig } from "@/lib/network";

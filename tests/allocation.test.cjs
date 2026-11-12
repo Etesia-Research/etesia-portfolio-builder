@@ -120,7 +120,7 @@ const ALLOCATION = { owner: OWNER, generated_at: "2026-11-11T12:00:00Z", funding
   positions: Object.fromEntries(Object.entries({ xlm: .3, xlm_buffer: .025, "etesia-tf": .35, ustry: .3, usdc: .025 }).map(([id, f]) => [id, { allocation_fraction: f }])) };
 const symbolOf = (contract) => Object.values(TESTNET.assets).find(a => a.address === contract).symbol;
 // A scripted client: each signing call reports its envelope, then confirms, fails or ends unknown.
-function client({ outcomes = {}, checks = [], account = ACCOUNT, noQuote = [] } = {}) {
+function client({ outcomes = {}, checks = [], account = ACCOUNT, noQuote = [], limited = [] } = {}) {
   const log = [];
   let n = 0;
   const sign = (name, onSigned) => {
@@ -135,10 +135,14 @@ function client({ outcomes = {}, checks = [], account = ACCOUNT, noQuote = [] } 
   return { log, net: TESTNET, SHARES: vaultLib.vaultClient(TESTNET).SHARES, swapReturns: (p) => ({ decimals: 7, unit: symbolOf(p.at(-1)) }),
     vaultError: (err) => err.message, readUsdcLine: async () => account,
     quoteSwap: async (amountIn, p) => { log.push(`quote ${p.map(symbolOf).join("→")}`);
-      if (noQuote.includes(symbolOf(p.at(-1)))) throw new Error(`No Soroswap testnet quote for ${p.map(symbolOf).join(" → ")}: pair removed`);
-      return { amountOut: amountIn * 2n, ledger: 1 }; },
+      if (noQuote.includes(symbolOf(p.at(-1)))) throw Object.assign(new Error(`No Soroswap testnet quote for ${p.map(symbolOf).join(" → ")}: Soroswap API 400: No path found`), { noPath: true });
+      if (limited.includes(symbolOf(p.at(-1)))) throw Object.assign(new Error(`No Soroswap testnet quote for ${p.map(symbolOf).join(" → ")}: The Soroswap API rate limit was reached. Try again in 1 seconds.`), { noPath: false });
+      return { amountOut: amountIn * 2n, minOut: amountIn * 2n * 9950n / 10000n, quote: {} }; },
     preview: async () => 1000000000000n,
-    swapExactIn: async (owner, amountIn, minOut, p, onSigned) => { log.push({ amountIn, minOut, to: owner }); return sign(`swap ${symbolOf(p.at(-1))}`, onSigned); },
+    // lib/vault.ts quotes and builds through the Soroswap API inside swapExactIn (tests/vault.test.cjs).
+    swapExactIn: async (owner, amountIn, p, onSigned, floor) => { log.push({ amountIn, floor, to: owner });
+      if (outcomes[`swap ${symbolOf(p.at(-1))}`] === "unquoted") throw Object.assign(new Error(`No Soroswap testnet quote for ${p.map(symbolOf).join(" → ")}: No path found`), { unquoted: true });
+      return sign(`swap ${symbolOf(p.at(-1))}`, onSigned); },
     addUsdcTrustline: async (owner, symbol, onSigned) => sign(`trustline ${symbol}`, onSigned),
     deposit: async (owner, amount, onSigned) => sign(`deposit ${amount}`, onSigned),
     checkTransaction: async (record) => { log.push(`check ${record.hash}`); return checks.shift(); } };
@@ -156,15 +160,15 @@ async function run(c, states = {}, store = panel.pendingStore(() => memoryStorag
 }
 const signedCalls = (c) => c.log.filter(e => typeof e === "string" && !e.startsWith("quote") && !e.startsWith("check"));
 
-test("legs run in order with a fresh quote and the 0.5% floor before each swap, then the deposit", async () => {
+test("legs run in order, each swap quoted before the run and executed through the API swap with no floor, then the deposit", async () => {
   const c = client();
   const { states, result, store } = await run(c);
   assert.equal(result, true);
   assert.deepEqual(signedCalls(c), ["trustline tRESERVE", "swap XLM", "swap tRESERVE", "deposit 7"]);
-  // Each swap is quoted right before it is signed, with minimum = floor(quote × 0.995).
   const quoteIndex = c.log.indexOf("quote USDC→XLM"), swap = c.log.find(e => e.amountIn === 65000000n);
   assert.ok(quoteIndex >= 0 && quoteIndex < c.log.indexOf(swap));
-  assert.deepEqual(swap, { amountIn: 65000000n, minOut: 130000000n * 9950n / 10000n, to: OWNER });
+  // swapExactIn quotes again and builds right before the signature; only the funding swap has a floor.
+  assert.deepEqual(swap, { amountIn: 65000000n, floor: 0n, to: OWNER });
   assert.ok(Object.values(states).every(s => s.status === "confirmed"));
   // Confirmed legs stay stored with their receipts, so a reload does not forget them.
   assert.deepEqual(store.list(OWNER).map(r => [r.leg, r.outcome.status, r.outcome.receipt.hash]), Object.entries(states).map(([key, s]) => [key, "SUCCESS", s.receipt.hash]));
@@ -179,8 +183,37 @@ test("a swap without a live quote is not executed, nor its trustline, and the ot
   assert.match(states["swap:tRESERVE"].error, /No Soroswap testnet quote for USDC → tRESERVE/);
   assert.equal(states["vault:etesia-tf"].status, "confirmed");
   const html = render({ plan: planFor({ "swap:tRESERVE": { error: "No Soroswap testnet quote" } }), states });
-  assert.ok(html.includes("Not executed · No Soroswap testnet quote for USDC → tRESERVE") && html.includes("A swap without a live quote is not executed"));
+  assert.ok(html.includes("Not executed · No Soroswap testnet quote for USDC → tRESERVE") && html.includes("A swap the Soroswap API finds no path for is not executed"));
   assert.ok(html.includes("Continue with the remaining legs") && !runButton(html)[1]);
+});
+
+test("a quote that fails for any reason but No path found (rate limit, outage, missing key) stops the run before anything is signed", async () => {
+  const c = client({ limited: ["tRESERVE"] });
+  const states = {};
+  const { legs } = execution.testnetLegs(ALLOCATION, 200000000n, TESTNET);
+  await assert.rejects(panel.runLegs({ client: c, owner: OWNER, generatedAt: ALLOCATION.generated_at, legs, states, store: null, update: (key, state) => { states[key] = state; } }),
+    /rate limit was reached\. Try again in 1 seconds\. Nothing was signed; run again once the Soroswap API answers\./);
+  assert.deepEqual([signedCalls(c), states], [[], {}]);
+});
+
+test("a swap whose quote fails at signing is not executed, while a funding swap's failure stops the run", async () => {
+  const c = client({ outcomes: { "swap tRESERVE": "unquoted" } });
+  const { states, result } = await run(c);
+  assert.equal(result, true);
+  assert.deepEqual([states["swap:tRESERVE"].status, states["vault:etesia-tf"].status], ["unavailable", "confirmed"]);
+  assert.match(states["swap:tRESERVE"].error, /No path found/);
+  const allocation = { ...ALLOCATION, funding: { symbol: "XLM", amount: "100" } };
+  const f = client({ outcomes: { "swap USDC": "unquoted" } });
+  const prepared = await panel.prepareRun(f, allocation, TESTNET, null);
+  const states2 = {};
+  const ok = await panel.runLegs({ client: f, owner: OWNER, generatedAt: ALLOCATION.generated_at, legs: prepared.plan.legs, states: states2, store: null,
+    update: (key, state) => { states2[key] = state; } });
+  assert.equal(ok, false);
+  assert.equal(states2.funding.status, "failed");
+  // The funding swap's floor is the USDC the plan was budgeted from: 0.5% below the funding quote's minimum.
+  const funding = f.log.find(e => typeof e === "object");
+  assert.equal(funding.floor, prepared.plan.capital);
+  assert.equal(prepared.plan.capital, 930000000n * 2n * 9950n / 10000n * 9950n / 10000n);
 });
 
 test("a run stops when its panel is gone, and refuses while the store holds a transaction signed outside it", async () => {
@@ -297,6 +330,9 @@ test("XLM funding keeps the run's XLM back and the funding leg shows it", async 
   assert.equal(prepared.plan.check, null);
   const html = render({ plan: prepared.plan, states: {} });
   assert.ok(html.includes("93.0000000 XLM of the 100 XLM entered · keeps 7.0000000 XLM back for fees and the account reserve"));
+  // The funding swap shows the fresh quote's minimum, which is what is signed, and the budgeted USDC it must cover.
+  assert.deepEqual(prepared.plan.quotes.funding, { amountOut: 1860000000n, minOut: 1850700000n, budgeted: prepared.plan.capital });
+  assert.ok(html.includes("expected 186 USDC · minimum 185.07 USDC · budgeted 184.14465 USDC"));
 });
 
 test("receipts render only for a SUCCESS, as testnet transactions and not simulations", () => {

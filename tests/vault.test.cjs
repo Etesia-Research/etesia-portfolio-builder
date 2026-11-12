@@ -7,12 +7,12 @@ const ts = require("typescript");
 const sdk = require("@stellar/stellar-sdk");
 const root = path.join(__dirname, "..");
 
-function load(file, imports = {}) {
+function load(file, imports = {}, globals = {}) {
   const code = ts.transpileModule(fs.readFileSync(path.join(root, file), "utf8"), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022, esModuleInterop: true, resolveJsonModule: true },
   }).outputText;
   const module = { exports: {} };
-  new Function("require", "module", "exports", code)(name => imports[name] ?? require(name), module, module.exports);
+  new Function("require", "module", "exports", ...Object.keys(globals), code)(name => imports[name] ?? require(name), module, module.exports, ...Object.values(globals));
   return module.exports;
 }
 const manifestPath = path.join(root, "data/testnet-manifest.json");
@@ -20,7 +20,10 @@ const network = load("lib/network.ts", { "@/data/testnet-manifest.json": require
 const { TESTNET } = network;
 const OWNER = sdk.Keypair.random().publicKey();
 const i128 = (value) => sdk.nativeToScVal(BigInt(value), { type: "i128" });
-const resourceFailure = { result: { type: "txFailed", results: [{ type: "opInner", tr: { type: "invokeHostFunction", invokeHostFunctionResult: { type: "invokeHostFunctionResourceLimitExceeded" } } }] } };
+const hostFailure = (type) => ({ result: { type: "txFailed", results: [{ type: "opInner", tr: { type: "invokeHostFunction", invokeHostFunctionResult: { type } } }] } });
+const resourceFailure = hostFailure("invokeHostFunctionResourceLimitExceeded");
+// An API-built swap's resourceFee was a few stroops below a fresh simulation's on testnet (21512 vs 21516).
+const refundableFeeFailure = hostFailure("invokeHostFunctionInsufficientRefundableFee");
 const trapped = { result: { type: "txFailed", results: [{ type: "opInner", tr: { type: "invokeHostFunction", invokeHostFunctionResult: { type: "invokeHostFunctionTrapped" } } }] } };
 // Diagnostic event 30 of failed testnet tx 4c55ed60…37bf: contract CBE32GUT…V5TH,
 // topics [error, Error(Contract, #7)], data ["failing with contract error", 7].
@@ -35,10 +38,11 @@ function failingEvent(contract, code) {
 
 // lib/vault.ts with a scripted RPC server: `views` answers simulations by
 // function name (numbers become i128), `sends` and `polls` are the sequences of
-// sendTransaction and getTransaction outcomes (a function is thrown), and
-// `horizon` stubs Horizon.Server.
-function harness({ views = {}, sends = [], polls = [{ status: "SUCCESS", ledger: 77, returnValue: i128(5) }], horizon = {}, gets = [] } = {}, config = TESTNET) {
-  const calls = { contract: [], signed: 0, sent: 0, polled: [], hashes: [], passphrases: [], networks: [] };
+// sendTransaction and getTransaction outcomes (a function is thrown),
+// `horizon` stubs Horizon.Server, and `api` is the sequence of the Builder
+// Soroswap route's answers ({ status, body, headers }, or a function of the request).
+function harness({ views = {}, sends = [], polls = [{ status: "SUCCESS", ledger: 77, returnValue: i128(5) }], horizon = {}, gets = [], api = [] } = {}, config = TESTNET) {
+  const calls = { contract: [], signed: 0, sent: 0, prepared: 0, polled: [], hashes: [], passphrases: [], networks: [], api: [], waits: [], signedXdr: [] };
   const next = (queue, fallback) => {
     const outcome = queue.length ? queue.shift() : fallback;
     if (typeof outcome === "function") throw outcome();
@@ -57,7 +61,7 @@ function harness({ views = {}, sends = [], polls = [{ status: "SUCCESS", ledger:
       return { latestLedger: 70, result: { retval: typeof value === "number" ? i128(value) : value } };
     }
     async getAccount(address) { return new sdk.Account(address, "1"); }
-    async prepareTransaction(tx) { return tx; }
+    async prepareTransaction(tx) { calls.prepared++; return tx; }
     async sendTransaction(tx) {
       calls.sent++;
       calls.networks.push(tx.networkPassphrase);
@@ -74,8 +78,18 @@ function harness({ views = {}, sends = [], polls = [{ status: "SUCCESS", ledger:
   const lib = load("lib/vault.ts", {
     "@stellar/stellar-sdk": { ...sdk, Contract, rpc: { ...sdk.rpc, Server }, Horizon: { ...sdk.Horizon, Server: HorizonServer } },
     "@/lib/network": network,
-    "@/components/stellar/walletKit": { signTx: async (xdr, passphrase) => { calls.signed++; calls.passphrases.push(passphrase); return xdr; } },
+    "@/components/stellar/walletKit": { signTx: async (xdr, passphrase) => { calls.signed++; calls.passphrases.push(passphrase); calls.signedXdr.push(xdr); return xdr; } },
     "@/lib/quant": { quantRequest: async () => { throw new Error("not used"); } },
+  }, {
+    fetch: async (url, options) => {
+      const request = { url, body: JSON.parse(options.body) };
+      calls.api.push(request);
+      let reply = api.shift();
+      if (typeof reply === "function") reply = reply(request);
+      if (!reply) throw new Error(`unexpected Soroswap call ${url}`);
+      return new Response(JSON.stringify(reply.body ?? {}), { status: reply.status ?? 201, headers: reply.headers });
+    },
+    setTimeout: (fn, ms) => { calls.waits.push(ms); fn(); },
   });
   const vault = { ...lib, ...lib.vaultClient(config) };
   return { vault, calls, flows: () => calls.contract.filter(c => c.fn.endsWith("_bounded")) };
@@ -252,7 +266,8 @@ test("a vault client builds and signs only on its own deployment's network", asy
   assert.deepEqual(t.calls.networks, [sdk.Networks.TESTNET]);
 });
 
-// D5 allocation: swaps on the manifest's Soroswap router, called directly.
+// D5 allocation: testnet swaps quoted and built by the Soroswap Aggregator API
+// (through the Builder's /api/soroswap route), signed and submitted through RPC.
 const [USDC, XLM, RESERVE] = [TESTNET.usdc.contract, TESTNET.assets.XLM.address, TESTNET.assets.tRESERVE.address];
 const amounts = (...values) => sdk.nativeToScVal(values.map(i128));
 // The router's own failure as observed in a testnet simulation (min out above the quote, 2026-11-11).
@@ -264,32 +279,113 @@ function escalatedEvent(contract, code) {
   wire.event.body.v0.data = sdk.xdr.ScVal.scvString("escalating Ok(ScErrorType::Contract) frame-exit to Err").toXdrObject();
   return sdk.xdr.DiagnosticEvent.fromXdrObject(wire);
 }
+// A /quote answer in the shape observed on testnet on 2026-11-11 (10 USDC → XLM, platform router).
+const quoteOf = (assetIn, assetOut, amountIn, amountOut, min = amountOut * 9950n / 10000n) => ({ status: 201, body: {
+  assetIn, assetOut, tradeType: "EXACT_IN", amountIn: String(amountIn), amountOut: String(amountOut), otherAmountThreshold: String(min),
+  priceImpactPct: "0.00", platform: "router", routePlan: [{ swapInfo: { protocol: "soroswap", path: [assetIn, assetOut] }, percent: "100.00" }],
+  rawTrade: { amountIn: String(amountIn), amountOutMin: String(min), distribution: [{ protocol_id: "soroswap", path: [assetIn, assetOut], parts: 10, is_exact_in: true }] } } });
+// A /quote/build answer as decoded on testnet: the owner's router swap_exact_tokens_for_tokens, 180-second time bound.
+function builtOf({ amountIn, minOut, path, to = OWNER, source = OWNER, contract = TESTNET.router, fn = "swap_exact_tokens_for_tokens", fee = "90268", timeout = 180, extra = [] }) {
+  const builder = new sdk.TransactionBuilder(new sdk.Account(source, "1"), { fee, networkPassphrase: TESTNET.passphrase })
+    .addOperation(new sdk.Contract(contract).call(fn, i128(amountIn), i128(minOut), sdk.nativeToScVal(path.map(c => sdk.Address.fromString(c))),
+      sdk.Address.fromString(to).toScVal(), sdk.nativeToScVal(BigInt(Math.floor(Date.now() / 1000) + 3600), { type: "u64" }), ...extra));
+  const tx = (Array.isArray(timeout) ? builder.setTimebounds(...timeout) : builder.setTimeout(timeout)).build();
+  return { status: 201, body: { xdr: tx.toXDR(), action: "SIGN_TRANSACTION" } };
+}
+const swapApi = (amountIn, amountOut, path = [USDC, XLM], build = {}) => {
+  const quote = quoteOf(path[0], path.at(-1), amountIn, amountOut);
+  return [quote, builtOf({ amountIn, minOut: BigInt(quote.body.otherAmountThreshold), path, ...build })];
+};
 
-test("quoteSwap simulates router_get_amounts_out on the manifest router with the i128 amount and the address path", async () => {
-  const h = harness({ views: { router_get_amounts_out: () => amounts(100000000, 654091321) } });
+test("quoteSwap asks the Builder route for an exact-in testnet quote and returns its expected and minimum output", async () => {
+  const h = harness({ api: [quoteOf(USDC, XLM, 100000000n, 654087498n, 650817060n)] });
   const quote = await h.vault.quoteSwap(BigInt(100000000), [USDC, XLM]);
-  assert.deepEqual(quote, { amountOut: BigInt(654091321), ledger: 70 });
-  const [call] = h.calls.contract;
-  assert.deepEqual(call, { fn: "router_get_amounts_out", args: [BigInt(100000000), [USDC, XLM]], contract: TESTNET.router });
+  assert.deepEqual([quote.amountOut, quote.minOut], [BigInt(654087498), BigInt(650817060)]);
+  assert.deepEqual(h.calls.api, [{ url: "/api/soroswap/quote", body: { network: "testnet", assetIn: USDC, assetOut: XLM, amount: "100000000" } }]);
   assert.equal(h.calls.signed, 0);
-  await assert.rejects(harness({ views: {} }).vault.quoteSwap(BigInt(1), [USDC, XLM]), /No Soroswap testnet quote for USDC → XLM/);
+  // A quote for another trade, or with a zero minimum, is not a quote for this swap.
+  for (const reply of [quoteOf(USDC, RESERVE, 100000000n, 5n), quoteOf(USDC, XLM, 99999999n, 5n), quoteOf(USDC, XLM, 100000000n, 5n, 0n)])
+    await assert.rejects(harness({ api: [reply] }).vault.quoteSwap(BigInt(100000000), [USDC, XLM]), /No Soroswap testnet quote for USDC → XLM: the quote does not match/);
+  await assert.rejects(harness({ api: [{ status: 400, body: { message: "No path found" } }] }).vault.quoteSwap(BigInt(1), [USDC, XLM]),
+    /No Soroswap testnet quote for USDC → XLM: Soroswap API 400: No path found/);
 });
 
-test("swapExactIn signs swap_exact_tokens_for_tokens with the floor, the path, the owner and a 300-second deadline", async () => {
-  const h = harness({ polls: [{ status: "SUCCESS", ledger: 81, returnValue: amounts(100000000, 654000000) }] });
+test("swapExactIn quotes, builds with the quote unchanged and from = owner, then signs the built XDR as is and submits it through RPC", async () => {
+  const api = swapApi(100000000n, 654087498n);
+  const h = harness({ api: [...api], polls: [{ status: "SUCCESS", ledger: 81, returnValue: amounts(100000000, 654087498) }] });
   const signed = [];
-  const before = Math.floor(Date.now() / 1000);
-  const receipt = await h.vault.swapExactIn(OWNER, BigInt(100000000), h.vault.minBound(BigInt(654091321)), [USDC, XLM], (s) => signed.push(s));
-  const [call] = h.calls.contract;
-  assert.equal(call.fn, "swap_exact_tokens_for_tokens");
-  assert.equal(call.contract, TESTNET.router);
-  assert.deepEqual(call.args.slice(0, 4), [BigInt(100000000), BigInt(650820864), [USDC, XLM], OWNER]); // floor(654091321 × 0.995)
-  assert.ok(call.args[4] >= BigInt(before + 300) && call.args[4] <= BigInt(before + 301));
+  const receipt = await h.vault.swapExactIn(OWNER, BigInt(100000000), [USDC, XLM], (s) => signed.push(s));
+  assert.deepEqual(h.calls.api.map(c => c.url), ["/api/soroswap/quote", "/api/soroswap/build"]);
+  assert.deepEqual(h.calls.api[1].body, { network: "testnet", quote: api[0].body, from: OWNER });
+  // Never re-simulated: the API already sized the transaction.
+  assert.equal(h.calls.prepared, 0);
+  assert.deepEqual(h.calls.signedXdr, [api[1].body.xdr]);
   assert.deepEqual(h.calls.passphrases, [TESTNET.passphrase]);
   assert.deepEqual(signed.map(s => s.hash), h.calls.hashes);
-  assert.ok(signed[0].maxTime >= before + 300 && signed[0].maxTime <= before + 301);
+  const built = sdk.TransactionBuilder.fromXDR(api[1].body.xdr, TESTNET.passphrase);
+  assert.equal(signed[0].maxTime, Number(built.timeBounds.maxTime));
+  assert.deepEqual(h.calls.polled, [330]);
   // The receipt is the confirmed transaction's own return: the router's last amount, in the output asset.
-  assert.deepEqual(receipt, { action: "Swap 10 USDC → XLM", hash: h.calls.hashes[0], ledger: 81, returned: "65.4 XLM" });
+  assert.deepEqual(receipt, { action: "Swap 10 USDC → XLM", hash: h.calls.hashes[0], ledger: 81, returned: "65.4087498 XLM" });
+});
+
+test("a built transaction that is not the quoted swap on the manifest router is never signed", async () => {
+  const other = sdk.Keypair.random().publicKey();
+  const now = Math.floor(Date.now() / 1000);
+  // Also refused: no time bound (it would stay pending forever), one past or beyond the
+  // API's 180 s (plus 30 s slack), an extra argument, and a fee above the 1 XLM kept back per transaction.
+  for (const build of [{ to: other }, { source: other }, { contract: TESTNET.vault }, { fn: "swap_tokens_for_exact_tokens" }, { minOut: 1n }, { amountIn: 1n }, { path: [USDC, RESERVE] },
+    { timeout: 0 }, { timeout: 600 }, { timeout: [0, now - 1] }, { extra: [i128(1)] }, { fee: "10000001" }]) {
+    const [quote] = swapApi(100000000n, 654087498n);
+    const h = harness({ api: [quote, builtOf({ amountIn: 100000000n, minOut: BigInt(quote.body.otherAmountThreshold), path: [USDC, XLM], ...build })] });
+    await assert.rejects(h.vault.swapExactIn(OWNER, BigInt(100000000), [USDC, XLM]), /not the quoted swap on the manifest router\. Nothing was signed/, JSON.stringify(build, (k, v) => typeof v === "bigint" ? String(v) : v));
+    assert.equal(h.calls.signed, 0);
+  }
+  // At the limits: the full 210 s window and a 1 XLM fee are signed.
+  for (const build of [{ timeout: 210 }, { fee: "10000000" }]) {
+    const [quote] = swapApi(100000000n, 654087498n);
+    const h = harness({ api: [quote, builtOf({ amountIn: 100000000n, minOut: BigInt(quote.body.otherAmountThreshold), path: [USDC, XLM], ...build })], polls: [{ status: "SUCCESS", ledger: 81, returnValue: amounts(100000000, 654087498) }] });
+    await h.vault.swapExactIn(OWNER, BigInt(100000000), [USDC, XLM]);
+    assert.equal(h.calls.signed, 1);
+  }
+});
+
+test("a 428 CREATE_TRUSTLINE from the build names the manifest asset and signs nothing", async () => {
+  const [quote] = swapApi(100000000n, 97749663n, [USDC, RESERVE]);
+  const [code, issuer] = TESTNET.assets.tRESERVE.classic.split(":");
+  // Observed on testnet for an account without the tRESERVE line (2026-11-11).
+  const missing = { status: 428, body: { message: `Missing trustline in ${OWNER} for asset: tRESERVE`, action: "CREATE_TRUSTLINE", errorCode: 13,
+    actionData: { xdr: "AAAA", signer: OWNER, assetCode: code, assetIssuer: issuer, description: "Create a trustline" } } };
+  const h = harness({ api: [quote, missing] });
+  await assert.rejects(h.vault.swapExactIn(OWNER, BigInt(100000000), [USDC, RESERVE]),
+    (err) => err.message === "Add the tRESERVE trustline before this swap (Soroswap API 428 CREATE_TRUSTLINE)." && !err.unquoted);
+  assert.equal(h.calls.signed, 0);
+});
+
+test("a 429 waits Retry-After before asking again, and gives up after the retries", async () => {
+  const limited = { status: 429, body: { message: "Rate limit exceeded", retryAfter: 1 }, headers: { "Retry-After": "2" } };
+  const h = harness({ api: [limited, quoteOf(USDC, XLM, 10n, 20n)] });
+  assert.equal((await h.vault.quoteSwap(BigInt(10), [USDC, XLM])).amountOut, BigInt(20));
+  assert.deepEqual(h.calls.waits, [2000]);
+  const g = harness({ api: Array(h.vault.SOROSWAP_RETRIES + 1).fill(limited) });
+  await assert.rejects(g.vault.quoteSwap(BigInt(10), [USDC, XLM]), /rate limit was reached\. Try again in 2 seconds/);
+  assert.deepEqual(g.calls.waits, Array(h.vault.SOROSWAP_RETRIES).fill(2000));
+});
+
+test("only a No path found quote is marked unquoted; a minimum below the funding floor is refused before the build", async () => {
+  const none = harness({ api: [{ status: 400, body: { message: "No path found" } }] });
+  await assert.rejects(none.vault.swapExactIn(OWNER, BigInt(10), [USDC, XLM]), (err) => err.unquoted === true && /No Soroswap testnet quote/.test(err.message));
+  // A rate limit, an outage or a missing key is not a missing route: the run stops instead.
+  const limited = { status: 429, body: { message: "Rate limit exceeded" }, headers: { "Retry-After": "1" } };
+  for (const api of [Array(4).fill(limited), [{ status: 503, body: { error: "Soroswap API is not configured" } }], [{ status: 504, body: { error: "Soroswap request timed out" } }],
+    [{ status: 400, body: { error: "Unsupported network" } }]]) {
+    const h = harness({ api });
+    await assert.rejects(h.vault.swapExactIn(OWNER, BigInt(10), [USDC, XLM]), (err) => err.unquoted === false && err.noPath === false && /No Soroswap testnet quote/.test(err.message));
+  }
+  const low = harness({ api: [quoteOf(XLM, USDC, 500000000n, 75842198n, 75462987n)] });
+  await assert.rejects(low.vault.swapExactIn(OWNER, BigInt(500000000), [XLM, USDC], undefined, BigInt(75462988)),
+    (err) => err.message === "The XLM → USDC quote's minimum (7.5462987 USDC) is now below the 7.5462988 USDC the allocation was budgeted from. Rebuild the allocation." && !err.unquoted);
+  assert.deepEqual([low.calls.api.length, low.calls.signed], [1, 0]);
 });
 
 test("a router failure is reported with the router's code, not as a vault error", async () => {
@@ -298,17 +394,17 @@ test("a router failure is reported with the router's code, not as a vault error"
   assert.match(vault.vaultError(new Error(routerFailure(503))), /deadline passed.*error 503\)/);
   // A vault error code number from the router is still the router's.
   assert.doesNotMatch(vault.vaultError(new Error(routerFailure(14))), /vault error/);
-  const h = harness({ polls: [{ status: "FAILED", resultXdr: trapped, diagnosticEventsXdr: [escalatedEvent(TESTNET.router, 507)] }] });
-  await assert.rejects(h.vault.swapExactIn(OWNER, BigInt(10), BigInt(9), [USDC, XLM]),
+  const h = harness({ api: swapApi(10n, 20n), polls: [{ status: "FAILED", resultXdr: trapped, diagnosticEventsXdr: [escalatedEvent(TESTNET.router, 507)] }] });
+  await assert.rejects(h.vault.swapExactIn(OWNER, BigInt(10), [USDC, XLM]),
     (err) => err.message === `${h.vault.ROUTER_ERRORS[507]} (router ${TESTNET.router} error 507) Transaction ${h.calls.hashes[0]} failed onchain; only the fee was charged.`);
   // Observed in a testnet simulation: a swap to tRESERVE without its trustline names tRESERVE, not USDC.
   assert.equal(vault.vaultError(new Error(`HostError: Error(Contract, #13)\n 5: [Failed Diagnostic Event (not emitted)] contract:${RESERVE}, topics:[error, Error(Contract, #13)], data:["trustline entry is missing for account", ${OWNER}]`)), "Add the tRESERVE trustline before this swap.");
 });
 
 test("an unknown outcome after signing carries the signed hash and time bound", async () => {
-  const h = harness({ polls: [() => new Error("Request failed with status code 503")] });
+  const h = harness({ api: swapApi(10n, 20n), polls: [() => new Error("Request failed with status code 503")] });
   const signed = [];
-  await assert.rejects(h.vault.swapExactIn(OWNER, BigInt(10), BigInt(9), [USDC, XLM], (s) => signed.push(s)), (err) => {
+  await assert.rejects(h.vault.swapExactIn(OWNER, BigInt(10), [USDC, XLM], (s) => signed.push(s)), (err) => {
     assert.deepEqual(err.unknown, signed[0]);
     assert.equal(err.unknown.hash, h.calls.hashes[0]);
     return /Its outcome is unknown/.test(err.message);
@@ -316,6 +412,9 @@ test("an unknown outcome after signing carries the signed hash and time bound", 
   const t = harness({ horizon: { loadAccount: async (a) => new sdk.Account(a, "1"), submitTransaction: async () => { throw Object.assign(new Error("Server responded: 504"), { response: { status: 504, data: {} } }); } } });
   const trust = [];
   await assert.rejects(t.vault.addUsdcTrustline(OWNER, "tRESERVE", (s) => trust.push(s)), (err) => err.unknown?.hash === trust[0].hash);
+  // A swap signed past its 180-second bound is reported with that window.
+  const late = harness({ api: swapApi(10n, 20n), sends: [{ status: "ERROR", errorResult: { result: { type: "txTooLate" } } }] });
+  await assert.rejects(late.vault.swapExactIn(OWNER, BigInt(10), [USDC, XLM]), /signature took longer than the transaction's 180-second window/);
 });
 
 test("addUsdcTrustline adds a changeTrust for the asked manifest asset", async () => {
@@ -344,18 +443,37 @@ test("checkTransaction confirms SUCCESS and FAILED, and treats NOT_FOUND as expi
   assert.deepEqual(await h.vault.checkTransaction(signed, "Swap", returns), { status: "OUTSIDE_HISTORY" });
 });
 
-test("a re-simulated retry rebuilds the arguments with a fresh deadline and keeps the signed-off minimum", async () => {
-  const h = harness({ polls: [{ status: "FAILED", resultXdr: resourceFailure }, { status: "SUCCESS", ledger: 9, returnValue: amounts(10, 20) }] });
+
+test("a resource failure quotes and builds the swap again once, and signs the new build", async () => {
+  const first = swapApi(10n, 20n), second = swapApi(10n, 21n);
+  const h = harness({ api: [...first, ...second], polls: [{ status: "FAILED", resultXdr: resourceFailure }, { status: "SUCCESS", ledger: 9, returnValue: amounts(10, 21) }] });
+  const receipt = await h.vault.swapExactIn(OWNER, BigInt(10), [USDC, XLM]);
+  assert.deepEqual(h.calls.api.map(c => c.url), ["/api/soroswap/quote", "/api/soroswap/build", "/api/soroswap/quote", "/api/soroswap/build"]);
+  assert.deepEqual(h.calls.signedXdr, [first[1].body.xdr, second[1].body.xdr]);
+  assert.equal(receipt.hash, h.calls.hashes[1]);
+  const g = harness({ api: [...swapApi(10n, 20n), ...swapApi(10n, 20n)], polls: [{ status: "FAILED", resultXdr: resourceFailure }, { status: "FAILED", resultXdr: resourceFailure }] });
+  await assert.rejects(g.vault.swapExactIn(OWNER, BigInt(10), [USDC, XLM]), (err) => err.message === `Transaction ${g.calls.hashes[1]} failed onchain (txFailed).`);
+  assert.equal(g.calls.signed, 2);
+  // An insufficient refundable fee (the API's resourceFee below a fresh simulation's) is rebuilt the same way.
+  const f = harness({ api: [...swapApi(10n, 20n), ...swapApi(10n, 21n)], polls: [{ status: "FAILED", resultXdr: refundableFeeFailure }, { status: "SUCCESS", ledger: 9, returnValue: amounts(10, 21) }] });
+  assert.equal((await f.vault.swapExactIn(OWNER, BigInt(10), [USDC, XLM])).hash, f.calls.hashes[1]);
+  assert.deepEqual([f.calls.signed, f.calls.api.length], [2, 4]);
+  assert.equal(f.vault.needsResimulation(refundableFeeFailure), true);
+  assert.equal(f.vault.needsResimulation(trapped), false);
+});
+
+test("a re-simulated vault call rebuilds the arguments with a fresh deadline and keeps the signed-off minimum", async () => {
+  const h = harness({ views: { preview_deposit: () => 1000000 }, polls: [{ status: "FAILED", resultXdr: resourceFailure }, { status: "SUCCESS", ledger: 9, returnValue: i128(1) }] });
   const now = Date.now;
   let clock = now();
   Date.now = () => (clock += 60000);
   try {
-    await h.vault.swapExactIn(OWNER, BigInt(10), BigInt(19), [USDC, XLM]);
+    await h.vault.deposit(OWNER, "10");
   } finally {
     Date.now = now;
   }
-  const swaps = h.calls.contract.filter(c => c.fn === "swap_exact_tokens_for_tokens");
-  assert.equal(swaps.length, 2);
-  assert.ok(swaps[1].args[4] > swaps[0].args[4]);
-  assert.deepEqual(swaps.map(c => c.args[1]), [BigInt(19), BigInt(19)]);
+  const deposits = h.flows();
+  assert.equal(deposits.length, 2);
+  assert.ok(deposits[1].args[5] > deposits[0].args[5]);
+  assert.deepEqual(deposits.map(c => c.args[4]), [BigInt(995000), BigInt(995000)]);
 });

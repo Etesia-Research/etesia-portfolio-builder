@@ -58,7 +58,7 @@ export async function executionQuotes(allocation: Allocation, funding: { symbol:
 
 // ---------- Testnet execution plan ----------
 // On a vault network (testnet mode) every leg of an allocation is a real
-// transaction: a USDC swap on the manifest's Soroswap router per market asset,
+// transaction: a USDC swap per market asset (quoted and built by the Soroswap API),
 // the vault's deposit_bounded, and the USDC kept in the wallet.
 
 const baseId = (id: string) => id.replace(/_(?:buffer|reserve)$/, "");
@@ -76,7 +76,7 @@ export type Leg = {
   symbol: string; // asset received (trustline: asset trusted; vault: the vault product)
   ids: string[]; // allocation positions served by the leg
   amountIn: bigint; // input units (XLM for funding, USDC otherwise; 0 for a trustline)
-  path: string[]; // router path for funding and swaps
+  path: string[]; // funding and swaps: [asset in, asset out], quoted through the Soroswap API
   minOut: bigint; // funding only: the USDC the plan was budgeted from
 };
 
