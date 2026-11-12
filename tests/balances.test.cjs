@@ -24,6 +24,7 @@ function loadTs(file, imports) {
 const network = loadTs("lib/network.ts", { "@/data/testnet-manifest.json": require(path.join(root, "data/testnet-manifest.json")) });
 const vaults = loadTs("lib/vaults.ts", { "@/lib/network": network });
 const execution = loadTs("lib/execution.ts", { "@/lib/network": network, "@/lib/vaults": vaults, "@/lib/assets": loadTs("lib/assets.ts", {}), "@/lib/quant": {} });
+const vaultLib = loadTs("lib/vault.ts", { "@/lib/network": network, "@/lib/quant": {}, "@/components/stellar/walletKit": { signTx: async () => { throw new Error("not used"); } } });
 const NetworkSwitch = () => null;
 const TestnetExecution = () => null;
 // A mainnet deployment of the same manifest shape, as config would add it later.
@@ -42,7 +43,7 @@ const ExecutionSimulation = (() => {
 })();
 const { renderToStaticMarkup } = require("react-dom/server");
 
-function harness(initialState = [], registry = vaults) {
+function harness(initialState = [], registry = vaults, testnet = {}) {
   const wallet = { address: "A", connected: true };
   const balances = { address: "A", byTk: { USDC: 1.2356789 }, lastUpdated: 1, error: null };
   balances.set = (fn) => fn(balances);
@@ -74,7 +75,8 @@ function harness(initialState = [], registry = vaults) {
     "@/components/stellar/walletKit": { initWalletKit() {} },
     "@/lib/network": network,
     "@/lib/execution": execution,
-    "@/components/TestnetExecution": TestnetExecution,
+    "@/components/TestnetExecution": { __esModule: true, default: TestnetExecution, valueSources: testnet.valueSources },
+    "@/lib/vault": { ...vaultLib, vaultClient: testnet.vaultClient ?? vaultLib.vaultClient },
     "@/lib/vaults": registry,
     "@/components/NetworkSwitch": { __esModule: true, default: NetworkSwitch },
     "@/lib/prices": {
@@ -99,7 +101,7 @@ function harness(initialState = [], registry = vaults) {
   const render = () => { effects.length = 0; state.length = 0; return mod.exports.default(); };
   const poll = () => { render(); return effects.at(-1)(); };
   const panel = (overrides = {}) => mod.exports.FundingPanel({
-    coins: [{ tk: "USDC", name: "USD Coin" }], allocationCoins: [{ tk: "XLM" }], reserveValid: true, budget: "20", selectedHolding: "USDC", amount: "1", ...overrides,
+    coins: [{ tk: "USDC", name: "USD Coin" }], allocationCoins: [{ tk: "XLM" }], reserveValid: true, budget: "20", sources: { USDC: "100" }, setSources() {}, ...overrides,
   });
   return { ...mod.exports, wallet, balances, requests, quantRequests, prices, buildRef, effects, intervals, state, render, poll, panel };
 }
@@ -114,7 +116,7 @@ const buildButton = (tree) => nodes(tree).find((node) => node.type === "button" 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 test("account switch hides old holdings before the effect and clears allocation state", async () => {
-  const h = harness([["XLM", "USDC"], "USDC", "1", "allocated", null, []]);
+  const h = harness([["XLM", "USDC"], { USDC: "100" }, null, "allocated", null, []]);
   h.wallet.address = "B";
   assert.equal(buildButton(h.panel()).props.disabled, true);
   assert.ok(!text(h.panel()).includes("1.2357"));
@@ -125,7 +127,7 @@ test("account switch hides old holdings before the effect and clears allocation 
   assert.deepEqual(h.balances.byTk, {});
   assert.equal(h.balances.lastUpdated, null);
   assert.equal(h.balances.address, "B");
-  assert.deepEqual(h.state.slice(1, 5), [null, "", "select", null]);
+  assert.deepEqual(h.state.slice(1, 5), [{}, null, "select", null]);
   h.requests[0].reject(new Error("Horizon 503"));
   await flush();
   assert.deepEqual(h.balances.byTk, {});
@@ -156,23 +158,150 @@ test("disconnect clears balances and returns to the connection screen", () => {
   assert.equal(h.requests.length, 0);
 });
 
-test("quick amounts preserve MAX and round fractions down to seven decimals", () => {
+test("multi-source holdings: selecting a holding sets it to 100% (MAX); each source's percent adjusts, rounds down, and an invalid one blocks the build", () => {
   const h = harness();
-  for (const balance of [1.2356789, 0.0000001, 0.0000019, 999.9999999]) {
-    h.balances.byTk.USDC = balance;
-    let amount;
-    const buttons = nodes(h.panel({ setAmount: (value) => { amount = value; } }))
-      .filter((node) => node.type === "button" && node.props.className === "qa");
-    buttons.forEach((button, index) => {
-      button.props.onClick();
-      assert.match(amount, /^\d+\.\d{7}$/);
-      assert.ok(Number(amount) <= balance * ((index + 1) / 4));
-      if (index === 3) {
-        assert.equal(Number(amount), balance);
-        assert.equal(buildButton(h.panel({ amount })).props.disabled, false);
-      }
-    });
+  h.balances.byTk = { USDC: 1.2356789, XLM: 10 };
+  h.prices.bySymbol.XLM = { price: .2, ts: "2026-09-19T00:00:00Z", stale: false };
+  const coins = [{ tk: "USDC", name: "USD Coin" }, { tk: "XLM", name: "Stellar Lumens" }];
+  let sources = {};
+  const setSources = (next) => { sources = typeof next === "function" ? next(sources) : next; };
+  const tree = () => h.panel({ coins, sources, setSources });
+  const rows = (t) => nodes(t).filter((node) => node.props?.className?.startsWith("holding-row"));
+  const quick = (t, symbol) => nodes(nodes(t).find((node) => node.props?.["data-source"] === symbol)).filter((node) => node.type === "button");
+  assert.match(text(tree()), /Your holdings — select the sources to allocate or rebalance/);
+  assert.deepEqual(rows(tree()).map((row) => row.props["aria-checked"]), [false, false]);
+  assert.equal(buildButton(tree()).props.disabled, true);
+  rows(tree())[0].props.onClick();
+  rows(tree())[1].props.onClick();
+  assert.deepEqual(sources, { USDC: "100", XLM: "100" });
+  assert.match(text(tree()), /1\.2356789 USDC ≈ \$1\.24 · daily close/);
+  assert.match(text(tree()), /10 XLM ≈ \$2\.00 · daily close/);
+  assert.match(text(tree()), /Hypothetical capital: 3\.24 USDC/);
+  assert.equal(buildButton(tree()).props.disabled, false);
+  quick(tree(), "USDC")[0].props.onClick();
+  assert.equal(sources.USDC, "25");
+  assert.match(text(tree()), /0\.3089197 USDC/); // 25% of 1.2356789, rounded down to the stroop
+  quick(tree(), "USDC")[3].props.onClick();
+  assert.equal(sources.USDC, "100");
+  const input = nodes(tree()).find((node) => node.type === "input" && node.props["aria-label"] === "Percent of XLM");
+  for (const bad of ["0", "0.5", "100.5", "12.345", "", "."]) {
+    input.props.onChange({ target: { value: bad } });
+    assert.match(text(tree()), /Enter a percentage from 1 to 100, with at most two decimals\./, bad);
+    assert.equal(buildButton(tree()).props.disabled, true, bad);
   }
+  input.props.onChange({ target: { value: "12.5" } });
+  assert.match(text(tree()), /1\.25 XLM/);
+  assert.equal(buildButton(tree()).props.disabled, false);
+  rows(tree())[1].props.onClick();
+  assert.deepEqual(sources, { USDC: "100" });
+});
+
+// The connected owner's testnet account and vault position, as the Builder reads them.
+const TESTNET_ACCOUNT = { owner: "A", account: { funded: true, trustline: true, balance: "50.0000000", xlm: "100.0000000", subentries: 1, lines: { USDC: "50.0000000" } },
+  position: { shares: 81330000000000n, value: 818500000n, maxWithdraw: 818500000n, liquid: 0n, paused: false } };
+const TESTNET_COINS = [{ id: "xlm", tk: "XLM", name: "Stellar Lumens", allocationSupported: true }, { id: "usdc", tk: "USDC", name: "USD Coin" },
+  { id: "ustry", tk: "USTRY", name: "USTRY" }, { id: "etesia-tf", tk: "ETESIA-TF", name: "Etesia TF Vault", allocationSupported: true }];
+const testnetPage = (sources = {}, testnet = {}, account = TESTNET_ACCOUNT) => {
+  const state = [];
+  state[0] = ["XLM"]; state[1] = sources; state[2] = account; state[3] = "select"; state[5] = TESTNET_COINS; state[16] = "testnet";
+  const h = harness(state, vaults, testnet);
+  h.balances.byTk = { XLM: 100, USDC: 50, tRESERVE: 3 };
+  const props = nodes(h.render()).find((node) => node.type === h.FundingPanel).props;
+  return { h, props, tree: h.FundingPanel(props) };
+};
+
+test("testnet holdings: XLM less the most a run keeps back, USDC, tRESERVE as the USTRY stand-in and the vault's shares with their USDC value", () => {
+  const { tree } = testnetPage({ XLM: "100", "ETESIA-TF": "50" });
+  const rows = nodes(tree).filter((node) => node.props?.className?.startsWith("holding-row")).map(text);
+  assert.equal(rows.length, 4);
+  assert.match(rows[0], /^XLMStellar Lumens · MAX keeps 6\.0000000 XLM back for fees and the account reserve100/);
+  assert.match(rows[1], /^USDCUSD Coin50/);
+  assert.match(rows[2], /^tRESERVEUSTRY stand-in on testnet3/);
+  assert.match(rows[3], /^ETESIA-TFVault shares · 81\.85 USDC81\.33\$81\.85$/);
+  // 100% of XLM is the balance less the keep-back; 50% of the shares.
+  assert.match(text(tree), /94 XLM/);
+  assert.match(text(tree), /40\.665 shares/);
+  assert.match(text(tree), /Valued at testnet Soroswap quotes and the vault's share value when built/);
+  assert.ok(!/Hypothetical capital|daily close/.test(text(tree)));
+  assert.equal(buildButton(tree).props.disabled, false);
+  // Before the testnet account is read, the XLM maximum is 0 and the vault row is absent.
+  const { tree: tree2 } = testnetPage({ XLM: "100" }, {}, null);
+  assert.ok(!text(tree2).includes("ETESIA-TF"));
+  assert.match(text(tree2), /reading the testnet account…/);
+  assert.match(text(tree2), /Nothing to allocate: no XLM is selectable at this percentage\./);
+  assert.equal(buildButton(tree2).props.disabled, true);
+});
+
+test("a testnet build values the selected sources at testnet execution prices, sends their sum as the capital and stores sources and valuation; a failed quote blocks it", async () => {
+  const valued = [];
+  const valuation = { XLM: { quantity: 940000000n, value: 150000000n, minOut: 149250000n }, "ETESIA-TF": { quantity: 40665000000000n, value: 409250000n, minOut: 407000000n, maxWithdraw: 818500000n } };
+  const { h, props } = testnetPage({ XLM: "100", "ETESIA-TF": "50" }, { vaultClient: () => "client", valueSources: async (...args) => { valued.push(args); return valuation; } });
+  const pending = props.onBuild();
+  await flush();
+  assert.deepEqual(valued, [["client", [{ symbol: "XLM", percent: 100, quantity: 940000000n }, { symbol: "ETESIA-TF", percent: 50, quantity: 40665000000000n }], TESTNET_ACCOUNT.position]]);
+  assert.equal(h.quantRequests[0].body.portfolio_value_usdc, 55.925);
+  h.quantRequests[0].resolve({ status: "valid", positions: { xlm: {} } });
+  await pending;
+  assert.deepEqual([h.state[4].sources, h.state[4].valuation, h.state[4].owner, "funding" in h.state[4]], [valued[0][1], valuation, "A", false]);
+  const failed = testnetPage({ XLM: "100" }, { vaultClient: () => "client", valueSources: async () => { throw new Error("No Soroswap testnet quote for XLM → USDC: Soroswap API 503"); } });
+  await failed.props.onBuild();
+  assert.equal(failed.h.state[12], "No Soroswap testnet quote for XLM → USDC: Soroswap API 503");
+  assert.equal(failed.h.quantRequests.length, 0);
+});
+
+test("after a finished testnet run the holdings and the vault position are read again for the same owner", async () => {
+  const reads = [];
+  const client = { readUsdcLine: async (owner) => { reads.push(owner); return TESTNET_ACCOUNT.account; }, readPosition: async () => ({ ...TESTNET_ACCOUNT.position, shares: 1n }), vaultError: (err) => err.message };
+  const state = [];
+  state[2] = null; state[3] = "executed"; state[5] = TESTNET_COINS; state[16] = "testnet";
+  const page = harness(state, vaults, { vaultClient: () => client });
+  page.render();
+  const effect = page.effects.find((fn) => fn.toString().includes("phase !== 'executed'"));
+  effect();
+  page.requests[0].resolve({ XLM: 50 });
+  await flush(); await flush();
+  assert.deepEqual(page.balances.byTk, { XLM: 50 });
+  assert.deepEqual([reads, page.state[2].owner, page.state[2].position.shares], [["A"], "A", 1n]);
+  // A cancelled refresh (account or network changed) writes nothing.
+  const late = harness(state, vaults, { vaultClient: () => client });
+  late.render();
+  late.effects.find((fn) => fn.toString().includes("phase !== 'executed'"))()();
+  late.requests[0].resolve({ XLM: 1 });
+  await flush();
+  assert.deepEqual(late.balances.byTk, { USDC: 1.2356789 });
+  assert.equal(late.state[2], null);
+});
+
+test("a failed vault read keeps the testnet account and blocks only builds that involve the vault; a failed account read says so on the XLM row", async () => {
+  const client = { readUsdcLine: async () => TESTNET_ACCOUNT.account, readPosition: async () => { throw new Error("RPC 503"); }, vaultError: (err) => err.message };
+  const state = [];
+  state[2] = null; state[3] = "executed"; state[5] = TESTNET_COINS; state[16] = "testnet";
+  const page = harness(state, vaults, { vaultClient: () => client });
+  page.render();
+  page.effects.find((fn) => fn.toString().includes("phase !== 'executed'"))();
+  page.requests[0].resolve({ XLM: 100 });
+  await flush(); await flush();
+  const read = page.state[2];
+  assert.deepEqual([read.owner, read.account, read.position, read.accountError, read.positionError], ["A", TESTNET_ACCOUNT.account, undefined, null, "RPC 503"]);
+  // USDC for an XLM basket never needs the vault: Build stays enabled and builds.
+  const usdc = testnetPage({ USDC: "100" }, { vaultClient: () => "client", valueSources: async () => ({ USDC: { quantity: 500000000n, value: 500000000n, minOut: 500000000n } }) }, read);
+  assert.match(text(usdc.tree), /Could not read the vault position \(RPC 503\)\./);
+  assert.match(text(usdc.tree), /MAX keeps 6\.0000000 XLM back/);
+  assert.equal(buildButton(usdc.tree).props.disabled, false);
+  const pending = usdc.props.onBuild();
+  await flush();
+  assert.equal(usdc.h.quantRequests.length, 1);
+  usdc.h.quantRequests[0].resolve({ status: "valid", positions: { xlm: {} } });
+  await pending;
+  // The vault in the basket, or its shares selected, needs the position.
+  const basket = testnetPage({ USDC: "100" }, {}, read);
+  assert.equal(buildButton(basket.h.FundingPanel({ ...basket.props, allocationCoins: [{ tk: "XLM" }, { tk: "ETESIA-TF" }] })).props.disabled, true);
+  assert.equal(buildButton(testnetPage({ USDC: "100", "ETESIA-TF": "100" }, {}, read).tree).props.disabled, true);
+  // A failed account read: the XLM row says so instead of "reading".
+  const { tree } = testnetPage({ XLM: "100" }, {}, { owner: "A", account: undefined, position: TESTNET_ACCOUNT.position, accountError: "Horizon 503", positionError: null });
+  assert.match(text(tree), /Could not read the testnet account \(Horizon 503\)\./);
+  assert.match(text(tree), /Stellar Lumens · could not read the testnet account/);
+  assert.ok(!/reading the testnet account…/.test(text(tree)));
 });
 
 test("refresh errors remain visible with holdings and recovery enables construction", async () => {
@@ -243,8 +372,8 @@ test("reserve products are absent from the initial product selection", () => {
 test("allocation requests carry selected products and reserves, and cancelled responses are ignored", async () => {
   const state = [];
   state[0] = ["XLM", "ETESIA-TF"];
-  state[1] = "USDC";
-  state[2] = "1";
+  state[1] = { USDC: "100" };
+  state[2] = null;
   state[3] = "select";
   state[5] = [{ id: "xlm", tk: "XLM", allocationSupported: true }, { id: "usdc", tk: "USDC" },
     { id: "ustry", tk: "USTRY" }, { id: "etesia-tf", tk: "ETESIA-TF", simulated: true, allocationSupported: true }];
@@ -254,7 +383,7 @@ test("allocation requests carry selected products and reserves, and cancelled re
   const panel = nodes(h.render()).find(node => node.type === h.FundingPanel);
   assert.equal(buildButton(h.FundingPanel(panel.props)).props.disabled, false);
   const pending = panel.props.onBuild();
-  assert.deepEqual(h.quantRequests[0].body, { assets: ["xlm", "etesia-tf"], portfolio_value_usdc: 1, annual_volatility_budget: .25, cash_reserves: ["usdc", "ustry"] });
+  assert.deepEqual(h.quantRequests[0].body, { assets: ["xlm", "etesia-tf"], portfolio_value_usdc: 1.2356789, annual_volatility_budget: .25, cash_reserves: ["usdc", "ustry"] });
   h.buildRef.current.abort();
   h.quantRequests[0].resolve({ status: "valid", positions: { xlm: {} } });
   await pending;
@@ -494,9 +623,8 @@ test("testnet holdings come from testnet Horizon by manifest issuer; mainnet beh
   const testnet = holdingsModule(balances);
   const t = await testnet.fetchHoldings("GABC", network.TESTNET);
   assert.deepEqual(testnet.urls, ["https://horizon-testnet.stellar.org/accounts/GABC"]);
-  // Testnet USDC by the manifest issuer; mainnet identities and tRESERVE (outside the universe) are ignored.
-  assert.deepEqual([t.XLM, t.USDC, t.AQUA, t.USTRY], [9999.9865156, 99.9987113, 0, 0]);
-  assert.equal("tRESERVE" in t, false);
+  // Testnet USDC and tRESERVE (the USTRY stand-in) by the manifest issuer; mainnet identities are ignored.
+  assert.deepEqual([t.XLM, t.USDC, t.tRESERVE, t.AQUA, t.USTRY], [9999.9865156, 99.9987113, 3, 0, 0]);
   const mainnet = holdingsModule(balances);
   const m = await mainnet.fetchHoldings("GABC");
   assert.deepEqual(mainnet.urls, ["https://horizon.stellar.org/accounts/GABC"]);
@@ -509,7 +637,7 @@ test("the Builder reads balances on the active mode's network", () => {
     state[16] = mode;
     const h = harness(state);
     h.render();
-    h.effects.find(fn => fn.toString().includes("fetchHoldings"))();
+    h.effects.find(fn => fn.toString().includes("setTestnet(null)"))();
     assert.equal(h.requests.length, 1);
     assert.equal(h.requests[0].net, net);
   }

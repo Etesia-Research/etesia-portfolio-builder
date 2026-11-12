@@ -8,11 +8,12 @@ import usePriceStore from "@/stores/usePriceStore";
 import { fundingValue, referenceValue } from "@/lib/prices";
 import { fetchUniverse, quantRequest } from "@/lib/quant";
 import ExecutionSimulation from "@/components/ExecutionSimulation";
-import TestnetExecution from "@/components/TestnetExecution";
+import TestnetExecution, { valueSources } from "@/components/TestnetExecution";
 import AllocationSimulation from "@/components/AllocationSimulation";
 import useBalanceStore from "@/stores/useBalanceStore";
 import { fetchHoldings } from "@/lib/balances";
-import { testnetSelectable } from "@/lib/execution";
+import { testnetSelectable, tokenUnits, xlmSourceKeep } from "@/lib/execution";
+import { SHARE_DECIMALS, fromUnits, vaultClient } from "@/lib/vault";
 import { MAINNET, TESTNET } from "@/lib/network";
 import { VAULTS, builderHref, builderNetwork, vaultHref } from "@/lib/vaults";
 import NetworkSwitch from "@/components/NetworkSwitch";
@@ -283,84 +284,117 @@ function CashReservePanel({ selected, onChange, supported, coins, network = 'mai
   </section>;
 }
 
-function FundingPanel({ coins, allocationCoins, selectedHolding, setSelectedHolding, amount, setAmount, onBuild, building, error, budget, setBudget, reserveSelector, reserveValid }) {
-  const COIN_BY_TK = Object.fromEntries(coins.map(c => [c.tk, c]));
+// The wallet's holdings that can source an allocation or a rebalance, each
+// with its selectable maximum in units. Testnet: XLM (less the most a run
+// keeps back), USDC, tRESERVE (the USTRY stand-in) and the vault's shares;
+// mainnet: the universe holdings. testnet is the account and vault position
+// read for the connected owner.
+function holdingRows(network, coins, balByTk, testnet) {
+  const coin = (tk) => coins.find(c => c.tk === tk);
+  const units = (tk) => BigInt(Math.round((balByTk[tk] ?? 0) * 1e7));
+  if (network !== 'testnet') return coins.filter(c => (balByTk[c.tk] ?? 0) > 0).map(c => ({ symbol: c.tk, coin: c, name: c.name, held: units(c.tk), max: units(c.tk), decimals: 7 }));
+  const keep = testnet?.account ? xlmSourceKeep(testnet.account, TESTNET) : null;
+  const xlm = units('XLM'), position = testnet?.position;
+  const keepNote = keep != null ? `MAX keeps ${tokenUnits(keep)} XLM back for fees and the account reserve` : testnet?.accountError ? 'could not read the testnet account' : 'reading the testnet account…';
+  return [
+    { symbol: 'XLM', coin: coin('XLM'), name: `${coin('XLM')?.name ?? 'Stellar Lumens'} · ${keepNote}`,
+      held: xlm, max: keep != null && xlm > keep ? xlm - keep : BigInt(0), decimals: 7 },
+    { symbol: 'USDC', coin: coin('USDC'), name: coin('USDC')?.name ?? 'USD Coin', held: units('USDC'), max: units('USDC'), decimals: 7 },
+    { symbol: 'tRESERVE', coin: coin('USTRY'), name: 'USTRY stand-in on testnet', held: units('tRESERVE'), max: units('tRESERVE'), decimals: 7 },
+    position && { symbol: 'ETESIA-TF', coin: coin('ETESIA-TF'), name: `Vault shares · ${fromUnits(position.value, TESTNET.usdc.decimals)} USDC`, held: position.shares, max: position.shares, decimals: SHARE_DECIMALS, value: position.value },
+  ].filter(row => row && row.held > BigInt(0));
+}
+
+// A source's percent: 1 to 100, at most two decimals.
+const validPercent = (percent) => /^\d{1,3}(?:\.\d{1,2})?$/.test(percent) && Number(percent) >= 1 && Number(percent) <= 100;
+const sourcePart = (row, percent) => ({ symbol: row.symbol, percent: Number(percent), quantity: row.max * BigInt(Math.round(Number(percent) * 100)) / BigInt(10000) });
+// A testnet build needs the vault position only when the vault is a selected source or in the basket.
+const needsPosition = (sources, allocationCoins) => 'ETESIA-TF' in sources || allocationCoins.some(c => c.tk === 'ETESIA-TF');
+const amountOf = (quantity, decimals) => Number(fromUnits(quantity, decimals)).toLocaleString(undefined, { maximumFractionDigits: 4 });
+
+function FundingPanel({ coins, allocationCoins, network = 'mainnet', testnet, sources, setSources, onBuild, building, error, budget, setBudget, reserveSelector, reserveValid }) {
   const bySymbol = usePriceStore(s => s.bySymbol);
   // Real onchain holdings (Horizon) — never the static sample data.
   const address = useStellarWalletStore(s => s.address);
   const balByTk = useBalanceStore(s => s.address === address ? s.byTk : EMPTY_HOLDINGS);
   const balLoaded = useBalanceStore(s => s.address === address && s.lastUpdated != null);
   const balError = useBalanceStore(s => s.address === address ? s.error : null);
-  const holdingOf = (tk) => balByTk[tk] ?? 0;
-  const holdings = useMemo(() => coins.filter(c => holdingOf(c.tk) > 0), [coins, balByTk]);
-  const selCoin = selectedHolding ? COIN_BY_TK[selectedHolding] : null;
-  const usdAmount = selCoin ? referenceValue(bySymbol, selCoin.tk, Number(amount)) : null;
-  const usdcAmount = selCoin ? fundingValue(bySymbol, selCoin.tk, Number(amount)) : null;
-  const maxHolding = selCoin ? holdingOf(selCoin.tk) : 0;
-  const overMax = selCoin && Number(amount) > maxHolding;
+  const account = testnet?.owner === address ? testnet : null;
+  const rows = useMemo(() => holdingRows(network, coins, balByTk, account), [network, coins, balByTk, account]);
+  const selected = rows.filter(r => r.symbol in sources);
+  const parts = selected.map(r => validPercent(sources[r.symbol]) ? sourcePart(r, sources[r.symbol]) : null);
+  const partsValid = parts.length > 0 && parts.every(p => p && p.quantity > BigInt(0));
+  // Mainnet: the hypothetical capital is the daily-close value of every selected part.
+  const closeValues = network === 'testnet' ? [] : parts.map(p => p && fundingValue(bySymbol, p.symbol, Number(fromUnits(p.quantity, 7))));
+  const capital = closeValues.some(v => v == null) ? null : closeValues.reduce((sum, v) => sum + v, 0);
   const unsupported = allocationCoins.filter(c => c.allocationSupported === false);
-  const canBuild = !unsupported.length && balLoaded && !balError && selCoin && usdcAmount != null && Number(amount) > 0 && !overMax && allocationCoins.length > 0 && Number(budget) > 0 && Number.isFinite(Number(budget)) && !building && reserveValid;
+  const canBuild = !unsupported.length && balLoaded && !balError && partsValid && (network === 'testnet' ? !!account?.position || !needsPosition(sources, allocationCoins) : capital != null) && allocationCoins.length > 0 && Number(budget) > 0 && Number.isFinite(Number(budget)) && !building && reserveValid;
+  const setPercent = (symbol, percent) => setSources(current => ({ ...current, [symbol]: percent }));
+  const toggle = (symbol) => setSources(current => {
+    if (!(symbol in current)) return { ...current, [symbol]: '100' };
+    const { [symbol]: _, ...rest } = current;
+    return rest;
+  });
 
   return (
     <>
     <section className="funding-panel fade-in">
       <div className="col">
-        <h5>① Capital source — choose a reference holding</h5>
+        <h5>① Your holdings — select the sources to allocate or rebalance</h5>
         <div className="holding-list">
-          {(balError || holdings.length === 0) && (
+          {(balError || rows.length === 0) && (
             <div style={{ padding: 20, fontFamily: "'Instrument Serif', serif", fontStyle: 'italic', color: balError ? 'var(--bad)' : 'var(--ink-2)' }}>
               {balError ? `Could not read balances from Horizon (${balError}).${balLoaded ? " Displayed balances are stale; construction is paused until refresh succeeds." : ""}`
                 : balLoaded ? 'No qualifying balances detected in this wallet.'
                 : 'Reading balances from Horizon…'}
             </div>
           )}
-          {holdings.map(h => {
-            const isSel = selectedHolding === h.tk;
-            const held = holdingOf(h.tk);
+          {account?.accountError && <div className="data-note" role="alert" style={{ color: 'var(--bad)' }}>Could not read the testnet account ({account.accountError}).</div>}
+          {account?.positionError && <div className="data-note" role="alert" style={{ color: 'var(--bad)' }}>Could not read the vault position ({account.positionError}).</div>}
+          {rows.map(r => {
+            const isSel = r.symbol in sources;
             return (
-              <div key={h.tk} className={`holding-row ${isSel ? 'selected' : ''}`} onClick={() => setSelectedHolding(h.tk)}>
-                <ProductLogo coin={h} />
+              <div key={r.symbol} className={`holding-row ${isSel ? 'selected' : ''}`} role="checkbox" aria-checked={isSel} tabIndex={0} onClick={() => toggle(r.symbol)}
+                onKeyDown={e => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); toggle(r.symbol); } }}>
+                <ProductLogo coin={r.coin} />
                 <div>
-                  <div className="tk">{h.tk}</div>
-                  <div className="sub">{h.name}</div>
+                  <div className="tk">{r.symbol}</div>
+                  <div className="sub">{r.name}</div>
                 </div>
-                <div className="amt">{held.toLocaleString(undefined, {maximumFractionDigits: 4})}</div>
-                <div className="usd">{fmtUsd(referenceValue(bySymbol, h.tk, held))}</div>
+                <div className="amt">{amountOf(r.held, r.decimals)}</div>
+                <div className="usd">{r.value != null ? fmtUsd(Number(fromUnits(r.value, 7))) : fmtUsd(referenceValue(bySymbol, r.symbol, Number(fromUnits(r.held, 7))))}</div>
               </div>
             );
           })}
         </div>
       </div>
       <div className="col">
-        <h5>② Allocation amount</h5>
+        <h5>② Share of each source</h5>
         <div className="amount-block">
-          <div className="amount-input-wrap">
-            <span className="pre">AMT</span>
-            <input
-              type="text"
-              inputMode="decimal"
-              value={amount}
-              placeholder="0.00"
-              onChange={e => setAmount(e.target.value.replace(/[^0-9.]/g, ''))}
-              disabled={!selCoin}
-            />
-            <span className="unit">{selCoin?.tk || '—'}</span>
-          </div>
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-            <div className="quick-amounts">
-              {[0.25, 0.5, 0.75, 1.0].map(f => (
-                <button key={f} className="qa" disabled={!selCoin}
-                  // Round down in stroops so quick amounts never exceed the holding.
-                  onClick={() => selCoin && setAmount((Math.floor(Math.round(maxHolding * 1e7) * f) / 1e7).toFixed(7))}>
-                  {f === 1.0 ? 'MAX' : `${f*100}%`}
-                </button>
-              ))}
-            </div>
-            <div className="mono" style={{ fontSize: 12, color: overMax ? 'var(--bad)' : 'var(--ink-2)' }}>
-              ≈ {fmtUsd(usdAmount)} · daily close
-              {overMax && <span> · EXCEEDS BALANCE</span>}
-            </div>
-          </div>
+          {!selected.length && <div className="data-note">Select one or more holdings. Each starts at 100% (MAX) and can be adjusted.</div>}
+          {selected.map((r, index) => {
+            const part = parts[index];
+            const value = network === 'testnet' ? null : closeValues[index];
+            return <div key={r.symbol} className="amount-block" data-source={r.symbol}>
+              <div className="amount-input-wrap">
+                <span className="pre">{r.symbol}</span>
+                <input type="text" inputMode="decimal" aria-label={`Percent of ${r.symbol}`} value={sources[r.symbol]} onChange={e => setPercent(r.symbol, e.target.value.replace(/[^0-9.]/g, ''))} />
+                <span className="unit">%</span>
+              </div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <div className="quick-amounts">
+                  {['25', '50', '75', '100'].map(p => (
+                    <button key={p} className="qa" onClick={() => setPercent(r.symbol, p)}>{p === '100' ? 'MAX' : `${p}%`}</button>
+                  ))}
+                </div>
+                <div className="mono" style={{ fontSize: 12, color: part && part.quantity > BigInt(0) ? 'var(--ink-2)' : 'var(--bad)' }}>
+                  {!part ? 'Enter a percentage from 1 to 100, with at most two decimals.'
+                    : part.quantity <= BigInt(0) ? `Nothing to allocate: no ${r.symbol} is selectable at this percentage.`
+                    : `${fromUnits(part.quantity, r.decimals)} ${r.symbol === 'ETESIA-TF' ? 'shares' : r.symbol}${network === 'testnet' ? '' : ` ≈ ${fmtUsd(value)} · daily close`}`}
+                </div>
+              </div>
+            </div>;
+          })}
         </div>
       </div>
 
@@ -375,7 +409,8 @@ function FundingPanel({ coins, allocationCoins, selectedHolding, setSelectedHold
         <div className="note">
           <div>{allocationCoins.length ? `Allocation products: ${allocationCoins.map(c => c.tk).join(', ')}.` : 'Select a product with an available allocation model.'}</div>
           {unsupported.length > 0 && <div>Allocation API update required for {unsupported.map(c => c.tk).join(', ')}.</div>}
-          <div>{usdcAmount == null ? 'A fresh source close and matching USDC/USD close are required.' : `Hypothetical capital: ${usdcAmount.toLocaleString(undefined, { maximumFractionDigits: 2 })} USDC, including reserves and buffers.`}</div>
+          <div>{network === 'testnet' ? "Valued at testnet Soroswap quotes and the vault's share value when built, including reserves and buffers."
+            : capital == null ? 'A fresh source close and matching USDC/USD close are required.' : `Hypothetical capital: ${capital.toLocaleString(undefined, { maximumFractionDigits: 2 })} USDC, including reserves and buffers.`}</div>
           {error && <div role="alert" style={{ color: 'var(--bad)' }}>{error}</div>}
         </div>
         <button className="btn lg" disabled={!canBuild} onClick={onBuild}><span className="dot" />{building ? 'Calculating…' : 'Build risk-parity portfolio'}<span>→</span></button>
@@ -426,7 +461,7 @@ function AllocStage({ allocation, coins, onReset, network, onExecuted }) {
     <p className="data-note">{network === 'testnet' ? 'Model targets · units at the daily-close marks. The testnet execution below fills at Soroswap testnet pool prices and the testnet vault’s share price, so the units received differ.' : 'Simulated allocation · reference quantities, no funds moved.'} Product allocation and estimated volatility include every selected product, including the vault. The volatility estimate uses the current risk model’s one-year history and excludes reserves and buffers. The three-year historical metrics below include the entire portfolio.</p>
     <AllocationSimulation allocation={allocation} />
     {network === 'testnet' ? <TestnetExecution allocation={allocation} net={TESTNET} onFinished={onExecuted} /> : <>
-    <ExecutionSimulation allocation={allocation} funding={allocation.funding} usdcUsd={allocation.usdcUsd} vaultReason={simulatedShareReason(VAULTS.find(v => v.coin === 'etesia-tf'), network)} />
+    <ExecutionSimulation allocation={allocation} usdcUsd={allocation.usdcUsd} vaultReason={simulatedShareReason(VAULTS.find(v => v.coin === 'etesia-tf'), network)} />
     {VAULTS.filter(v => allocation.positions?.[v.coin]?.notional_usdc > 0).map(v => {
       const leg = allocation.positions[v.coin].notional_usdc;
       const deployment = v.networks[network];
@@ -445,8 +480,10 @@ function AllocStage({ allocation, coins, onReset, network, onExecuted }) {
 
 export default function PortfolioBuilder() {
   const [basket, setBasket] = useState([]);
-  const [holding, setHolding] = useState(null);
-  const [amount, setAmount] = useState('');
+  // Selected sources: holding symbol -> percent of it (text, as typed).
+  const [sources, setSources] = useState({});
+  // Testnet: the connected owner's account and vault position, or the error reading them.
+  const [testnet, setTestnet] = useState(null);
   const [phase, setPhase] = useState('connect');
   const [allocation, setAllocation] = useState(null);
   const [coins, setCoins] = useState([]);
@@ -570,24 +607,44 @@ export default function PortfolioBuilder() {
     setAllocation(null);
     setPhase(address ? 'select' : 'connect');
     return () => buildRequest.current?.abort();
-  }, [address, basketKey, holding, amount, budget, reserveKey, network]);
+  }, [address, basketKey, sources, budget, reserveKey, network]);
+
+  // The owner's holdings on the active network: Horizon balances and, on
+  // testnet, the account (for the XLM keep-back) and the vault position, read
+  // separately so a failed vault read leaves the account (and builds that do
+  // not involve the vault) usable. Nothing is written once cancelled.
+  const loadHoldings = async (owner, cancelled) => {
+    setBalances(s => { s.loading = true; });
+    try {
+      const byTk = await fetchHoldings(owner, network === 'testnet' ? TESTNET : undefined);
+      if (cancelled()) return;
+      setBalances(s => { s.byTk = byTk; s.loading = false; s.error = null; s.lastUpdated = Date.now(); });
+    } catch (error) {
+      if (!cancelled()) setBalances(s => { s.loading = false; s.error = error.message; });
+    }
+    if (network !== 'testnet') return;
+    const client = vaultClient(TESTNET);
+    const [account, position] = await Promise.allSettled([client.readUsdcLine(owner), client.readPosition(owner)]);
+    if (cancelled()) return;
+    const failure = (read) => read.status === 'rejected' ? client.vaultError(read.reason) : null;
+    setTestnet({ owner, account: account.value, position: position.value, accountError: failure(account), positionError: failure(position) });
+  };
+
+  // After a finished testnet run, read the holdings again.
+  useEffect(() => {
+    if (phase !== 'executed' || !address) return;
+    let cancelled = false;
+    loadHoldings(address, () => cancelled);
+    return () => { cancelled = true; };
+  }, [phase, address, network]);
 
   // Keep account ownership checks: a late result must never cross wallets.
   useEffect(() => {
     setBalances(s => { s.address = address; s.byTk = {}; s.loading = false; s.error = null; s.lastUpdated = null; });
-    setHolding(null); setAmount(''); setAllocation(null); setPhase(address ? 'select' : 'connect');
+    setSources({}); setTestnet(null); setAllocation(null); setPhase(address ? 'select' : 'connect');
     if (!address) return;
     let cancelled = false;
-    const load = async () => {
-      setBalances(s => { s.loading = true; });
-      try {
-        const byTk = await fetchHoldings(address, network === 'testnet' ? TESTNET : undefined);
-        if (cancelled) return;
-        setBalances(s => { s.byTk = byTk; s.loading = false; s.error = null; s.lastUpdated = Date.now(); });
-      } catch (error) {
-        if (!cancelled) setBalances(s => { s.loading = false; s.error = error.message; });
-      }
-    };
+    const load = () => loadHoldings(address, () => cancelled);
     load();
     const interval = setInterval(load, 30000);
     return () => { cancelled = true; clearInterval(interval); };
@@ -607,25 +664,34 @@ export default function PortfolioBuilder() {
     return (b.mcap ?? -1) - (a.mcap ?? -1);
   });
 
+  // Mainnet values each selected part at the daily close; testnet at testnet
+  // execution prices (valueSources), so its build waits for the quotes.
   const onBuild = async () => {
     if (allocationCoins.some(c => c.allocationSupported === false)) {
       setBuildError('The allocation API needs an update for this selection.');
       return;
     }
-    const capital = fundingValue(bySymbol, holding, Number(amount));
-    if (!reserveValid || !capital || !Number.isFinite(capital) || !allocationCoins.length || !balLoaded || balError || Number(amount) > (balByTk[holding] ?? 0)) return;
+    const onTestnet = network === 'testnet', account = testnet?.owner === address ? testnet : null;
+    const parts = holdingRows(network, coins, balByTk, account).filter(r => r.symbol in sources && validPercent(sources[r.symbol]))
+      .map(r => sourcePart(r, sources[r.symbol])).filter(p => p.quantity > BigInt(0));
+    const closeValues = onTestnet ? [] : parts.map(p => fundingValue(bySymbol, p.symbol, Number(fromUnits(p.quantity, 7))));
+    if (!reserveValid || !parts.length || closeValues.some(v => !v || !Number.isFinite(v)) || (onTestnet && !account?.position && needsPosition(sources, allocationCoins)) || !allocationCoins.length || !balLoaded || balError) return;
     buildRequest.current?.abort();
     const controller = new AbortController();
     buildRequest.current = controller;
     setBuilding(true); setBuildError(null); setAllocation(null); setPhase('select');
     try {
+      const valuation = onTestnet ? await valueSources(vaultClient(TESTNET), parts, account.position)
+        : Object.fromEntries(parts.map((p, i) => { const value = BigInt(Math.floor(closeValues[i] * 1e7)); return [p.symbol, { quantity: p.quantity, value, minOut: value }]; }));
+      if (controller.signal.aborted) return;
+      const capital = onTestnet ? Number(fromUnits(Object.values(valuation).reduce((sum, v) => sum + v.value, BigInt(0)), 7)) : closeValues.reduce((sum, v) => sum + v, 0);
       const result = await quantRequest('builder/targets', { assets: allocationCoins.map(c => c.id), portfolio_value_usdc: capital, annual_volatility_budget: Number(budget) / 100, ...(reserveKey === 'ustry' ? {} : { cash_reserves: cashReserves }) }, controller.signal);
       if (controller.signal.aborted) return;
       if (result.status !== 'valid' || !result.positions) {
         setBuildError(`Allocation blocked: ${result.diagnostics?.join(' · ') || 'Required inputs are unavailable'}`);
         return;
       }
-      setAllocation({ ...result, owner: address, funding: { symbol: holding, amount }, usdcUsd: bySymbol.USDC.price }); setPhase('allocated');
+      setAllocation({ ...result, owner: address, sources: parts, valuation, usdcUsd: bySymbol.USDC.price }); setPhase('allocated');
     } catch (error) {
       if (!controller.signal.aborted) setBuildError(error.message);
     } finally {
@@ -638,7 +704,7 @@ export default function PortfolioBuilder() {
       ? 'Testnet mode · market data from mainnet daily closes · balances, quotes and execution on Stellar testnet, test funds only'
       : 'Beta · Quant market data and allocation · Vault returns and execution are simulated'}</div>
     {network === 'testnet' && networkError && <p role="alert" className="data-banner" style={{ color: 'var(--bad)' }}>{networkError} Switch networks in the wallet, then return to this tab to re-check.</p>}
-    <Masthead network={network} onNetwork={selectNetwork} wallet={wallet} onDisconnect={() => { buildRequest.current?.abort(); disconnectWallet(); setBasket([]); setHolding(null); setAmount(''); setAllocation(null); setPhase('connect'); }} />
+    <Masthead network={network} onNetwork={selectNetwork} wallet={wallet} onDisconnect={() => { buildRequest.current?.abort(); disconnectWallet(); setBasket([]); setSources({}); setAllocation(null); setPhase('connect'); }} />
     <Ticker coins={products} network={network} />
     {phase === 'connect' && <ConnectScreen network={network} onConnect={kind => connectWallet(kind).catch(() => {})} connecting={connecting} error={connectError} />}
     <div className={phase === 'allocated' ? 'locked' : ''}>
@@ -646,8 +712,8 @@ export default function PortfolioBuilder() {
       <div className="data-toolbar"><span role="status">{loading ? 'Loading quant market data…' : catalogError ? `Market data unavailable: ${catalogError}` : `${products.length} products from the quant universe · daily reference data`}</span><button className="btn ghost" disabled={loading} onClick={() => setRefresh(v => v + 1)}>Refresh data</button></div>
       <div className="two-col"><div className="coin-grid">{sortedCoins.map(c => <CoinCard key={c.tk} coin={c} network={network} selected={basket.includes(c.tk)} correlation={candidateCorr[c.tk]} correlationLoading={correlationLoading} hasBasket={basket.length > 0} onToggle={() => selectableOn(network, c.id) && setBasket(current => current.includes(c.tk) ? current.filter(t => t !== c.tk) : [...current, c.tk])} maxMcap={maxMcap} />)}</div><Sidecar basket={basket} coins={coins} network={network} analytics={basketAnalytics.key === basketKey ? basketAnalytics.value : null} analyticsLoading={basket.length > 0 && basketAnalytics.key !== basketKey} removeFromBasket={tk => setBasket(current => current.filter(t => t !== tk))} /></div>
       {wallet && <>
-        <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">03</span><h2>Funding — capital source &amp; amount</h2><span className="meta">{network === 'testnet' ? 'Testnet USDC or XLM · executed below' : 'Hypothetical allocation'}</span></div>
-        <FundingPanel coins={coins} allocationCoins={allocationCoins} selectedHolding={holding} setSelectedHolding={setHolding} amount={amount} setAmount={setAmount} onBuild={onBuild} building={building} error={buildError} budget={budget} setBudget={setBudget} reserveValid={reserveValid} reserveSelector={<CashReservePanel network={network} selected={cashReserves} onChange={setCashReserves} supported={supportedReserves} coins={coins} />} />
+        <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">03</span><h2>Funding — your holdings as sources</h2><span className="meta">{network === 'testnet' ? 'Testnet holdings · rebalanced below' : 'Hypothetical allocation'}</span></div>
+        <FundingPanel coins={coins} allocationCoins={allocationCoins} network={network} testnet={testnet} sources={sources} setSources={setSources} onBuild={onBuild} building={building} error={buildError} budget={budget} setBudget={setBudget} reserveValid={reserveValid} reserveSelector={<CashReservePanel network={network} selected={cashReserves} onChange={setCashReserves} supported={supportedReserves} coins={coins} />} />
       </>}
     </div>
     {(phase === 'allocated' || phase === 'executed') && allocation?.owner === address && <><div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">05</span><h2>Allocation — model targets</h2><span className="meta">{network === 'testnet' ? 'Executed on Stellar testnet · wallet-signed' : 'Simulation only'}</span></div><AllocStage allocation={allocation} coins={coins} network={network} onReset={() => { setAllocation(null); setPhase('select'); }} onExecuted={() => setPhase(current => current === 'allocated' ? 'executed' : current)} /></>}

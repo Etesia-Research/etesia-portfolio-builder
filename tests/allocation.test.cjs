@@ -50,13 +50,13 @@ function builder(state = [], calls = { init: [] }) {
     "next/dynamic": () => () => null,
     "@/components/AllocationSimulation": () => null,
     "@/components/ExecutionSimulation": { __esModule: true, default: ExecutionSimulation },
-    "@/components/TestnetExecution": { __esModule: true, default: TestnetExecution },
+    "@/components/TestnetExecution": { __esModule: true, default: TestnetExecution, valueSources: panel.valueSources },
     "@/components/NetworkSwitch": { __esModule: true, default: () => null },
     "@/stores/useStellarWalletStore": (sel) => sel(store),
     "@/stores/useBalanceStore": (sel) => sel(store),
     "@/stores/usePriceStore": (sel) => sel({ bySymbol: {}, set: () => {} }),
     "@/components/stellar/walletKit": { initWalletKit: (config) => calls.init.push(config), connectWallet() {}, disconnectWallet() {} },
-    "@/lib/network": network, "@/lib/vaults": vaults, "@/lib/execution": execution,
+    "@/lib/network": network, "@/lib/vaults": vaults, "@/lib/execution": execution, "@/lib/vault": vaultLib,
     "@/lib/prices": { referenceValue: () => null, fundingValue: () => null },
     "@/lib/quant": { fetchUniverse: () => new Promise(() => {}), quantRequest: () => new Promise(() => {}) },
     "@/lib/balances": { fetchHoldings: () => new Promise(() => {}) },
@@ -125,11 +125,13 @@ test("the working basket labels the vault with the active network's deployment, 
   assert.ok(text(card(h, PRODUCTS[1], "testnet")).includes(`Testnet vault · ${TESTNET.epoch}`));
 });
 
+// The selected sources of an allocation and their valuation (USDC units).
+const usdcSource = (quantity) => ({ sources: [{ symbol: "USDC", percent: 100, quantity }], valuation: { USDC: { quantity, value: quantity, minOut: quantity } } });
 const ALLOCATED = { requested_assets: ["xlm", "etesia-tf"], owner: "GOWNER", generated_at: "2026-11-12T00:00:00Z", model_version: "m", market_data_as_of: "2026-11-11T00:00:00Z", portfolio_value_usdc: 100,
   positions: { "etesia-tf": { allocation_fraction: .8185, notional_usdc: 81.85, quantity: 81.8, mark_usdc: 1 }, xlm: { allocation_fraction: .1315, notional_usdc: 13.15, quantity: 89.3, mark_usdc: .147 },
     ustry: { allocation_fraction: 0, notional_usdc: 0, quantity: 0, mark_usdc: 1 }, usdc: { allocation_fraction: .025, notional_usdc: 2.5, quantity: 2.5, mark_usdc: 1 }, xlm_buffer: { allocation_fraction: .025, notional_usdc: 2.5, quantity: 17, mark_usdc: .147 } },
   parameters: { builder: { annual_volatility_budget: .25 }, cash_reserves: ["ustry"] }, allocated_sleeve_volatility: .1655883689913353,
-  binding_constraints: ["gross_allocation_cap"], diagnostics: [], funding: { symbol: "USDC", amount: "100" }, usdcUsd: 1 };
+  binding_constraints: ["gross_allocation_cap"], diagnostics: [], ...usdcSource(1000000000n), usdcUsd: 1 };
 
 test("a selected reserve left empty by the gross allocation cap is explained, with the budget that keeps one", () => {
   const h = builder();
@@ -160,7 +162,7 @@ test("once every testnet leg is executed, sections 02–04 unlock, input changes
   invalidate(h);
   assert.deepEqual([h.values[3], h.values[4]], ["select", null]);
   // The account and network effect clears an executed allocation too.
-  after.effects.find(fn => fn.toString().includes("fetchHoldings"))()(); // run, then clean up its refresh interval
+  after.effects.find(fn => fn.toString().includes("setTestnet(null)"))()(); // run, then clean up its refresh interval
   assert.deepEqual([after.values[3], after.values[4]], ["select", null]);
 });
 
@@ -168,11 +170,12 @@ test("once every testnet leg is executed, sections 02–04 unlock, input changes
 
 const OWNER = sdk.Keypair.random().publicKey();
 const ACCOUNT = { funded: true, trustline: true, balance: "1000.0000000", xlm: "100.0000000", subentries: 1, lines: { USDC: "1000.0000000" } };
-const ALLOCATION = { owner: OWNER, generated_at: "2026-11-11T12:00:00Z", funding: { symbol: "USDC", amount: "20" },
+const ALLOCATION = { owner: OWNER, generated_at: "2026-11-11T12:00:00Z", ...usdcSource(200000000n),
   positions: Object.fromEntries(Object.entries({ xlm: .3, xlm_buffer: .025, "etesia-tf": .35, ustry: .3, usdc: .025 }).map(([id, f]) => [id, { allocation_fraction: f }])) };
+const POSITION = { shares: 0n, value: 0n, maxWithdraw: 0n, liquid: 0n, paused: false };
 const symbolOf = (contract) => Object.values(TESTNET.assets).find(a => a.address === contract).symbol;
 // A scripted client: each signing call reports its envelope, then confirms, fails or ends unknown.
-function client({ outcomes = {}, checks = [], account = ACCOUNT, noQuote = [], limited = [] } = {}) {
+function client({ outcomes = {}, checks = [], account = ACCOUNT, noQuote = [], limited = [], position = POSITION } = {}) {
   const log = [];
   let n = 0;
   const sign = (name, onSigned) => {
@@ -197,20 +200,23 @@ function client({ outcomes = {}, checks = [], account = ACCOUNT, noQuote = [], l
       return sign(`swap ${symbolOf(p.at(-1))}`, onSigned); },
     addUsdcTrustline: async (owner, symbol, onSigned) => sign(`trustline ${symbol}`, onSigned),
     deposit: async (owner, amount, onSigned) => sign(`deposit ${amount}`, onSigned),
+    withdraw: async (owner, amount, onSigned) => sign(`withdraw ${amount}`, onSigned),
+    exitAll: async (owner, onSigned) => sign("redeem all", onSigned),
+    readPosition: async () => { log.push("position"); return position; },
     checkTransaction: async (record) => { log.push(`check ${record.hash}`); return checks.shift(); } };
 }
 function memoryStorage(initial = {}) {
   const data = { "etesia.builder.pending": JSON.stringify(initial) };
   return { data, getItem: (k) => data[k] ?? null, setItem: (k, v) => { data[k] = v; } };
 }
-async function run(c, states = {}, store = panel.pendingStore(() => memoryStorage()), active) {
-  const { legs } = execution.testnetLegs(ALLOCATION, 200000000n, TESTNET);
+async function run(c, states = {}, store = panel.pendingStore(() => memoryStorage()), active, allocation = ALLOCATION) {
+  const { legs } = execution.testnetLegs(allocation, TESTNET);
   const updates = [];
   const result = await panel.runLegs({ client: c, owner: OWNER, generatedAt: ALLOCATION.generated_at, legs, states, store, active,
     update: (key, state) => { updates.push([key, state.status]); states[key] = state; } });
   return { legs, states, updates, result, store };
 }
-const signedCalls = (c) => c.log.filter(e => typeof e === "string" && !e.startsWith("quote") && !e.startsWith("check"));
+const signedCalls = (c) => c.log.filter(e => typeof e === "string" && !e.startsWith("quote") && !e.startsWith("check") && e !== "position");
 
 test("legs run in order, each swap quoted before the run and executed through the API swap with no floor, then the deposit", async () => {
   const c = client();
@@ -235,37 +241,77 @@ test("a swap without a live quote is not executed, nor its trustline, and the ot
   assert.match(states["swap:tRESERVE"].error, /No Soroswap testnet quote for USDC → tRESERVE/);
   assert.equal(states["vault:etesia-tf"].status, "confirmed");
   const html = render({ plan: planFor({ "swap:tRESERVE": { error: "No Soroswap testnet quote" } }), states });
-  assert.ok(html.includes("Not executed · No Soroswap testnet quote for USDC → tRESERVE") && html.includes("A swap the Soroswap API finds no path for is not executed"));
+  assert.ok(html.includes("Not executed · No Soroswap testnet quote for USDC → tRESERVE") && html.includes("A buy the Soroswap API finds no path for is not executed"));
   assert.ok(html.includes("Continue with the remaining legs") && !runButton(html)[1]);
 });
 
 test("a quote that fails for any reason but No path found (rate limit, outage, missing key) stops the run before anything is signed", async () => {
   const c = client({ limited: ["tRESERVE"] });
   const states = {};
-  const { legs } = execution.testnetLegs(ALLOCATION, 200000000n, TESTNET);
+  const { legs } = execution.testnetLegs(ALLOCATION, TESTNET);
   await assert.rejects(panel.runLegs({ client: c, owner: OWNER, generatedAt: ALLOCATION.generated_at, legs, states, store: null, update: (key, state) => { states[key] = state; } }),
     /rate limit was reached\. Try again in 1 seconds\. Nothing was signed; run again once the Soroswap API answers\./);
   assert.deepEqual([signedCalls(c), states], [[], {}]);
 });
 
-test("a swap whose quote fails at signing is not executed, while a funding swap's failure stops the run", async () => {
+// An XLM source of 100 XLM valued at 20 USDC (minimum 19.9): it sells 67.5 XLM, the XLM above its 32.5% target.
+const XLM_SOURCE = { ...ALLOCATION, sources: [{ symbol: "XLM", percent: 100, quantity: 1000000000n }], valuation: { XLM: { quantity: 1000000000n, value: 200000000n, minOut: 199000000n } } };
+
+test("a buy whose quote fails at signing is not executed, while a sell's failure stops the run before the buys", async () => {
   const c = client({ outcomes: { "swap tRESERVE": "unquoted" } });
   const { states, result } = await run(c);
   assert.equal(result, true);
   assert.deepEqual([states["swap:tRESERVE"].status, states["vault:etesia-tf"].status], ["unavailable", "confirmed"]);
   assert.match(states["swap:tRESERVE"].error, /No path found/);
-  const allocation = { ...ALLOCATION, funding: { symbol: "XLM", amount: "100" } };
   const f = client({ outcomes: { "swap USDC": "unquoted" } });
-  const prepared = await panel.prepareRun(f, allocation, TESTNET, null);
+  const prepared = await panel.prepareRun(f, XLM_SOURCE, TESTNET, null);
   const states2 = {};
   const ok = await panel.runLegs({ client: f, owner: OWNER, generatedAt: ALLOCATION.generated_at, legs: prepared.plan.legs, states: states2, store: null,
     update: (key, state) => { states2[key] = state; } });
   assert.equal(ok, false);
-  assert.equal(states2.funding.status, "failed");
-  // The funding swap's floor is the USDC the plan was budgeted from: 0.5% below the funding quote's minimum.
-  const funding = f.log.find(e => typeof e === "object");
-  assert.equal(funding.floor, prepared.plan.capital);
-  assert.equal(prepared.plan.capital, 930000000n * 2n * 9950n / 10000n * 9950n / 10000n);
+  assert.equal(states2["sell:XLM"].status, "failed");
+  assert.deepEqual(signedCalls(f), ["trustline tRESERVE"]);
+  assert.equal(states2["swap:tRESERVE"], undefined);
+});
+
+test("a sell is signed with its share of the valued minimum as its floor; buys have none", async () => {
+  const c = client();
+  const { legs, states, result } = await run(c, {}, undefined, undefined, XLM_SOURCE);
+  assert.equal(result, true);
+  const sell = legs.find(l => l.key === "sell:XLM");
+  assert.equal(sell.minOut, 199000000n * 675000000n / 1000000000n);
+  assert.deepEqual(c.log.filter(e => typeof e === "object").map(e => [e.amountIn, e.floor]), [[675000000n, sell.minOut], [legs.find(l => l.key === "swap:tRESERVE").amountIn, 0n]]);
+  assert.deepEqual(signedCalls(c), ["trustline tRESERVE", "swap USDC", "swap tRESERVE", `deposit ${vaultLib.fromUnits(legs.at(-1).amountIn, 7)}`]);
+  assert.ok(Object.values(states).every(s => s.status === "confirmed"));
+});
+
+test("a sell without a quote stops the run before anything is signed, even when the API finds no path", async () => {
+  const c = client({ noQuote: ["USDC"] });
+  const states = {};
+  const { legs } = execution.testnetLegs(XLM_SOURCE, TESTNET);
+  await assert.rejects(panel.runLegs({ client: c, owner: OWNER, generatedAt: ALLOCATION.generated_at, legs, states, store: null, update: (key, state) => { states[key] = state; } }),
+    /No Soroswap testnet quote for XLM → USDC: Soroswap API 400: No path found Nothing was signed/);
+  assert.deepEqual([signedCalls(c), states], [[], {}]);
+});
+
+test("vault withdraw and redeem legs record their signed envelopes like the other legs and run before the buys", async () => {
+  const S = 500000000000000n;
+  const vaultSource = (percent) => ({ ...ALLOCATION, positions: { xlm: { allocation_fraction: .5 }, xlm_buffer: { allocation_fraction: .025 }, usdc: { allocation_fraction: .475 } },
+    sources: [{ symbol: "ETESIA-TF", percent, quantity: S }], valuation: { "ETESIA-TF": { quantity: S, value: 500000000n, minOut: 497500000n, maxWithdraw: 500000000n } } });
+  for (const [percent, kind, signed] of [[100, "redeem", "redeem all"], [50, "withdraw", "withdraw 50"]]) {
+    const c = client({ position: { ...POSITION, shares: S, maxWithdraw: 500000000n } });
+    const { states, store, result } = await run(c, {}, undefined, undefined, vaultSource(percent));
+    assert.equal(result, true);
+    assert.deepEqual(signedCalls(c), [signed, "swap XLM"]);
+    assert.ok(c.log.includes("position"), "the vault position is read for the checks");
+    const record = store.list(OWNER).find(r => r.leg === `${kind}:etesia-tf`);
+    assert.deepEqual([record.outcome.status, record.action], ["SUCCESS", kind === "redeem" ? "Redeem all · ETESIA-TF redeem_bounded" : "Withdraw · ETESIA-TF withdraw_bounded"]);
+    assert.equal(states[`${kind}:etesia-tf`].status, "confirmed");
+  }
+  // A paused vault refuses the run before any signature.
+  const paused = client({ position: { ...POSITION, shares: S, maxWithdraw: 500000000n, paused: true } });
+  await assert.rejects(run(paused, {}, undefined, undefined, vaultSource(100)), /The vault is paused/);
+  assert.deepEqual(signedCalls(paused), []);
 });
 
 test("a run stops when its panel is gone, and refuses while the store holds a transaction signed outside it", async () => {
@@ -306,7 +352,7 @@ test("a run is refused before any signature when the checks fail", async () => {
 
 const render = (props) => renderToStaticMarkup(React.createElement(panel.ExecutionPanel, { net: TESTNET, owner: OWNER, open: [], earlier: [], storageOk: true,
   running: false, networkError: null, wrongAccount: false, onRun() {}, onCheck() {}, onCheckOpen() {}, ...props }));
-const planFor = (quotes = {}) => ({ ...execution.testnetLegs(ALLOCATION, 200000000n, TESTNET), capital: 200000000n, quotes, check: null });
+const planFor = (quotes = {}, allocation = ALLOCATION) => ({ ...execution.testnetLegs(allocation, TESTNET), quotes, check: null });
 const runButton = (html) => /<button class="btn lg"( disabled="")?>.*?<\/button>/.exec(html);
 
 test("an unknown leg blocks Continue until Check status resolves it, and is never signed again meanwhile", async () => {
@@ -372,19 +418,28 @@ test("after a reload, legs an earlier allocation executed (or may have) block th
   assert.equal(panel.checkedState({ status: "OUTSIDE_HISTORY" }, old).status, "untracked");
 });
 
-test("XLM funding keeps the run's XLM back and the funding leg shows it", async () => {
-  const allocation = { ...ALLOCATION, funding: { symbol: "XLM", amount: "100" } };
+test("an XLM sell keeps the run's XLM back, and section 05 shows the rebalance, current vs target, above the legs", async () => {
   const c = client({ account: { ...ACCOUNT, xlm: "100.0000000" } });
-  const prepared = await panel.prepareRun(c, allocation, TESTNET, null);
-  const [funding] = prepared.plan.legs;
-  // Two base reserves, the USDC line, the tRESERVE line and five transactions: 7 XLM kept back.
-  assert.deepEqual([funding.kind, funding.amountIn, prepared.plan.xlmKept], ["funding", 930000000n, 70000000n]);
+  const prepared = await panel.prepareRun(c, XLM_SOURCE, TESTNET, null);
+  const sell = prepared.plan.legs.find(l => l.key === "sell:XLM");
+  // Two base reserves, the USDC line, the tRESERVE line and four transactions: 6 XLM kept back.
+  assert.deepEqual([sell.kind, sell.amountIn, prepared.plan.xlmKept], ["sell", 675000000n, 60000000n]);
   assert.equal(prepared.plan.check, null);
   const html = render({ plan: prepared.plan, states: {} });
-  assert.ok(html.includes("93.0000000 XLM of the 100 XLM entered · keeps 7.0000000 XLM back for fees and the account reserve"));
-  // The funding swap shows the fresh quote's minimum, which is what is signed, and the budgeted USDC it must cover.
-  assert.deepEqual(prepared.plan.quotes.funding, { amountOut: 1860000000n, minOut: 1850700000n, budgeted: prepared.plan.capital });
-  assert.ok(html.includes("expected 186 USDC · minimum 185.07 USDC · budgeted 184.14465 USDC"));
+  assert.ok(html.includes("67.5000000 XLM · keeps 6.0000000 XLM back for fees and the account reserve"));
+  // The sell shows the fresh quote's minimum, which is what is signed, and the USDC the plan counts on.
+  assert.deepEqual(prepared.plan.quotes["sell:XLM"], { amountOut: 1350000000n, minOut: 1343250000n, budgeted: 134325000n });
+  assert.ok(html.includes("expected 135 USDC · minimum 134.325 USDC · budgeted 13.4325 USDC"));
+  assert.ok(html.indexOf("Rebalance — current vs target") < html.indexOf("Sell · XLM → USDC"));
+  assert.ok(html.includes("Current 100 XLM · 20.0000000 USDC → target 6.5000000 USDC") && html.includes("Sell 67.5000000 XLM"));
+  assert.ok(html.includes("Buy · USDC → tRESERVE · USTRY stand-in on testnet") && html.includes("Deposit · ETESIA-TF deposit_bounded"));
+  assert.ok(html.includes("scaled down to the USDC the sells provide"));
+  // A source within tolerance of its target is shown, with no trade.
+  const close = { ...ALLOCATION, sources: [{ symbol: "USDC", percent: 100, quantity: 135000000n }, { symbol: "XLM", percent: 50, quantity: 500000000n }],
+    valuation: { USDC: { quantity: 135000000n, value: 135000000n, minOut: 135000000n }, XLM: { quantity: 500000000n, value: 65000000n, minOut: 64000000n } } };
+  const html2 = render({ plan: planFor({}, close), states: {} });
+  assert.ok(html2.includes("Current 50 XLM · 6.5000000 USDC → target 6.5000000 USDC") && html2.includes("Within tolerance, no trade"));
+  assert.ok(!html2.includes("sell:XLM") && !html2.includes("swap:XLM"));
 });
 
 test("receipts render only for a SUCCESS, as testnet transactions and not simulations", () => {
@@ -394,7 +449,7 @@ test("receipts render only for a SUCCESS, as testnet transactions and not simula
   assert.ok(!none.includes("not a simulation") && !none.includes("tx-receipt"));
   const html = render({ plan, states: { "swap:XLM": { status: "confirmed", receipt } } });
   assert.equal((html.match(/class="tx-receipt"/g) || []).length, 1);
-  assert.ok(html.includes("Stellar testnet transaction, not a simulation · USDC → XLM swap · XLM, XLM fee buffer"));
+  assert.ok(html.includes("Stellar testnet transaction, not a simulation · Buy · USDC → XLM"));
   assert.ok(html.includes("Confirmed in ledger 77 · contract returned 13 XLM"));
   assert.ok(html.includes(`${TESTNET.explorerUrl}/tx/${receipt.hash}`));
   assert.ok(html.includes("Execution — Stellar testnet transactions signed by your wallet · test funds only"));
@@ -422,6 +477,14 @@ test("a finished run reports it once to the Builder and keeps its records for th
   assert.deepEqual(mount({ ...done, [plan.legs.at(-1).key]: { status: "failed" } }), { finished: [], kept: mine.map(r => r.hash) });
 });
 
+test("testnet sources are valued at testnet prices, and a sell counts on 0.5% below its quote's minimum", async () => {
+  const c = client();
+  const valuation = await panel.valueSources(c, [{ symbol: "USDC", percent: 100, quantity: 50000000n }, { symbol: "XLM", percent: 50, quantity: 1000000000n }], null);
+  // The scripted quote returns 2× the input with a 0.5% minimum; the sell counts on 0.5% below that minimum.
+  assert.deepEqual(valuation.USDC, { quantity: 50000000n, value: 50000000n, minOut: 50000000n });
+  assert.deepEqual(valuation.XLM, { quantity: 1000000000n, value: 2000000000n, minOut: 1990000000n * 9950n / 10000n });
+});
+
 test("a wallet network mismatch or another account blocks signing", () => {
   const plan = planFor();
   assert.ok(runButton(render({ plan, states: {}, networkError: "Wallet network mismatch: switch your wallet to Stellar testnet" }))[1]);
@@ -440,7 +503,7 @@ test("the connect screen describes testnet execution in testnet mode and keeps t
 test("mainnet still renders Simulate execution and signs nothing", () => {
   const h = builder();
   const allocation = { requested_assets: ["xlm"], positions: { xlm: { allocation_fraction: .975, notional_usdc: 97.5, quantity: 300 }, usdc: { allocation_fraction: .025, notional_usdc: 2.5, quantity: 2.5 } },
-    model_version: "m", market_data_as_of: "2026-09-19T00:00:00Z", portfolio_value_usdc: 100, allocated_sleeve_volatility: null, binding_constraints: [], diagnostics: [], funding: { symbol: "USDC", amount: "100" }, usdcUsd: 1 };
+    model_version: "m", market_data_as_of: "2026-09-19T00:00:00Z", portfolio_value_usdc: 100, allocated_sleeve_volatility: null, binding_constraints: [], diagnostics: [], ...usdcSource(1000000000n), usdcUsd: 1 };
   const tree = h.AllocStage({ network: "mainnet", allocation, coins: [], onReset() {} });
   assert.ok(!nodes(tree).some(n => n.type === h.TestnetExecution));
   const simulation = nodes(tree).find(n => n.type === h.ExecutionSimulation);

@@ -14,7 +14,8 @@
 // Assets in the wallet but outside the universe are ignored. Unheld -> 0.
 // With a vault network (testnet mode), the account is read from that network's
 // Horizon and mapped by the manifest's classic identities instead (its USDC by
-// issuer, native XLM); manifest assets outside the universe are ignored.
+// issuer, native XLM), keyed by manifest symbol: every manifest classic asset
+// is held, including tRESERVE (the USTRY stand-in).
 
 import { ASSET_CONTRACTS } from "@/lib/assets";
 import type { VaultNetworkConfig } from "@/lib/network";
@@ -38,10 +39,10 @@ const TK_BY_CODE_ISSUER: Record<string, string> = Object.fromEntries(
 const zeroHoldings = (): Record<string, number> =>
   Object.fromEntries(Object.keys(ASSET_CONTRACTS).map((tk) => [tk, 0]));
 
-// "CODE:ISSUER" -> universe ticker for a vault network's manifest assets.
+// "CODE:ISSUER" -> manifest symbol for a vault network's classic assets.
 const manifestTickers = (net: VaultNetworkConfig): Record<string, string> => Object.fromEntries(
   Object.values(net.assets)
-    .filter((asset) => asset.classic && asset.classic !== "native" && asset.symbol in ASSET_CONTRACTS)
+    .filter((asset) => asset.classic && asset.classic !== "native")
     .map((asset) => [asset.classic!, asset.symbol])
 );
 

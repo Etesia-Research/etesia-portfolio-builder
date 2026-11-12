@@ -153,7 +153,8 @@ test("every non-native market output has a changeTrust step before its swap (the
     // The manifest address is the SAC of its classic identity.
     const sac = asset.classic === "native" ? sdk.Asset.native() : new sdk.Asset(...asset.classic.split(":"));
     assert.equal(sac.contractId(TESTNET.passphrase), asset.address, symbol);
-    const { legs } = execution.testnetLegs({ positions: { [id]: { allocation_fraction: .975 }, usdc: { allocation_fraction: .025 } }, funding: { symbol: "USDC", amount: "1" } }, 10000000n, TESTNET);
+    const { legs } = execution.testnetLegs({ positions: { [id]: { allocation_fraction: .975 }, usdc: { allocation_fraction: .025 } },
+      sources: [{ symbol: "USDC", percent: 100, quantity: 10000000n }], valuation: { USDC: { quantity: 10000000n, value: 10000000n, minOut: 10000000n } } }, TESTNET);
     const keys = legs.map(l => l.key);
     if (asset.classic === "native") assert.deepEqual(keys, [`swap:${symbol}`]);
     else assert.deepEqual(keys, [`trustline:${symbol}`, `swap:${symbol}`]);

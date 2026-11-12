@@ -132,19 +132,24 @@ test("deposit bounds min_shares by the preview and signs a deposit_bounded call"
   assert.deepEqual(receipt, { action: "Deposit 10 USDC", hash: h.calls.hashes[0], ledger: 77, returned: "0.000000000005 shares" });
 });
 
-test("partial withdraw caps max_shares and full exit redeems the whole balance", async () => {
+test("partial withdraw caps max_shares and full exit redeems the whole balance, each reporting its signed envelope", async () => {
   const h = harness({
     views: { preview_withdraw: () => 2000, balance: () => 123456, preview_redeem: () => 40000 },
     polls: [{ status: "SUCCESS", ledger: 1, returnValue: i128(1) }, { status: "SUCCESS", ledger: 2, returnValue: i128(40000) }],
   });
-  await h.vault.withdraw(OWNER, "0.5");
-  const exit = await h.vault.exitAll(OWNER);
+  const signed = [];
+  await h.vault.withdraw(OWNER, "0.5", (envelope) => signed.push(envelope.hash));
+  const exit = await h.vault.exitAll(OWNER, (envelope) => signed.push(envelope.hash));
+  assert.deepEqual(signed, h.calls.hashes);
   const [withdraw, redeem] = h.flows();
   assert.equal(withdraw.fn, "withdraw_bounded");
   assert.deepEqual(withdraw.args.slice(0, 5), [BigInt(5000000), OWNER, OWNER, OWNER, BigInt(2010)]);
   assert.equal(redeem.fn, "redeem_bounded");
   assert.deepEqual(redeem.args.slice(0, 5), [BigInt(123456), OWNER, OWNER, OWNER, BigInt(39800)]);
   assert.equal(exit.returned, "0.004 USDC");
+  // A redeem preview takes shares (twelve decimals).
+  assert.equal(await h.vault.preview("redeem", "0.000000123456"), BigInt(40000));
+  assert.deepEqual(h.calls.contract.at(-1), { fn: "preview_redeem", args: [BigInt(123456)], contract: TESTNET.vault });
 });
 
 test("polling outlasts the transaction's time bound before reporting an unknown outcome", async () => {

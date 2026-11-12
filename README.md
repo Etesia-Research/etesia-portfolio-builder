@@ -84,8 +84,9 @@ Freighter/Varial and xBull only. The mainnet Builder signs nothing. In testnet
 mode the Builder reads balances from testnet Horizon, offers only the products
 with a Soroswap testnet market for the same asset (XLM, the Etesia-TF vault, USDC
 and the USTRY reserve through its labelled stand-in tRESERVE; AQUA, ETH, BTC, SHX
-and EURC are shown as not selectable), and executes every allocation leg as a
-wallet-signed testnet transaction (see the allocation run below).
+and EURC are shown as not selectable), and rebalances the selected holdings to
+the allocation, every trade a wallet-signed testnet transaction (see the
+allocation and rebalance run below).
 `/stellar_tf_vault/testnet?amount=<USDC>` still prefills a deposit. `/stellar_tf_vault/mainnet`
 shows the vault as not deployed, with every control disabled, until a mainnet
 manifest is added to the registry.
@@ -115,7 +116,7 @@ contract returned. Then a partial **Sign & withdraw** within "Max withdraw" and
 **Sign & redeem all shares**. An unconfirmed transaction is reported with its
 hash as an unknown outcome; check the explorer before retrying.
 
-### Testnet allocation run (manual script)
+### Testnet allocation and rebalance run (manual script)
 
 Same wallet setup, with test USDC from the Blend faucet. Expected page text is quoted.
 
@@ -123,41 +124,65 @@ Same wallet setup, with test USDC from the Blend faucet. Expected page text is q
    mainnet daily closes · balances, quotes and execution on Stellar testnet, test
    funds only". The AQUA, ETH, BTC and SHX cards read "Not selectable on testnet ·
    no Soroswap testnet market for …" and ignore clicks.
-2. Connect; the funding list shows the testnet USDC and XLM balances. The EURC
-   reserve reads "Not selectable on testnet · no Soroswap testnet market for EURC"
-   and the USTRY reserve reads "USTRY stand-in on testnet: Etesia-issued tRESERVE
-   …". Select XLM and ETESIA-TF with the USTRY reserve, choose USDC (or XLM) as
-   the source, set the volatility budget to 10%, and build. At the default 25%
-   these two products reach about 16.6% volatility fully invested, so the 95%
-   gross allocation cap binds, the page shows "No USTRY reserve: …" and the run
-   has no tRESERVE legs; a budget below the level that note reports keeps a
-   reserve. With XLM, the funding leg keeps XLM back for fees and the account
-   reserve, so MAX swaps the rest.
+2. Connect. Section 03 lists "① Your holdings — select the sources to allocate or
+   rebalance": XLM ("MAX keeps … XLM back for fees and the account reserve"),
+   USDC, tRESERVE ("USTRY stand-in on testnet") and ETESIA-TF ("Vault shares · …
+   USDC"), each only when held. The EURC reserve reads "Not selectable on testnet
+   · no Soroswap testnet market for EURC" and the USTRY reserve reads "USTRY
+   stand-in on testnet: Etesia-issued tRESERVE …". Select XLM and ETESIA-TF with
+   the USTRY reserve, click the USDC holding (it starts at 100%, MAX), set the
+   volatility budget to 10%, and build. At the default 25% these two products
+   reach about 16.6% volatility fully invested, so the 95% gross allocation cap
+   binds, the page shows "No USTRY reserve: …" and the run has no tRESERVE legs;
+   a budget below the level that note reports keeps a reserve. The capital line
+   reads "Valued at testnet Soroswap quotes and the vault's share value when
+   built". An invalid percentage (below 1, above 100 or more than two decimals)
+   reads "Enter a percentage from 1 to 100, with at most two decimals." and
+   blocks the build.
 3. Under "Execution — Stellar testnet transactions signed by your wallet · test
-   funds only", check every leg before signing: amount in, expected and minimum
-   out (a swap's minimum is the Soroswap API quote's `otherAmountThreshold`; the
-   funding swap also shows the budgeted USDC its minimum must cover), and
-   the contract (the router `CCJUD55A…E7BRD`, which every API-built swap invokes,
-   the tRESERVE asset, the vault). With XLM funding the "Funding swap · XLM → USDC" leg comes first.
+   funds only", the "Rebalance — current vs target" rows show each bucket's
+   selected quantity and USDC value, its target and its trade. Check every leg
+   before signing: amount in, expected and minimum out (a swap's minimum is the
+   Soroswap API quote's `otherAmountThreshold`; a sell also shows the USDC the
+   plan counts on, which its minimum must cover), and the contract (the router
+   `CCJUD55A…E7BRD`, which every API-built swap invokes, the tRESERVE asset, the
+   vault). With only USDC selected there is no sell: "tRESERVE trustline ·
+   changeTrust", "Buy · USDC → XLM", "Buy · USDC → tRESERVE · USTRY stand-in on
+   testnet", then "Deposit · ETESIA-TF deposit_bounded".
 4. Press **Sign and execute** and approve each leg in the wallet: the tRESERVE
    `changeTrust` (skipped as "Trustline already present" when the account has
    it), the USDC → XLM and USDC → tRESERVE swaps, then the `deposit_bounded`.
    Each confirmed leg shows "Stellar testnet transaction, not a simulation · …"
    with its ledger, returned amount and explorer link. Once the button reads
-   "All legs executed", sections 02–04 unlock and section 05 keeps its receipts
+   "All legs executed", sections 02–04 unlock, the holdings are read again
+   (tRESERVE and the vault shares now listed), and section 05 keeps its receipts
    until the next **Build risk-parity portfolio**; that build lists them as the
    earlier allocation's receipts until **Acknowledge and allow this run**.
-5. Reject one signature: the run stops with "Signature request was rejected in
+5. Rebalance: select XLM, USDC, tRESERVE and ETESIA-TF as sources (each at
+   100%, or lower one, for example the shares to 50%), change the volatility
+   budget or the products, and build again. The rebalance rows net each bucket:
+   above its target it sells only the excess ("Sell · XLM → USDC", "Sell ·
+   tRESERVE → USDC · USTRY stand-in on testnet", "Withdraw · ETESIA-TF
+   withdraw_bounded", capped at the vault's max withdraw, or "Redeem all ·
+   ETESIA-TF redeem_bounded" when the vault leaves the basket and every share is
+   selected); below it buys with the USDC; within 0.01 USDC it reads "Within
+   tolerance, no trade". Sells run before buys, and buys are scaled down when
+   the sells' minimums fall short. Acknowledge the earlier receipts, then sign.
+   Unselected holdings are not touched.
+6. Reject one signature: the run stops with "Signature request was rejected in
    the wallet. Nothing was submitted." and **Continue with the remaining legs**
-   quotes the rest again.
-6. Reload while a leg is "Submitted · confirming onchain…": after rebuilding, the
+   quotes the rest again. A sell whose quote fails stops the run before any buy.
+7. Reload while a leg is "Submitted · confirming onchain…": after rebuilding, the
    page lists it as "Pending transaction" and nothing can be signed until
    **Check status** resolves it. Legs confirmed before the reload, and one that
    resolves as confirmed, are listed as the earlier allocation's receipts; they
    are not deducted from the rebuilt allocation, so its run stays blocked until
    **Acknowledge and allow this run**, after which it executes every leg again.
-7. Open `/stellar_tf_vault/testnet`: the contract-read and indexed shares match.
-8. Switch to Mainnet: "Simulate execution" is unchanged and nothing is signed.
+8. Open `/stellar_tf_vault/testnet`: the contract-read and indexed shares match.
+9. Switch to Mainnet: the holdings list allows several sources the same way;
+   "Simulate execution" shows the same net trades (sells quoted to USDC, buys
+   from USDC, current values at the daily close, the vault at a simulated $1 per
+   share) and nothing is signed.
 
 ## Data and allocation
 
@@ -187,10 +212,13 @@ Same wallet setup, with test USDC from the Blend faucet. Expected page text is q
   pointer and keyboard controls expose daily values. Today's weights applied to
   the past are a retrospective illustration, excluding trading costs. Internal gaps,
   stale tails, entirely missing history or a changed market snapshot show an explicit unavailable state.
-- **Simulate execution** uses actual-size quotes for the funding conversion into
-  USDC and each nonzero swap position. Quoted USDC proceeds are divided by the
-  model fractions; atomic rounding dust stays in the USDC buffer. Cash is retained
-  without a swap. The vault needs no swap quote: shares assume $1 USD, using the
+- **Simulate execution** nets the selected sources against the model targets
+  (current values at the daily close) and uses actual-size quotes for each net
+  trade: a source above its target sells the excess to USDC, a position below
+  it buys from USDC (the sells are quoted first, and the buys spend only the
+  USDC those quotes return at least, scaled down together when short), and a
+  difference under 0.01 USDC is not traded. Atomic
+  rounding dust stays in the USDC buffer. Cash is retained without a swap. The vault needs no swap quote: shares assume $1 USD, using the
   reference USDC/USD conversion. Each row shows quoted output, minimum output,
   and quote time; failed or 60-second-old quotes block simulation. Refresh obtains
   a new complete quote set and clears any prior completion. No wallet signature,
@@ -203,8 +231,14 @@ Same wallet setup, with test USDC from the Blend faucet. Expected page text is q
 - Quotes appear only after allocation. Product/reserve selection and allocation
   construction do not depend on quotes. ETH/BTC analytics use underlying histories,
   while quoted Stellar instruments are the identified Ultra Capital wrappers.
-- Funding uses actual Horizon balances. The hypothetical USDC capital is
+- Funding lists the wallet's holdings (actual Horizon balances; on testnet also
+  tRESERVE and the vault shares). Several can be selected as sources; each starts
+  at 100% (MAX) and takes 1–100% with up to two decimals. The hypothetical USDC
+  capital is the sum over the selected parts of
   `quantity × source USD close / USDC USD close`, with fresh matching timestamps.
+  On testnet the parts are valued instead at testnet Soroswap quotes to USDC and
+  the vault's share value, and the XLM maximum leaves the most a run keeps back
+  for fees and the account reserve.
   The displayed catalog value is a daily-reference estimate, not full-wallet NAV.
 - Funding includes a **Risk cap** slider, default **25%**, sent as the annual
   allocated-sleeve volatility budget. It does not change the reserve/buffer fractions

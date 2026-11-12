@@ -3,7 +3,8 @@ import { produce } from "immer";
 
 // Live wallet holdings (Horizon mainnet), refreshed by polling in
 // PortfolioBuilder while a wallet is connected. byTk maps every universe
-// ticker to the connected account's real balance (0 when unheld).
+// ticker (in testnet mode, also every manifest symbol held, such as tRESERVE)
+// to the connected account's real balance (0 when unheld).
 export interface BalanceState {
   address: string | null;
   byTk: Record<string, number>;

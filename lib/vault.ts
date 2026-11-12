@@ -502,8 +502,8 @@ export function vaultClient(net: VaultNetworkConfig) {
   }
 
   // Exact-in swap to the connected account: quoted, built by the API, checked,
-  // then signed and submitted. floor is the least minimum accepted (the funding
-  // swap's budgeted USDC). A quote answered "No path found" is marked unquoted;
+  // then signed and submitted. floor is the least minimum accepted (a sell's
+  // share of the minimum its source was valued at). A quote answered "No path found" is marked unquoted;
   // a resource failure is quoted and built again once.
   async function swapExactIn(owner: string, amountIn: bigint, path: string[], onSigned?: OnSigned, floor = BigInt(0), retried = false): Promise<Receipt> {
     const [assetIn, assetOut] = [path[0], path.at(-1)!];
@@ -524,10 +524,11 @@ export function vaultClient(net: VaultNetworkConfig) {
   }
 
   // Preview for the form, shown before anything is signed; the flows below
-  // re-read it so the bound reflects the latest ledger.
-  async function preview(kind: "deposit" | "withdraw", amount: string): Promise<bigint> {
-    const assets = toUnits(amount, net.usdc.decimals);
-    return BigInt((await read(kind === "deposit" ? "preview_deposit" : "preview_withdraw", [i128(assets)])).value);
+  // re-read it so the bound reflects the latest ledger. A redeem previews an
+  // amount of shares.
+  async function preview(kind: "deposit" | "withdraw" | "redeem", amount: string): Promise<bigint> {
+    const units = toUnits(amount, kind === "redeem" ? SHARE_DECIMALS : net.usdc.decimals);
+    return BigInt((await read(`preview_${kind}`, [i128(units)])).value);
   }
 
   // receiver, from/owner and operator are all the connected account.
@@ -537,19 +538,19 @@ export function vaultClient(net: VaultNetworkConfig) {
       () => [i128(toUnits(amount, USDC.decimals)), address(owner), address(owner), address(owner), i128(minShares), u64(deadline())], SHARES, onSigned);
   }
 
-  async function withdraw(owner: string, amount: string): Promise<Receipt> {
+  async function withdraw(owner: string, amount: string, onSigned?: OnSigned): Promise<Receipt> {
     const maxShares = maxBound(await preview("withdraw", amount));
     return invoke(owner, `Withdraw ${amount} USDC`, vault, "withdraw_bounded",
-      () => [i128(toUnits(amount, USDC.decimals)), address(owner), address(owner), address(owner), i128(maxShares), u64(deadline())], SHARES);
+      () => [i128(toUnits(amount, USDC.decimals)), address(owner), address(owner), address(owner), i128(maxShares), u64(deadline())], SHARES, onSigned);
   }
 
   // Full exit: redeem the whole share balance for USDC.
-  async function exitAll(owner: string): Promise<Receipt> {
+  async function exitAll(owner: string, onSigned?: OnSigned): Promise<Receipt> {
     const shares = BigInt((await read("balance", [address(owner)])).value);
     if (shares <= BigInt(0)) throw new Error("This account holds no vault shares.");
     const redeemable = BigInt((await read("preview_redeem", [i128(shares)])).value);
     return invoke(owner, `Full exit: redeem ${fromUnits(shares, SHARE_DECIMALS)} shares`, vault, "redeem_bounded",
-      () => [i128(shares), address(owner), address(owner), address(owner), i128(minBound(redeemable)), u64(deadline())], USDC);
+      () => [i128(shares), address(owner), address(owner), address(owner), i128(minBound(redeemable)), u64(deadline())], USDC, onSigned);
   }
 
   return { net, vaultError, readPosition, readIndexed, readUsdcLine, addUsdcTrustline, onchainVaultCode, preview, deposit, withdraw, exitAll, assetSymbol, targetLabel, eventDetail,
