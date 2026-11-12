@@ -29,7 +29,7 @@ const vaultLib = load("lib/vault.ts", { "@/lib/network": network, "@/lib/quant":
 // call is recorded and answered by liquidity.reply (by default, deep enough).
 const liquidity = { calls: [], reply: async () => ({ status: "ready", additions: [] }) };
 const quant = { quantRequest: async (endpoint, body) => { liquidity.calls.push({ endpoint, body }); return liquidity.reply(endpoint, body); } };
-const panel = load("components/TestnetExecution.jsx", { "@/lib/vault": vaultLib, "@/lib/execution": execution, "@/lib/quant": quant,
+const panel = load("components/TestnetExecution.jsx", { "@/components/SharesInWallet": load("components/SharesInWallet.jsx"), "@/lib/vault": vaultLib, "@/lib/execution": execution, "@/lib/quant": quant,
   "@/stores/useStellarWalletStore": { __esModule: true, default: () => null } });
 
 function nodes(node) {
@@ -472,7 +472,7 @@ test("a finished run reports it once to the Builder and keeps its records for th
   const mount = (states) => {
     const store = panel.pendingStore(() => memoryStorage({ [OWNER]: mine }));
     const values = [store, plan, states, [], [], null, null, false], effects = [], finished = [];
-    const component = load("components/TestnetExecution.jsx", { "@/lib/vault": vaultLib, "@/lib/execution": execution, "@/lib/quant": quant,
+    const component = load("components/TestnetExecution.jsx", { "@/components/SharesInWallet": load("components/SharesInWallet.jsx"), "@/lib/vault": vaultLib, "@/lib/execution": execution, "@/lib/quant": quant,
       "@/stores/useStellarWalletStore": { __esModule: true, default: (sel) => sel({ address: OWNER, networkError: null }) },
       react: { ...React, useRef: () => ({ current: null }), useMemo: (fn) => fn(), useEffect: (fn) => effects.push(fn),
         useState: () => [values.shift(), () => {}] } }).default;
@@ -726,4 +726,26 @@ test("the Builder initialises the wallet kit on the active mode's network", () =
     h.effects.find(fn => fn.toString().includes("initWalletKit"))();
     assert.deepEqual(calls.init, [expected]);
   }
+});
+
+test("once the vault deposit leg is confirmed, the panel shows how to add the share token to a wallet", () => {
+  const plan = planFor();
+  const deposit = plan.legs.find((leg) => leg.kind === "vault");
+  assert.ok(deposit, "the fixture allocation deposits into the vault");
+  const confirmed = (keys) => Object.fromEntries(keys.map((key, i) => [key, { status: "confirmed", receipt: { hash: String(i + 1).repeat(64), ledger: 1 } }]));
+  const others = plan.legs.filter((leg) => leg !== deposit).map((leg) => leg.key);
+  for (const states of [{}, confirmed(others), { ...confirmed(others), [deposit.key]: { status: "submitted" } }])
+    assert.ok(!render({ plan, states }).includes("Your vault shares in your wallet"), JSON.stringify(states));
+  // The deposit leg alone decides: shown with only the deposit confirmed (a buy with no path may stay unexecuted).
+  assert.ok(render({ plan, states: confirmed([deposit.key]) }).includes("Your vault shares in your wallet"));
+  const html = render({ plan, states: confirmed(plan.legs.map((leg) => leg.key)) });
+  const note = html.indexOf("Your vault shares in your wallet");
+  assert.ok(note > 0 && html.indexOf(TESTNET.vault, note) > note);
+  // At the bottom of the panel, after the receipts.
+  assert.ok(note > html.lastIndexOf("Stellar testnet transaction, not a simulation"));
+  // An earlier allocation's deposit that succeeded (e.g. after a rebuild or a reload) still shows it; its other legs do not.
+  const earlierLeg = (leg, status) => ({ record: { leg, action: leg, hash: "e".repeat(64) }, result: { status, receipt: { hash: "e".repeat(64), ledger: 1 } } });
+  assert.ok(render({ plan, states: {}, earlier: [earlierLeg(deposit.key, "SUCCESS")] }).includes("Your vault shares in your wallet"));
+  for (const entry of [earlierLeg(deposit.key, "FAILED"), earlierLeg("swap:XLM", "SUCCESS")])
+    assert.ok(!render({ plan, states: {}, earlier: [entry] }).includes("Your vault shares in your wallet"), JSON.stringify(entry));
 });

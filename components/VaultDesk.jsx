@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import useStellarWalletStore from "@/stores/useStellarWalletStore";
 import { initWalletKit, connectWallet, disconnectWallet } from "@/components/stellar/walletKit";
 import NetworkSwitch from "@/components/NetworkSwitch";
+import SharesInWallet from "@/components/SharesInWallet";
 import { builderHref, findVault, vaultHref } from "@/lib/vaults";
 import { INDEXED_LIMIT, SHARE_DECIMALS, freshness, fromUnits, minBound, maxBound, sample, supplyAccrual, toUnits, vaultClient } from "@/lib/vault";
 
@@ -260,7 +261,7 @@ export default function VaultDesk({ slug, network }) {
     setBusy(label); setActionError(null);
     try {
       const receipt = await action();
-      setReceipts(current => [receipt, ...current]);
+      setReceipts(current => [{ ...receipt, kind: label }, ...current]);
     } catch (err) {
       setActionError(vaultError(err));
     } finally {
@@ -357,6 +358,7 @@ export default function VaultDesk({ slug, network }) {
           <p>Confirmed in ledger {receipt.ledger}{receipt.returned ? ` · contract returned ${receipt.returned}` : ''}.</p>
           <p className="data-note">Hash <a href={`${net.explorerUrl}/tx/${receipt.hash}`} target="_blank" rel="noreferrer">{receipt.hash}</a></p>
         </div>)}
+        {receipts.some(receipt => receipt.kind === 'deposit') && <SharesInWallet net={net} />}
       </>}
     </>}
 

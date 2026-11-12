@@ -161,7 +161,7 @@ test("Blend interest leaves out intervals with a supply or withdraw and interval
 });
 
 function component(imports = {}, globals = {}) {
-  return load("components/VaultDesk.jsx", { "@/lib/vault": vaultModule(), "@/lib/vaults": vaults,
+  return load("components/VaultDesk.jsx", { "@/components/SharesInWallet": load("components/SharesInWallet.jsx"), "@/lib/vault": vaultModule(), "@/lib/vaults": vaults,
     "@/components/NetworkSwitch": { __esModule: true, default: () => null },
     "@/stores/useStellarWalletStore": { default: () => null }, "@/components/stellar/walletKit": {}, ...imports }, globals);
 }

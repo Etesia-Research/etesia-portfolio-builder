@@ -5,6 +5,7 @@ import useStellarWalletStore from "@/stores/useStellarWalletStore";
 import { API_TX_SECONDS, DEADLINE_SECONDS, SHARE_DECIMALS, fromUnits, minBound, vaultClient } from "@/lib/vault";
 import { IMPACT_LIMIT_BPS, TOLERANCE, liquiditySwaps, priceImpactBps, referenceIn, runKeep, testnetCheck, testnetLegs, tokenUnits } from "@/lib/execution";
 import { quantRequest } from "@/lib/quant";
+import SharesInWallet from "@/components/SharesInWallet";
 
 // Testnet execution of a Builder allocation: the rebalance of the selected
 // sources to the allocation's targets, where every leg is a real Stellar testnet
@@ -320,6 +321,9 @@ export function ExecutionPanel({ net, owner, plan, states, open, earlier, prepEr
   const finished = plan ? plan.legs.every((leg) => DONE.has(states[leg.key]?.status)) : false;
   const repeats = earlier.filter(({ result, acknowledged }) => !acknowledged && MAY_HAVE_EXECUTED.has(result.status));
   const blocked = running || !plan || finished || !!plan.impact || open.length > 0 || unknown.length > 0 || repeats.length > 0 || !!networkError || wrongAccount;
+  // Shares bought here: this run's deposit confirmed, or an earlier allocation's deposit that succeeded.
+  const deposited = (plan?.legs ?? []).some((leg) => leg.kind === "vault" && states[leg.key]?.status === "confirmed")
+    || earlier.some(({ record, result }) => result.status === "SUCCESS" && record.leg?.startsWith("vault:"));
   const contract = (leg) => VAULT_LEGS.has(leg.kind) ? net.vault : leg.kind === "trustline" ? net.assets[leg.symbol].classic : net.router;
   return <section className="execution-routes">
     <h4>Execution — Stellar testnet transactions signed by your wallet · test funds only</h4>
@@ -382,6 +386,7 @@ export function ExecutionPanel({ net, owner, plan, states, open, earlier, prepEr
       {plan.legs.filter((leg) => states[leg.key]?.status === "confirmed").map((leg) =>
         <Receipt key={leg.key} net={net} label={legLabel(leg)} receipt={states[leg.key].receipt} />)}
     </>}
+    {deposited && <SharesInWallet net={net} />}
   </section>;
 }
 

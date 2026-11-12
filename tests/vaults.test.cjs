@@ -89,7 +89,7 @@ function desk(registry) {
   const runEffects = { ...React, useState: (initial) => [typeof initial === "function" ? initial() : initial, () => {}], useEffect: (fn) => { fn(); } };
   const lib = load("lib/vault.ts", { "@/lib/network": network, "@/components/stellar/walletKit": { signTx: async () => { throw new Error("not used"); } },
     "@/lib/quant": { quantRequest: async (p) => { calls.quant.push(p); return { status: "missing" }; } } });
-  const { default: VaultDesk } = load("components/VaultDesk.jsx", { react: runEffects, "@/lib/vault": lib, "@/lib/vaults": registry,
+  const { default: VaultDesk } = load("components/VaultDesk.jsx", { "@/components/SharesInWallet": load("components/SharesInWallet.jsx"), react: runEffects, "@/lib/vault": lib, "@/lib/vaults": registry,
     "@/components/NetworkSwitch": NetworkSwitch(registry),
     "@/stores/useStellarWalletStore": { __esModule: true, default: sel => sel({ address: null, connected: false }) },
     "@/components/stellar/walletKit": { initWalletKit: (config) => calls.init.push(config), connectWallet() {}, disconnectWallet() {} } },
@@ -159,4 +159,40 @@ test("every non-native market output has a changeTrust step before its swap (the
     if (asset.classic === "native") assert.deepEqual(keys, [`swap:${symbol}`]);
     else assert.deepEqual(keys, [`trustline:${symbol}`, `swap:${symbol}`]);
   }
+});
+
+test("after a deposit the vault page shows how to add the share token to a wallet", async () => {
+  const owner = sdk.Keypair.random().publicKey();
+  const real = load("lib/vault.ts", { "@/lib/network": network, "@/components/stellar/walletKit": {}, "@/lib/quant": { quantRequest: async () => ({ status: "missing" }) } });
+  // The client's receipts carry no kind: the desk tags each with the action it ran.
+  const receipt = (action) => ({ action, hash: "a".repeat(64), ledger: 1 });
+  const lib = { ...real, vaultClient: (net) => ({ ...real.vaultClient(net), readUsdcLine: async () => null, readPosition: async () => null, readIndexed: async () => ({}),
+    deposit: async () => receipt("Deposit 10 USDC"), withdraw: async () => receipt("Withdraw 1 USDC"), exitAll: async () => receipt("Full exit: redeem 1 shares") }) };
+  // The receipts list is the desk's only state that starts as []; effects do not run.
+  const desk = (receipts, updates = []) => load("components/VaultDesk.jsx", { "@/components/SharesInWallet": load("components/SharesInWallet.jsx"), "@/lib/vault": lib, "@/lib/vaults": vaults,
+    react: { ...React, useEffect() {}, useCallback: (fn) => fn, useMemo: (fn) => fn(), useRef: () => ({ current: 0 }),
+      useState: (initial) => Array.isArray(initial) && !initial.length ? [receipts, (fn) => updates.push(fn)] : [typeof initial === "function" ? initial() : initial, () => {}] },
+    "@/components/NetworkSwitch": NetworkSwitch(vaults),
+    "@/stores/useStellarWalletStore": { __esModule: true, default: sel => sel({ address: owner, connected: true, walletKind: "Varial" }) },
+    "@/components/stellar/walletKit": { initWalletKit() {}, connectWallet() {}, disconnectWallet() {} } },
+    { window: { location: { search: "" } } }).default;
+  // Run one action through the desk's own handler and return the receipts it leaves.
+  const act = async (receipts, pick) => {
+    const updates = [];
+    const tree = desk(receipts, updates)({ slug: "stellar_tf_vault", network: "testnet" });
+    const all = (node) => node == null || typeof node !== "object" ? [] : Array.isArray(node) ? node.flatMap(all) : [node, ...all(node.props?.children)];
+    const target = all(tree).find(pick);
+    assert.ok(target, "control found");
+    await (target.props.onSubmit ?? target.props.onClick)("1");
+    return updates.reduce((current, fn) => fn(current), receipts);
+  };
+  const html = (receipts) => renderToStaticMarkup(React.createElement(desk(receipts), { slug: "stellar_tf_vault", network: "testnet" }));
+  const NOTE = "Your vault shares in your wallet";
+  const afterWithdraw = await act([], (n) => n.props?.kind === "withdraw");
+  const afterExit = await act([], (n) => n.type === "button" && /redeem all/.test(JSON.stringify(n.props.children)));
+  for (const receipts of [[], afterWithdraw, afterExit]) assert.ok(!html(receipts).includes(NOTE), JSON.stringify(receipts));
+  const afterDeposit = await act(afterWithdraw, (n) => n.props?.kind === "deposit");
+  const page = html(afterDeposit);
+  const note = page.indexOf(NOTE);
+  assert.ok(note > page.indexOf("Deposit 10 USDC") && page.indexOf(TESTNET.vault, note) > note);
 });
