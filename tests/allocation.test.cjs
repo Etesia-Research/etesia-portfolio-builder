@@ -60,7 +60,7 @@ function builder(state = [], calls = { init: [] }) {
     "@/lib/prices": { referenceValue: () => null, fundingValue: () => null },
     "@/lib/quant": { fetchUniverse: () => new Promise(() => {}), quantRequest: () => new Promise(() => {}) },
     "@/lib/balances": { fetchHoldings: () => new Promise(() => {}) },
-  }, { window: { location: { search: "" }, history: { replaceState() {} } } }, "\nexport { CoinCard, CashReservePanel, AllocStage, ConnectScreen };");
+  }, { window: { location: { search: "" }, history: { replaceState() {} } } }, "\nexport { CoinCard, CashReservePanel, AllocStage, ConnectScreen, Sidecar };");
   return { ...mod, values, effects, TestnetExecution, ExecutionSimulation, render: () => { values.length = 0; effects.length = 0; return mod.default(); } };
 }
 const PRODUCTS = ["xlm", "etesia-tf", "aqua", "eth", "btc", "shx"].map(id => ({ id, tk: id.toUpperCase(), name: id, marketCap: {}, mcap: 1e6, sharpe: 1, analytics: null, allocationSupported: true }));
@@ -110,6 +110,58 @@ test("switching to testnet drops products and reserves without a testnet market,
   const aqua = nodes(testnet.render()).find(n => n.props?.coin?.id === "aqua");
   aqua.props.onToggle();
   assert.deepEqual(testnet.values[0], ["XLM", "ETESIA-TF"]);
+});
+
+test("the working basket labels the vault with the active network's deployment, as its card does", () => {
+  const h = builder();
+  const coins = [{ id: "etesia-tf", tk: "ETESIA-TF", name: "Etesia TF Vault", simulated: true }, { id: "xlm", tk: "XLM", name: "Stellar Lumens" }, { id: "aqua", tk: "AQUA", name: "Aquarius", simulated: true }];
+  const basket = (network) => text(h.Sidecar({ basket: ["ETESIA-TF", "XLM", "AQUA"], coins, network, analytics: null, analyticsLoading: false, removeFromBasket() {} }));
+  assert.ok(basket("testnet").includes(`Testnet vault · ${TESTNET.epoch}`));
+  assert.ok(basket("mainnet").includes("Mainnet vault not deployed yet"));
+  for (const network of ["testnet", "mainnet"]) {
+    assert.equal(basket(network).match(/Under construction · simulated/g)?.length, 1, network); // AQUA only
+    assert.ok(basket(network).includes("Stellar Lumens"), network);
+  }
+  assert.ok(text(card(h, PRODUCTS[1], "testnet")).includes(`Testnet vault · ${TESTNET.epoch}`));
+});
+
+const ALLOCATED = { requested_assets: ["xlm", "etesia-tf"], owner: "GOWNER", generated_at: "2026-11-12T00:00:00Z", model_version: "m", market_data_as_of: "2026-11-11T00:00:00Z", portfolio_value_usdc: 100,
+  positions: { "etesia-tf": { allocation_fraction: .8185, notional_usdc: 81.85, quantity: 81.8, mark_usdc: 1 }, xlm: { allocation_fraction: .1315, notional_usdc: 13.15, quantity: 89.3, mark_usdc: .147 },
+    ustry: { allocation_fraction: 0, notional_usdc: 0, quantity: 0, mark_usdc: 1 }, usdc: { allocation_fraction: .025, notional_usdc: 2.5, quantity: 2.5, mark_usdc: 1 }, xlm_buffer: { allocation_fraction: .025, notional_usdc: 2.5, quantity: 17, mark_usdc: .147 } },
+  parameters: { builder: { annual_volatility_budget: .25 }, cash_reserves: ["ustry"] }, allocated_sleeve_volatility: .1655883689913353,
+  binding_constraints: ["gross_allocation_cap"], diagnostics: [], funding: { symbol: "USDC", amount: "100" }, usdcUsd: 1 };
+
+test("a selected reserve left empty by the gross allocation cap is explained, with the budget that keeps one", () => {
+  const h = builder();
+  const note = (allocation) => text(h.AllocStage({ network: "testnet", allocation, coins: [], onReset() {} }));
+  assert.ok(note(ALLOCATED).includes("No USTRY reserve: fully invested, the selected products reach 16.56% annual volatility, below the 25.00% budget, so the model invests the 95% maximum and leaves no residual cash for the reserve. A volatility budget below 16.56% keeps a reserve."));
+  const funded = { ...ALLOCATED, binding_constraints: ["annual_volatility_budget"], allocated_sleeve_volatility: .1 };
+  assert.ok(!note(funded).includes("No USTRY reserve"));
+  assert.ok(note({ ...ALLOCATED, parameters: { ...ALLOCATED.parameters, cash_reserves: ["usdc", "ustry"] } }).includes("No USDC and USTRY reserve"));
+});
+
+test("once every testnet leg is executed, sections 02–04 unlock, input changes keep section 05, and only the account or network clears it", () => {
+  const state = [];
+  state[3] = "allocated"; state[4] = ALLOCATED; state[16] = "testnet";
+  const h = builder(state);
+  const locked = (tree) => nodes(tree).some(n => n.props?.className === "locked");
+  let tree = h.render();
+  assert.ok(locked(tree), "inputs locked while the allocation runs");
+  const invalidate = (b) => b.effects.find(fn => fn.toString().includes("buildRequest.current?.abort();") && fn.toString().includes("executed"))();
+  nodes(tree).find(n => n.props?.onExecuted).props.onExecuted();
+  assert.equal(h.values[3], "executed");
+  const after = builder([...h.values]);
+  tree = after.render();
+  assert.ok(!locked(tree), "inputs unlocked after every leg executed");
+  assert.equal(nodes(tree).find(n => n.props?.onExecuted)?.props.allocation, ALLOCATED, "section 05 and its receipts stay");
+  invalidate(after);
+  assert.deepEqual([after.values[3], after.values[4]], ["executed", ALLOCATED], "an input change keeps section 05");
+  // Before execution, an input change still clears the allocation.
+  invalidate(h);
+  assert.deepEqual([h.values[3], h.values[4]], ["select", null]);
+  // The account and network effect clears an executed allocation too.
+  after.effects.find(fn => fn.toString().includes("fetchHoldings"))()(); // run, then clean up its refresh interval
+  assert.deepEqual([after.values[3], after.values[4]], ["select", null]);
 });
 
 // ---------- Leg run ----------
@@ -349,6 +401,25 @@ test("receipts render only for a SUCCESS, as testnet transactions and not simula
   assert.ok(html.includes("Soroswap testnet pool quote; testnet prices are not market prices"));
   assert.ok(html.includes("expected 13 XLM · minimum 12.935 XLM"));
   assert.ok(html.includes("Kept as USDC") && !/Simulat/.test(html));
+});
+
+test("a finished run reports it once to the Builder and keeps its records for the next build's acknowledgement", () => {
+  const plan = planFor();
+  const mine = plan.legs.map((leg, i) => ({ generatedAt: ALLOCATION.generated_at, leg: leg.key, hash: String(i + 1).repeat(64), outcome: { status: "SUCCESS", receipt: { hash: String(i + 1).repeat(64), ledger: 1 } } }));
+  const mount = (states) => {
+    const store = panel.pendingStore(() => memoryStorage({ [OWNER]: mine }));
+    const values = [store, plan, states, [], [], null, null, false], effects = [], finished = [];
+    const component = load("components/TestnetExecution.jsx", { "@/lib/vault": vaultLib, "@/lib/execution": execution,
+      "@/stores/useStellarWalletStore": { __esModule: true, default: (sel) => sel({ address: OWNER, networkError: null }) },
+      react: { ...React, useRef: () => ({ current: null }), useMemo: (fn) => fn(), useEffect: (fn) => effects.push(fn),
+        useState: () => [values.shift(), () => {}] } }).default;
+    component({ allocation: ALLOCATION, net: TESTNET, onFinished: () => finished.push(1) });
+    effects.filter(fn => fn.toString().includes("onFinished")).forEach(fn => fn());
+    return { finished, kept: store.list(OWNER).map(r => r.hash) };
+  };
+  const done = Object.fromEntries(plan.legs.map(leg => [leg.key, { status: "confirmed" }]));
+  assert.deepEqual(mount(done), { finished: [1], kept: mine.map(r => r.hash) });
+  assert.deepEqual(mount({ ...done, [plan.legs.at(-1).key]: { status: "failed" } }), { finished: [], kept: mine.map(r => r.hash) });
 });
 
 test("a wallet network mismatch or another account blocks signing", () => {

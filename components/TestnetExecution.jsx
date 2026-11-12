@@ -257,7 +257,7 @@ export function ExecutionPanel({ net, owner, plan, states, open, earlier, prepEr
   </section>;
 }
 
-export default function TestnetExecution({ allocation, net }) {
+export default function TestnetExecution({ allocation, net, onFinished }) {
   const client = useMemo(() => vaultClient(net), [net]);
   const [store] = useState(() => pendingStore());
   const address = useStellarWalletStore((s) => s.address);
@@ -284,6 +284,13 @@ export default function TestnetExecution({ allocation, net }) {
     }).catch((err) => { if (!cancelled) setPrepError(client.vaultError(err)); });
     return () => { cancelled = true; live.current = null; };
   }, [allocation, client, net, store]);
+
+  // Once every leg is done the Builder unlocks its inputs. The run's records
+  // stay stored, so the next build still lists them for acknowledgement.
+  const finished = !!plan && plan.legs.every((leg) => DONE.has(states[leg.key]?.status));
+  useEffect(() => {
+    if (finished) onFinished?.();
+  }, [finished]);
 
   const onRun = async () => {
     setRunning(true); setRunError(null);

@@ -235,11 +235,11 @@ function Sidecar({ basket, coins, removeFromBasket, analytics, analyticsLoading,
   return <aside className="sidecar">
     <h4>Working basket — {basket.length} {basket.length === 1 ? 'asset' : 'assets'}</h4>
     {!basket.length && <div className="empty">An empty page awaits the first pick.</div>}
-    {coins.filter(c => basket.includes(c.tk)).map(c => <div className="basket-row" key={c.tk}>
+    {coins.filter(c => basket.includes(c.tk)).map(c => { const vault = VAULTS.find(v => v.coin === c.id); return <div className="basket-row" key={c.tk}>
       <ProductLogo coin={c} />
-      <div><div className="tk">{c.tk}</div><div className="data-note">{c.simulated ? 'Under construction · simulated' : c.name}</div></div>
+      <div><div className="tk">{c.tk}</div><div className="data-note">{vault ? vaultStatus(network, vault.networks[network]) : c.simulated ? 'Under construction · simulated' : c.name}</div></div>
       <button className="rm" aria-label={`Remove ${c.tk}`} onClick={() => removeFromBasket(c.tk)}>×</button>
-    </div>)}
+    </div>; })}
     {basket.length > 0 && <div className="metrics" aria-live="polite" aria-busy={analyticsLoading}>
       <div className="row"><span className="lbl">Avg. pairwise correlation</span><span className="val">{analyticsLoading ? '…' : analytics?.average_pairwise_correlation?.toFixed(2) ?? '—'}</span></div>
       {!analyticsLoading && analytics?.pairwise_reason && <div className="data-note">{analytics.pairwise_reason}</div>}
@@ -386,7 +386,17 @@ function FundingPanel({ coins, allocationCoins, selectedHolding, setSelectedHold
 }
 
 
-function AllocStage({ allocation, coins, onReset, network }) {
+// With the 95% gross allocation cap binding, no residual cash is left for the
+// selected reserve: the products reach less volatility than the budget fully invested.
+function emptyReserveNote(allocation) {
+  if (!allocation.binding_constraints.includes('gross_allocation_cap') || allocation.allocated_sleeve_volatility == null) return null;
+  const reserves = (allocation.parameters?.cash_reserves ?? ['ustry']).map(id => id.toUpperCase()).join(' and ');
+  const budget = (allocation.parameters.builder.annual_volatility_budget * 100).toFixed(2);
+  const reached = (allocation.allocated_sleeve_volatility * 100).toFixed(2);
+  return `No ${reserves} reserve: fully invested, the selected products reach ${reached}% annual volatility, below the ${budget}% budget, so the model invests the 95% maximum and leaves no residual cash for the reserve. A volatility budget below ${reached}% keeps a reserve.`;
+}
+
+function AllocStage({ allocation, coins, onReset, network, onExecuted }) {
   const productAllocation = allocation.requested_assets.reduce((sum, id) => sum + (allocation.positions[id]?.allocation_fraction || 0), 0);
   const ordered = Object.entries(allocation.positions || {}).filter(([, p]) => p.allocation_fraction > 0).sort((a, b) => b[1].allocation_fraction - a[1].allocation_fraction);
   const coinFor = (id) => coins.find(c => c.id === id.replace('_buffer', '').replace('_reserve', ''));
@@ -415,7 +425,7 @@ function AllocStage({ allocation, coins, onReset, network }) {
     </div><button className="btn ghost" onClick={onReset}>← Revise basket</button></div>
     <p className="data-note">{network === 'testnet' ? 'Model targets · units at the daily-close marks. The testnet execution below fills at Soroswap testnet pool prices and the testnet vault’s share price, so the units received differ.' : 'Simulated allocation · reference quantities, no funds moved.'} Product allocation and estimated volatility include every selected product, including the vault. The volatility estimate uses the current risk model’s one-year history and excludes reserves and buffers. The three-year historical metrics below include the entire portfolio.</p>
     <AllocationSimulation allocation={allocation} />
-    {network === 'testnet' ? <TestnetExecution allocation={allocation} net={TESTNET} /> : <>
+    {network === 'testnet' ? <TestnetExecution allocation={allocation} net={TESTNET} onFinished={onExecuted} /> : <>
     <ExecutionSimulation allocation={allocation} funding={allocation.funding} usdcUsd={allocation.usdcUsd} vaultReason={simulatedShareReason(VAULTS.find(v => v.coin === 'etesia-tf'), network)} />
     {VAULTS.filter(v => allocation.positions?.[v.coin]?.notional_usdc > 0).map(v => {
       const leg = allocation.positions[v.coin].notional_usdc;
@@ -426,6 +436,7 @@ function AllocStage({ allocation, coins, onReset, network }) {
     })}
     </>}
     {allocation.binding_constraints.length > 0 && <p className="data-note">Model limits: {allocation.binding_constraints.map(c => c.replaceAll('_', ' ')).join(' · ')}</p>}
+    {emptyReserveNote(allocation) && <p className="data-note">{emptyReserveNote(allocation)}</p>}
     {allocation.diagnostics.length > 0 && <p className="data-note">{allocation.diagnostics.join(' · ')}</p>}
   </section>;
 }
@@ -548,11 +559,14 @@ export default function PortfolioBuilder() {
     return () => { controller.abort(); clearTimeout(timer); };
   }, [basketKey, coins]);
 
-  // Invalidate any pending calculation when its inputs or account change.
+  // Invalidate any pending calculation when its inputs or account change. An
+  // executed allocation and its receipts stay until the next build; the account
+  // and network effect below still clears them.
   useEffect(() => {
     buildRequest.current?.abort();
     setBuilding(false);
     setBuildError(null);
+    if (phase === 'executed') return;
     setAllocation(null);
     setPhase(address ? 'select' : 'connect');
     return () => buildRequest.current?.abort();
@@ -603,7 +617,7 @@ export default function PortfolioBuilder() {
     buildRequest.current?.abort();
     const controller = new AbortController();
     buildRequest.current = controller;
-    setBuilding(true); setBuildError(null); setAllocation(null);
+    setBuilding(true); setBuildError(null); setAllocation(null); setPhase('select');
     try {
       const result = await quantRequest('builder/targets', { assets: allocationCoins.map(c => c.id), portfolio_value_usdc: capital, annual_volatility_budget: Number(budget) / 100, ...(reserveKey === 'ustry' ? {} : { cash_reserves: cashReserves }) }, controller.signal);
       if (controller.signal.aborted) return;
@@ -636,7 +650,7 @@ export default function PortfolioBuilder() {
         <FundingPanel coins={coins} allocationCoins={allocationCoins} selectedHolding={holding} setSelectedHolding={setHolding} amount={amount} setAmount={setAmount} onBuild={onBuild} building={building} error={buildError} budget={budget} setBudget={setBudget} reserveValid={reserveValid} reserveSelector={<CashReservePanel network={network} selected={cashReserves} onChange={setCashReserves} supported={supportedReserves} coins={coins} />} />
       </>}
     </div>
-    {phase === 'allocated' && allocation?.owner === address && <><div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">05</span><h2>Allocation — model targets</h2><span className="meta">{network === 'testnet' ? 'Executed on Stellar testnet · wallet-signed' : 'Simulation only'}</span></div><AllocStage allocation={allocation} coins={coins} network={network} onReset={() => { setAllocation(null); setPhase('select'); }} /></>}
+    {(phase === 'allocated' || phase === 'executed') && allocation?.owner === address && <><div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">05</span><h2>Allocation — model targets</h2><span className="meta">{network === 'testnet' ? 'Executed on Stellar testnet · wallet-signed' : 'Simulation only'}</span></div><AllocStage allocation={allocation} coins={coins} network={network} onReset={() => { setAllocation(null); setPhase('select'); }} onExecuted={() => setPhase(current => current === 'allocated' ? 'executed' : current)} /></>}
     <footer className="data-footer"><span>ETESIA RESEARCH</span><span>{network === 'testnet' ? 'Testnet wallet balances · daily quant analytics · allocation executed as wallet-signed Stellar testnet transactions, test funds only' : 'Live wallet balances · daily quant analytics · simulated vault returns · allocation preview, no funds moved'}</span></footer>
   </div>;
 }

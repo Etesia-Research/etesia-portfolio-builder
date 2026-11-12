@@ -127,8 +127,12 @@ Same wallet setup, with test USDC from the Blend faucet. Expected page text is q
    reserve reads "Not selectable on testnet · no Soroswap testnet market for EURC"
    and the USTRY reserve reads "USTRY stand-in on testnet: Etesia-issued tRESERVE
    …". Select XLM and ETESIA-TF with the USTRY reserve, choose USDC (or XLM) as
-   the source, and build. With XLM, the funding leg keeps XLM back for fees and
-   the account reserve, so MAX swaps the rest.
+   the source, set the volatility budget to 10%, and build. At the default 25%
+   these two products reach about 16.6% volatility fully invested, so the 95%
+   gross allocation cap binds, the page shows "No USTRY reserve: …" and the run
+   has no tRESERVE legs; a budget below the level that note reports keeps a
+   reserve. With XLM, the funding leg keeps XLM back for fees and the account
+   reserve, so MAX swaps the rest.
 3. Under "Execution — Stellar testnet transactions signed by your wallet · test
    funds only", check every leg before signing: amount in, expected and minimum
    out (a swap's minimum is the Soroswap API quote's `otherAmountThreshold`; the
@@ -139,7 +143,10 @@ Same wallet setup, with test USDC from the Blend faucet. Expected page text is q
    `changeTrust` (skipped as "Trustline already present" when the account has
    it), the USDC → XLM and USDC → tRESERVE swaps, then the `deposit_bounded`.
    Each confirmed leg shows "Stellar testnet transaction, not a simulation · …"
-   with its ledger, returned amount and explorer link.
+   with its ledger, returned amount and explorer link. Once the button reads
+   "All legs executed", sections 02–04 unlock and section 05 keeps its receipts
+   until the next **Build risk-parity portfolio**; that build lists them as the
+   earlier allocation's receipts until **Acknowledge and allow this run**.
 5. Reject one signature: the run stops with "Signature request was rejected in
    the wallet. Nothing was submitted." and **Continue with the remaining legs**
    quotes the rest again.
