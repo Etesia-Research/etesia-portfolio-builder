@@ -3,7 +3,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import useStellarWalletStore from "@/stores/useStellarWalletStore";
 import { API_TX_SECONDS, DEADLINE_SECONDS, SHARE_DECIMALS, fromUnits, minBound, vaultClient } from "@/lib/vault";
-import { IMPACT_LIMIT_BPS, TOLERANCE, priceImpactBps, referenceIn, runKeep, testnetCheck, testnetLegs, tokenUnits } from "@/lib/execution";
+import { IMPACT_LIMIT_BPS, TOLERANCE, liquiditySwaps, priceImpactBps, referenceIn, runKeep, testnetCheck, testnetLegs, tokenUnits } from "@/lib/execution";
+import { quantRequest } from "@/lib/quant";
 
 // Testnet execution of a Builder allocation: the rebalance of the selected
 // sources to the allocation's targets, where every leg is a real Stellar testnet
@@ -134,11 +135,26 @@ export async function valueSources(client, sources, position) {
   })));
 }
 
+// The quant service's testnet liquidity top-up (A98) for the planned swaps:
+// it may add Etesia-supplied liquidity to their Soroswap pools so that each
+// swap's impact is at most 1%. It never throws: a failure is reported as
+// unavailable, and the price impact limit still decides. null without swaps.
+async function topUp(owner, build, legs) {
+  const swaps = liquiditySwaps(legs);
+  if (!swaps.length) return null;
+  try {
+    return await quantRequest("testnet/liquidity", { owner, build, swaps });
+  } catch (err) {
+    return { status: "unavailable", reason: err instanceof Error ? err.message : "Testnet liquidity request failed" };
+  }
+}
+
 // Before anything can be signed: resolve the owner's stored envelopes (an
 // unresolved one blocks the run; one that may have executed is listed as an
 // earlier allocation's), read the account (and the vault position for vault
 // legs), plan the rebalance from the valuation fixed when the allocation was
-// built, and quote the legs: first the sells at the amounts they sell (against
+// built, ask for the testnet liquidity top-up of its swaps (plan.liquidity),
+// and only then quote the legs: first the sells at the amounts they sell (against
 // the reference rate their source was valued at), whose minimums, 0.5% below
 // the quotes', size the buys; then the other legs. A sell without a quote
 // throws, so the run cannot start on buys sized without it. A swap above the
@@ -158,7 +174,9 @@ export async function prepareRun(client, allocation, net, store) {
     else earlier.push({ record, result });
   }
   const account = await client.readUsdcLine(owner);
-  const sellLegs = testnetLegs(allocation, net).legs.filter((leg) => leg.kind === "sell");
+  const planned = testnetLegs(allocation, net).legs;
+  const liquidity = await topUp(owner, allocation.generated_at, planned);
+  const sellLegs = planned.filter((leg) => leg.kind === "sell");
   const sells = await quoteLegs(client, sellLegs, (leg) => allocation.valuation[leg.symbol]?.ref);
   const unquoted = sellLegs.find((leg) => sells[leg.key].error);
   if (unquoted) throw new Error(`${legLabel(unquoted)} has no quote (${sells[unquoted.key].error}), and the buys are sized on it. Nothing was signed; rebuild the allocation once the Soroswap API answers.`);
@@ -166,7 +184,7 @@ export async function prepareRun(client, allocation, net, store) {
   const { legs, kept, rows, capital } = testnetLegs(allocation, net, sold);
   const position = legs.some((leg) => VAULT_LEGS.has(leg.kind)) ? await client.readPosition(owner) : null;
   const quotes = { ...await quoteLegs(client, legs.filter((leg) => leg.kind !== "sell")), ...sells };
-  return { plan: { legs, kept, rows, capital, quotes, check: testnetCheck(legs, account, position), impact: impactProblem(legs, quotes), xlmKept: runKeep(legs, account) }, open, earlier };
+  return { plan: { legs, kept, rows, capital, quotes, check: testnetCheck(legs, account, position), impact: impactProblem(legs, quotes), xlmKept: runKeep(legs, account), liquidity }, open, earlier };
 }
 
 async function executeLeg(client, owner, leg, account, onSigned) {
@@ -265,6 +283,24 @@ function Receipt({ net, label, receipt }) {
   </div>;
 }
 
+// The testnet liquidity top-up's outcome (prepareRun), labelled as
+// Etesia-supplied testnet liquidity, not market depth. An addition's amounts
+// are keyed by asset contract, in units.
+function LiquidityStatus({ net, liquidity }) {
+  const symbol = (address) => Object.values(net.assets).find((a) => a.address === address)?.symbol ?? address;
+  const added = (liquidity.additions ?? []).map((addition, i) => {
+    const amounts = Object.entries(addition.amounts ?? {}).map(([asset, amount]) => [symbol(asset), amount]);
+    const others = amounts.filter(([s]) => s !== 'USDC');
+    return <span key={addition.tx_hash ?? i}>{i ? '; ' : ''}added {[...amounts.filter(([s]) => s === 'USDC'), ...others].map(([s, amount]) => `${tokenUnits(amount)} ${s}`).join(' + ')} to {[...others.map(([s]) => s), 'USDC'].join('/')} (tx <a href={`${net.explorerUrl}/tx/${addition.tx_hash}`} target="_blank" rel="noreferrer">{addition.tx_hash}</a>)</span>;
+  });
+  const limit = `; the ${IMPACT_LIMIT_BPS / 100}% limit still applies.`;
+  const outcome = liquidity.status === 'ready' ? 'pools deep enough'
+    : liquidity.status === 'topped_up' ? added
+    : liquidity.status === 'partial' ? <>{added}{added.length ? ' · ' : ''}partial{liquidity.reason ? `: ${liquidity.reason}` : ''}{limit}</>
+    : `unavailable${liquidity.reason ? `: ${liquidity.reason}` : ''}${limit}`;
+  return <p role="status" className="data-note" data-liquidity={liquidity.status}>Testnet liquidity · Etesia-supplied, not market depth: {outcome}</p>;
+}
+
 // One rebalance row's trade, as the legs below execute it (a symbol outside
 // the manifest assets is the vault).
 function tradeText(row, net) {
@@ -288,11 +324,12 @@ export function ExecutionPanel({ net, owner, plan, states, open, earlier, prepEr
   return <section className="execution-routes">
     <h4>Execution — Stellar testnet transactions signed by your wallet · test funds only</h4>
     <p className="data-note">One transaction per leg, each signed in your wallet: trustlines for bought assets, the sells of the selected sources (Soroswap swaps to USDC, then the vault withdraw or redeem), then the buys (Soroswap swaps from USDC, then the vault deposit). Every swap is quoted and built by the Soroswap Aggregator API on its testnet Soroswap pools (each invokes the router {net.router}). Soroswap testnet pool quote; testnet prices are not market prices. A swap's minimum output is the API's minimum at {net.soroswap.slippageBps / 100}% slippage (a sell is signed only while that minimum covers the USDC the plan counts on) and the vault calls allow 0.5% against their previews. The testnet pools are shallow: a swap whose price impact against a one-unit reference quote is above {IMPACT_LIMIT_BPS / 100}% is not signed. Each swap is quoted and built again right before its signature and expires {API_TX_SECONDS} seconds after it is built; the other transactions expire after {DEADLINE_SECONDS} seconds.</p>
+    <p className="data-note">Before quoting, Etesia's quant service may add testnet liquidity from its own float (account etesia-liquidity) to the Soroswap pools at their current price, so that each swap's impact is at most 1%.</p>
     {!storageOk && <p role="alert" className="data-note" style={{ color: 'var(--warn)' }}>Browser storage is unavailable, so a reload cannot recover a transaction that is still pending. Check your account on the explorer (<a href={`${net.explorerUrl}/account/${owner}`} target="_blank" rel="noreferrer">{owner}</a>) before running again.</p>}
     {networkError && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>{networkError}</p>}
     {wrongAccount && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>The connected account is not the one this allocation was built for. Rebuild it to execute.</p>}
     {prepError && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>{prepError}</p>}
-    {!plan && !prepError && <p role="status" className="data-note">Reading the testnet account, pending transactions and Soroswap testnet quotes…</p>}
+    {!plan && !prepError && <p role="status" className="data-note">Reading the testnet account, pending transactions, testnet liquidity and Soroswap testnet quotes…</p>}
     {open.map((record) => <div key={record.hash} role="alert" className="execution-quote">
       <strong>Pending transaction</strong>
       <span>{record.action} · <a href={`${net.explorerUrl}/tx/${record.hash}`} target="_blank" rel="noreferrer">{record.hash}</a></span>
@@ -303,6 +340,7 @@ export function ExecutionPanel({ net, owner, plan, states, open, earlier, prepEr
       : <p key={record.hash} className="data-note">Earlier transaction <a href={`${net.explorerUrl}/tx/${record.hash}`} target="_blank" rel="noreferrer">{record.hash}</a> ({record.action}) {result.status === "FAILED" ? "failed onchain; only the fee was charged" : result.status === "EXPIRED" ? "expired without being included" : "can no longer be included, but it is outside the RPC's retained history, so whether it executed is unknown; check it on the explorer"}.</p>)}
     {repeats.length > 0 && <p role="alert" className="data-note" style={{ color: 'var(--warn)' }}>{repeats.length === 1 ? 'A transaction' : `${repeats.length} transactions`} of an earlier allocation executed or may have executed: {repeats.map(({ record }) => record.action).join(' · ')}. They are not deducted from this allocation, so running it executes its legs in full again. <button className="btn ghost" disabled={running} onClick={onAcknowledge}>Acknowledge and allow this run</button></p>}
     {plan && <>
+      {plan.liquidity && <LiquidityStatus net={net} liquidity={plan.liquidity} />}
       <div className="execution-quote-list" data-table="rebalance">
         <div className="execution-quote"><strong>Rebalance — current vs target</strong><span className="data-note">The selected parts of your holdings, valued when built at Soroswap testnet spot rates (one-unit quotes) and the vault's share value, against the model targets of their value. Unselected holdings are untouched.</span></div>
         {plan.rows.map((row) => <div className="execution-quote" key={row.symbol} data-bucket={row.symbol}>

@@ -186,6 +186,17 @@ export function testnetLegs(allocation: Sourced, net: VaultNetworkConfig, sold: 
   return { legs: [...trustlines, ...sells, ...exits, ...buys, ...deposits], kept: plan.kept, rows: plan.rows, capital: plan.capital };
 }
 
+// A testnet build allocates at most this much of the selected sources' value
+// (A98, A99): a larger selection is scaled down proportionally.
+export const TESTNET_CAPITAL_CAP = BigInt(100) * SCALE;
+
+// The swaps of a run as the quant service's testnet liquidity top-up takes
+// them (POST /v1/testnet/liquidity): sells at the asset amounts they sell,
+// buys at the USDC amounts they spend. Vault legs and trustlines are not swaps.
+export function liquiditySwaps(legs: Leg[]) {
+  return legs.filter((l) => l.kind === "sell" || l.kind === "swap").map((l) => ({ asset_in: l.path[0], asset_out: l.path[1], amount_in: String(l.amountIn) }));
+}
+
 // Price impact guard. A swap's reference rate is a Soroswap API quote of one
 // whole unit (or of the swap's amount, if smaller) of the same pair and
 // direction. The pool fee is in both quotes, so their ratio isolates the

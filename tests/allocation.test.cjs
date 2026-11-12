@@ -25,7 +25,11 @@ const vaults = load("lib/vaults.ts", { "@/lib/network": network });
 const assets = load("lib/assets.ts");
 const execution = load("lib/execution.ts", { "@/lib/network": network, "@/lib/vaults": vaults, "@/lib/assets": assets, "@/lib/quant": {} });
 const vaultLib = load("lib/vault.ts", { "@/lib/network": network, "@/lib/quant": {}, "@/components/stellar/walletKit": { signTx: async () => { throw new Error("not used"); } } });
-const panel = load("components/TestnetExecution.jsx", { "@/lib/vault": vaultLib, "@/lib/execution": execution,
+// The quant service's testnet liquidity top-up as prepareRun calls it: each
+// call is recorded and answered by liquidity.reply (by default, deep enough).
+const liquidity = { calls: [], reply: async () => ({ status: "ready", additions: [] }) };
+const quant = { quantRequest: async (endpoint, body) => { liquidity.calls.push({ endpoint, body }); return liquidity.reply(endpoint, body); } };
+const panel = load("components/TestnetExecution.jsx", { "@/lib/vault": vaultLib, "@/lib/execution": execution, "@/lib/quant": quant,
   "@/stores/useStellarWalletStore": { __esModule: true, default: () => null } });
 
 function nodes(node) {
@@ -468,7 +472,7 @@ test("a finished run reports it once to the Builder and keeps its records for th
   const mount = (states) => {
     const store = panel.pendingStore(() => memoryStorage({ [OWNER]: mine }));
     const values = [store, plan, states, [], [], null, null, false], effects = [], finished = [];
-    const component = load("components/TestnetExecution.jsx", { "@/lib/vault": vaultLib, "@/lib/execution": execution,
+    const component = load("components/TestnetExecution.jsx", { "@/lib/vault": vaultLib, "@/lib/execution": execution, "@/lib/quant": quant,
       "@/stores/useStellarWalletStore": { __esModule: true, default: (sel) => sel({ address: OWNER, networkError: null }) },
       react: { ...React, useRef: () => ({ current: null }), useMemo: (fn) => fn(), useEffect: (fn) => effects.push(fn),
         useState: () => [values.shift(), () => {}] } }).default;
@@ -629,6 +633,59 @@ test("a sell whose prepareRun quote fails blocks the plan, so no run starts on a
   const states = {};
   assert.equal(await panel.runLegs({ client: c, owner: OWNER, generatedAt: ALLOCATION.generated_at, legs: plan.legs, states, store: null, update: (key, state) => { states[key] = state; } }), true);
   assert.equal(states["sell:XLM"].status, "confirmed");
+});
+
+// The dry run's pools after a top-up at their ratio: same mid, 10× and 100× deeper.
+const DEEPENED = pools({ XLM: 651660n * XLM, USDC: 88500n * XLM }, { tRESERVE: 100000n * XLM, USDC: 100000n * XLM });
+const DRY_RUN = { xlm: .1, xlm_buffer: .025, "etesia-tf": .45, ustry: .4, usdc: .025 };
+
+test("prepareRun asks for the testnet liquidity top-up of the planned swaps after reading the account and before any quote, so the quotes see the deeper pools", async () => {
+  let quote = SHALLOW;
+  const c = client({ quote: (...args) => quote(...args), account: RICH });
+  const allocation = await xlmAllocation(c, 10115n * XLM, DRY_RUN);
+  c.log.length = 0;
+  c.readUsdcLine = async () => { c.log.push("account"); return RICH; };
+  const reply = { request_id: "f".repeat(64), status: "topped_up", max_impact_bps: 100, swaps: [], reason: null,
+    additions: [{ pair: TESTNET.assets.XLM.address, amounts: { [TESTNET.assets.XLM.address]: "77310000000", [TESTNET.usdc.contract]: "10500000000" }, lp_minted: "1", tx_hash: "a".repeat(64), ledger: 7 }] };
+  liquidity.calls.length = 0;
+  liquidity.reply = async () => { c.log.push("liquidity"); quote = DEEPENED; return reply; };
+  try {
+    const { plan } = await panel.prepareRun(c, allocation, TESTNET, null);
+    const swaps = execution.liquiditySwaps(execution.testnetLegs(allocation, TESTNET).legs);
+    assert.deepEqual(swaps.map(s => [s.asset_in, s.asset_out]), [[TESTNET.assets.XLM.address, TESTNET.usdc.contract], [TESTNET.usdc.contract, TESTNET.assets.tRESERVE.address]]);
+    assert.deepEqual(liquidity.calls, [{ endpoint: "testnet/liquidity", body: { owner: OWNER, build: ALLOCATION.generated_at, swaps } }]);
+    assert.deepEqual(c.log.slice(0, 3), ["account", "liquidity", "quote XLM→USDC"]);
+    assert.equal(plan.liquidity, reply);
+    // On the deeper pools the dry run's swaps are within the 2% limit.
+    assert.equal(plan.impact, null);
+    const html = render({ plan, states: {} });
+    assert.ok(html.includes("Before quoting, Etesia&#x27;s quant service may add testnet liquidity from its own float (account etesia-liquidity) to the Soroswap pools at their current price, so that each swap&#x27;s impact is at most 1%."));
+    assert.ok(html.includes(`Testnet liquidity · Etesia-supplied, not market depth: <span>added 1050.0000000 USDC + 7731.0000000 XLM to XLM/USDC (tx <a href="${TESTNET.explorerUrl}/tx/${"a".repeat(64)}"`));
+    assert.ok(render({ plan: { ...plan, liquidity: { status: "ready", additions: [] } }, states: {} }).includes("Testnet liquidity · Etesia-supplied, not market depth: pools deep enough"));
+  } finally {
+    liquidity.reply = async () => ({ status: "ready", additions: [] });
+  }
+});
+
+test("a failed liquidity request never throws: the plan reports it unavailable and the 2% limit still decides", async () => {
+  const c = client({ quote: SHALLOW, account: RICH });
+  const allocation = await xlmAllocation(c, 10115n * XLM, DRY_RUN);
+  liquidity.reply = async () => { throw new Error("Testnet liquidity is busy; retry"); };
+  try {
+    const { plan } = await panel.prepareRun(c, allocation, TESTNET, null);
+    assert.deepEqual(plan.liquidity, { status: "unavailable", reason: "Testnet liquidity is busy; retry" });
+    assert.match(plan.impact, /^Sell · XLM → USDC: price impact \d+\.\d\d% is above the 2% limit/);
+    const html = render({ plan, states: {} });
+    assert.ok(html.includes("Testnet liquidity · Etesia-supplied, not market depth: unavailable: Testnet liquidity is busy; retry; the 2% limit still applies."));
+    assert.ok(runButton(html)[1], "the run stays blocked above the limit");
+  } finally {
+    liquidity.reply = async () => ({ status: "ready", additions: [] });
+  }
+  // A run without swaps (USDC into the vault only) asks for nothing.
+  liquidity.calls.length = 0;
+  const { plan } = await panel.prepareRun(client(), { ...ALLOCATION, positions: { "etesia-tf": { allocation_fraction: .975 }, usdc: { allocation_fraction: .025 } } }, TESTNET, null);
+  assert.deepEqual([liquidity.calls, plan.liquidity], [[], null]);
+  assert.ok(!render({ plan, states: {} }).includes("Testnet liquidity ·"));
 });
 
 test("a wallet network mismatch or another account blocks signing", () => {

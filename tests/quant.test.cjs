@@ -88,6 +88,50 @@ test("proxy restricts endpoints, keeps credentials server-side, and sanitizes up
 });
 
 
+test("the testnet liquidity path sends its own key and the client's first forwarded hop, and reports a busy or rate-limited top-up", async () => {
+  const route = "app/api/quant/[...path]/route.ts";
+  const env = { ETESIA_API_URL: "quant.example.test", ETESIA_API_KEY: "private-test-key", ETESIA_LIQUIDITY_API_KEY: "liquidity-test-key" };
+  const calls = [];
+  let status = 200;
+  const proxy = load(route, {}, { process: { env }, fetch: async (url, options) => {
+    calls.push({ url: String(url), options });
+    return status === 200 ? Response.json({ status: "ready" }) : new Response("upstream detail", { status, headers: { "Retry-After": "15" } });
+  } });
+  const context = endpoint => ({ params: Promise.resolve({ path: endpoint.split("/") }) });
+  const body = { owner: "G".padEnd(56, "A"), build: "2026-11-12T00:00:00Z", swaps: [{ asset_in: "CIN", asset_out: "COUT", amount_in: "10" }] };
+  const post = (headers = {}) => new Request("http://localhost/api/quant/testnet/liquidity", { method: "POST", headers: { "Content-Type": "application/json", ...headers }, body: JSON.stringify(body) });
+  let response = await proxy.POST(post({ "X-Forwarded-For": "203.0.113.7, 10.0.0.1" }), context("testnet/liquidity"));
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { status: "ready" });
+  assert.equal(calls[0].url, "https://quant.example.test/v1/testnet/liquidity");
+  assert.deepEqual(JSON.parse(calls[0].options.body), body);
+  assert.equal(calls[0].options.headers.Authorization, "Bearer liquidity-test-key");
+  assert.equal(calls[0].options.headers["X-Etesia-Client"], "203.0.113.7");
+  // Without a forwarded hop no client header is sent; other paths keep the quant key and never send one.
+  await proxy.POST(post(), context("testnet/liquidity"));
+  assert.ok(!("X-Etesia-Client" in calls[1].options.headers));
+  await proxy.POST(new Request("http://localhost", { method: "POST", headers: { "X-Forwarded-For": "203.0.113.7" }, body: JSON.stringify({ asset_in: "A", asset_out: "B", amount: "1" }) }), context("quotes"));
+  assert.equal(calls[2].options.headers.Authorization, "Bearer private-test-key");
+  assert.ok(!("X-Etesia-Client" in calls[2].options.headers));
+  for (const code of [409, 429]) {
+    status = code;
+    response = await proxy.POST(post(), context("testnet/liquidity"));
+    assert.equal(response.status, code);
+    assert.deepEqual(await response.json(), { error: "Testnet liquidity is busy; retry" });
+  }
+  // The same codes elsewhere keep the generic message.
+  response = await proxy.POST(new Request("http://localhost", { method: "POST", body: "{}" }), context("quotes"));
+  assert.deepEqual(await response.json(), { error: "Quant service is temporarily unavailable" });
+  assert.equal((await proxy.GET(new Request("http://localhost"), context("testnet/liquidity"))).status, 404);
+  // Without its own key the path is not configured, even with the quant key, and nothing is sent.
+  const sent = calls.length;
+  const unconfigured = load(route, {}, { process: { env: { ...env, ETESIA_LIQUIDITY_API_KEY: "" } }, fetch: async (...args) => { calls.push(args); return Response.json({}); } });
+  response = await unconfigured.POST(post(), context("testnet/liquidity"));
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), { error: "Testnet liquidity is not configured" });
+  assert.equal(calls.length, sent);
+});
+
 test("allocation simulation merges buffers and reserve positions without omitting capital", () => {
   const quant = load("lib/quant.ts", { "@/lib/assets": assets });
   const positions = Object.fromEntries(Object.entries({ xlm: .2, xlm_buffer: .025, usdc: .025, usdc_reserve: .25, ustry: .5, btc: 0 })

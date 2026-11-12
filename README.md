@@ -22,11 +22,16 @@ Set these **server-only** variables in the ignored `.env.local`:
 ```dotenv
 ETESIA_API_URL=https://your-quant-api.example
 ETESIA_API_KEY=your-private-server-key
+ETESIA_LIQUIDITY_API_KEY=your-private-liquidity-key
 SOROSWAP_API_KEY=sk_your-soroswap-key
 ```
 
 A hostname without a scheme is interpreted as HTTPS. The browser calls the
 allowlisted `/api/quant/` proxy; the bearer key never enters browser requests.
+Its `testnet/liquidity` path (the quant service's A98 testnet liquidity top-up)
+sends `ETESIA_LIQUIDITY_API_KEY` instead, forwards the first `X-Forwarded-For`
+hop as `X-Etesia-Client` for the service's per-client limits, and reports a busy
+or rate-limited top-up (409, 429) as "Testnet liquidity is busy; retry".
 No Soroswap credential is needed in the frontend. The quant service owns the
 mainnet quotes. Testnet allocation swaps call the allowlisted
 `/api/soroswap/quote` and `/api/soroswap/build` route, which holds
@@ -137,13 +142,24 @@ Same wallet setup, with test USDC from the Blend faucet. Expected page text is q
    a budget below the level that note reports keeps a reserve. The capital line
    reads "Valued at testnet Soroswap spot rates (one-unit quotes) and the
    vault's share value when built": XLM and tRESERVE are valued at a quote of
-   one whole unit, not of the whole holding. The testnet pools are shallow
-   (XLM/USDC about 65,000 / 8,850, tRESERVE/USDC about 1,000 / 1,000), so use
-   small percentages: a few hundred XLM or tens of USDC per trade. An invalid percentage (below 1, above 100 or more than two decimals)
+   one whole unit, not of the whole holding. It also reads "Testnet builds use
+   at most 100 USDC of the selected value; a larger selection is scaled down
+   proportionally."; a larger selection builds with every source's percentage
+   scaled down, and section 05 reads "Capped: X USDC selected, scaled to 100
+   USDC (Y% of each source)." The testnet pools are shallow (XLM/USDC about
+   65,000 / 8,850, tRESERVE/USDC about 1,000 / 1,000). An invalid percentage (below 1, above 100 or more than two decimals)
    reads "Enter a percentage from 1 to 100, with at most two decimals." and
    blocks the build.
 3. Under "Execution — Stellar testnet transactions signed by your wallet · test
-   funds only", the "Rebalance — current vs target" rows show each bucket's
+   funds only", the page reads "Before quoting, Etesia's quant service may add
+   testnet liquidity from its own float (account etesia-liquidity) to the
+   Soroswap pools at their current price, so that each swap's impact is at most
+   1%." Before the quotes, the Builder asks the quant service's testnet
+   liquidity top-up for the run's swaps; its outcome reads "Testnet liquidity ·
+   Etesia-supplied, not market depth: pools deep enough", "… added A USDC + B
+   XLM to XLM/USDC (tx …)" with the explorer link, or "… unavailable: reason;
+   the 2% limit still applies." (a failed request never blocks the run by
+   itself). The "Rebalance — current vs target" rows show each bucket's
    selected quantity and USDC value, its target and its trade. Check every leg
    before signing: amount in, expected and minimum out (a swap's minimum is the
    Soroswap API quote's `otherAmountThreshold`; a sell also shows the USDC the

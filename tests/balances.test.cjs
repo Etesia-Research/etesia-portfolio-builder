@@ -249,6 +249,36 @@ test("a testnet build values the selected sources at testnet execution prices, s
   assert.equal(failed.h.quantRequests.length, 0);
 });
 
+test("a testnet selection worth more than 100 USDC is scaled down: every source's percent and quantity by 100/value, valued again, and the cap is stored and shown", async () => {
+  const valued = [];
+  // 400 USDC selected, then 100 USDC once each part is a quarter of what it was.
+  const replies = [
+    { XLM: { quantity: 940000000n, value: 1500000000n, minOut: 1492500000n }, "ETESIA-TF": { quantity: 40665000000000n, value: 2500000000n, minOut: 2487500000n, maxWithdraw: 818500000n } },
+    { XLM: { quantity: 235000000n, value: 375000000n, minOut: 373125000n }, "ETESIA-TF": { quantity: 10166250000000n, value: 625000000n, minOut: 621875000n, maxWithdraw: 818500000n } },
+  ];
+  const { h, props, tree } = testnetPage({ XLM: "100", "ETESIA-TF": "50" }, { vaultClient: () => "client", valueSources: async (...args) => { valued.push(args); return replies[valued.length - 1]; } });
+  assert.match(text(tree), /Testnet builds use at most 100 USDC of the selected value; a larger selection is scaled down proportionally\./);
+  const pending = props.onBuild();
+  await flush();
+  assert.equal(valued.length, 2);
+  assert.deepEqual(valued[1], ["client", [{ symbol: "XLM", percent: 25, quantity: 235000000n }, { symbol: "ETESIA-TF", percent: 12.5, quantity: 10166250000000n }], TESTNET_ACCOUNT.position]);
+  assert.equal(h.quantRequests[0].body.portfolio_value_usdc, 100);
+  h.quantRequests[0].resolve({ status: "valid", positions: { xlm: {} } });
+  await pending;
+  assert.deepEqual([h.state[4].sources, h.state[4].valuation, h.state[4].capped], [valued[1][1], replies[1], { from: 4000000000n, to: 1000000000n }]);
+  const stage = (capped) => text(h.AllocStage({ network: "testnet", allocation: { ...allocationWith({ xlm: { allocation_fraction: 1, notional_usdc: 100, quantity: 700 } }), ...(capped && { capped }) }, coins: [], onReset() {} }));
+  assert.ok(stage({ from: 4000000000n, to: 1000000000n }).includes("Capped: 400 USDC selected, scaled to 100 USDC (25.00% of each source)."));
+  assert.ok(!stage(null).includes("Capped"));
+  // At or below the cap: valued once, nothing scaled or stored.
+  const below = testnetPage({ XLM: "100" }, { vaultClient: () => "client", valueSources: async (...args) => { valued.push(args); return { XLM: { quantity: 940000000n, value: 1000000000n, minOut: 995000000n } }; } });
+  valued.length = 0;
+  const done = below.props.onBuild();
+  await flush();
+  below.h.quantRequests[0].resolve({ status: "valid", positions: { xlm: {} } });
+  await done;
+  assert.deepEqual([valued.length, below.h.quantRequests[0].body.portfolio_value_usdc, "capped" in below.h.state[4]], [1, 100, false]);
+});
+
 test("after a finished testnet run the holdings and the vault position are read again for the same owner", async () => {
   const reads = [];
   const client = { readUsdcLine: async (owner) => { reads.push(owner); return TESTNET_ACCOUNT.account; }, readPosition: async () => ({ ...TESTNET_ACCOUNT.position, shares: 1n }), vaultError: (err) => err.message };

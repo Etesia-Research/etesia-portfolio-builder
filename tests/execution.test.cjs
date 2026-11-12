@@ -267,3 +267,16 @@ test("an allocation holding a product without a testnet market is refused", () =
   assert.deepEqual(["xlm", "xlm_buffer", "etesia-tf", "ustry", "usdc", "usdc_reserve", "eurc", "btc", "aqua", "eth", "shx"].filter(id => testnetSelectable(id, TESTNET)),
     ["xlm", "xlm_buffer", "etesia-tf", "ustry", "usdc", "usdc_reserve"]);
 });
+
+test("liquiditySwaps: sells at the asset amounts they sell, buys at the USDC they spend; trustlines and vault legs are not swaps; the testnet build cap is 100 USDC", () => {
+  const h = harness();
+  const { legs } = h.testnetLegs(sourced(mix, { XLM: [100, 1000000000n, 200000000n, 199000000n] }), TESTNET);
+  assert.deepEqual(legs.map(l => l.key), ["trustline:tRESERVE", "sell:XLM", "swap:tRESERVE", "vault:etesia-tf"]);
+  const [, sell, buy] = legs;
+  assert.deepEqual(h.liquiditySwaps(legs), [
+    { asset_in: TESTNET.assets.XLM.address, asset_out: TESTNET.usdc.contract, amount_in: String(sell.amountIn) },
+    { asset_in: TESTNET.usdc.contract, asset_out: TESTNET.assets.tRESERVE.address, amount_in: String(buy.amountIn) },
+  ]);
+  assert.deepEqual(h.liquiditySwaps(legsOf({ "etesia-tf": .975, usdc: .025 }).legs), []);
+  assert.equal(h.TESTNET_CAPITAL_CAP, 1000000000n);
+});

@@ -12,7 +12,7 @@ import TestnetExecution, { valueSources } from "@/components/TestnetExecution";
 import AllocationSimulation from "@/components/AllocationSimulation";
 import useBalanceStore from "@/stores/useBalanceStore";
 import { fetchHoldings } from "@/lib/balances";
-import { testnetSelectable, tokenUnits, xlmSourceKeep } from "@/lib/execution";
+import { TESTNET_CAPITAL_CAP, testnetSelectable, tokenUnits, xlmSourceKeep } from "@/lib/execution";
 import { SHARE_DECIMALS, fromUnits, vaultClient } from "@/lib/vault";
 import { MAINNET, TESTNET } from "@/lib/network";
 import { VAULTS, builderHref, builderNetwork, vaultHref } from "@/lib/vaults";
@@ -409,7 +409,7 @@ function FundingPanel({ coins, allocationCoins, network = 'mainnet', testnet, so
         <div className="note">
           <div>{allocationCoins.length ? `Allocation products: ${allocationCoins.map(c => c.tk).join(', ')}.` : 'Select a product with an available allocation model.'}</div>
           {unsupported.length > 0 && <div>Allocation API update required for {unsupported.map(c => c.tk).join(', ')}.</div>}
-          <div>{network === 'testnet' ? "Valued at testnet Soroswap spot rates (one-unit quotes) and the vault's share value when built, including reserves and buffers."
+          <div>{network === 'testnet' ? "Valued at testnet Soroswap spot rates (one-unit quotes) and the vault's share value when built, including reserves and buffers. Testnet builds use at most 100 USDC of the selected value; a larger selection is scaled down proportionally."
             : capital == null ? 'A fresh source close and matching USDC/USD close are required.' : `Hypothetical capital: ${capital.toLocaleString(undefined, { maximumFractionDigits: 2 })} USDC, including reserves and buffers.`}</div>
           {error && <div role="alert" style={{ color: 'var(--bad)' }}>{error}</div>}
         </div>
@@ -430,6 +430,8 @@ function emptyReserveNote(allocation) {
   const reached = (allocation.allocated_sleeve_volatility * 100).toFixed(2);
   return `No ${reserves} reserve: fully invested, the selected products reach ${reached}% annual volatility, below the ${budget}% budget, so the model invests the 95% maximum and leaves no residual cash for the reserve. A volatility budget below ${reached}% keeps a reserve.`;
 }
+
+const usdcText = (units) => Number(fromUnits(units, 7)).toLocaleString(undefined, { maximumFractionDigits: 2 });
 
 function AllocStage({ allocation, coins, onReset, network, onExecuted }) {
   const productAllocation = allocation.requested_assets.reduce((sum, id) => sum + (allocation.positions[id]?.allocation_fraction || 0), 0);
@@ -459,6 +461,7 @@ function AllocStage({ allocation, coins, onReset, network, onExecuted }) {
       <div><div className="lbl">Model volatility · annual (1Y inputs)</div><div className="val">{allocation.allocated_sleeve_volatility == null ? '—' : `${(allocation.allocated_sleeve_volatility * 100).toFixed(2)}%`}</div></div>
     </div><button className="btn ghost" onClick={onReset}>← Revise basket</button></div>
     <p className="data-note">{network === 'testnet' ? 'Model targets · units at the daily-close marks. The testnet execution below fills at Soroswap testnet pool prices and the testnet vault’s share price, so the units received differ.' : 'Simulated allocation · reference quantities, no funds moved.'} Product allocation and estimated volatility include every selected product, including the vault. The volatility estimate uses the current risk model’s one-year history and excludes reserves and buffers. The three-year historical metrics below include the entire portfolio.</p>
+    {network === 'testnet' && allocation.capped && <p className="data-note">Capped: {usdcText(allocation.capped.from)} USDC selected, scaled to {usdcText(allocation.capped.to)} USDC ({(Number(TESTNET_CAPITAL_CAP) / Number(allocation.capped.from) * 100).toFixed(2)}% of each source).</p>}
     <AllocationSimulation allocation={allocation} />
     {network === 'testnet' ? <TestnetExecution allocation={allocation} net={TESTNET} onFinished={onExecuted} /> : <>
     <ExecutionSimulation allocation={allocation} usdcUsd={allocation.usdcUsd} vaultReason={simulatedShareReason(VAULTS.find(v => v.coin === 'etesia-tf'), network)} />
@@ -665,7 +668,9 @@ export default function PortfolioBuilder() {
   });
 
   // Mainnet values each selected part at the daily close; testnet at testnet
-  // execution prices (valueSources), so its build waits for the quotes.
+  // execution prices (valueSources), so its build waits for the quotes. A
+  // testnet selection worth more than TESTNET_CAPITAL_CAP is scaled down: every
+  // source's percent and quantity by cap/value, then valued again (capped).
   const onBuild = async () => {
     if (allocationCoins.some(c => c.allocationSupported === false)) {
       setBuildError('The allocation API needs an update for this selection.');
@@ -681,17 +686,26 @@ export default function PortfolioBuilder() {
     buildRequest.current = controller;
     setBuilding(true); setBuildError(null); setAllocation(null); setPhase('select');
     try {
-      const valuation = onTestnet ? await valueSources(vaultClient(TESTNET), parts, account.position)
+      const valued = (v) => Object.values(v).reduce((sum, x) => sum + x.value, BigInt(0));
+      let sourced = parts, capped = null;
+      let valuation = onTestnet ? await valueSources(vaultClient(TESTNET), parts, account.position)
         : Object.fromEntries(parts.map((p, i) => { const value = BigInt(Math.floor(closeValues[i] * 1e7)); return [p.symbol, { quantity: p.quantity, value, minOut: value }]; }));
       if (controller.signal.aborted) return;
-      const capital = onTestnet ? Number(fromUnits(Object.values(valuation).reduce((sum, v) => sum + v.value, BigInt(0)), 7)) : closeValues.reduce((sum, v) => sum + v, 0);
+      if (onTestnet && valued(valuation) > TESTNET_CAPITAL_CAP) {
+        const from = valued(valuation), factor = Number(TESTNET_CAPITAL_CAP) / Number(from);
+        sourced = parts.map(p => ({ ...p, percent: p.percent * factor, quantity: p.quantity * TESTNET_CAPITAL_CAP / from })).filter(p => p.quantity > BigInt(0));
+        valuation = await valueSources(vaultClient(TESTNET), sourced, account.position);
+        if (controller.signal.aborted) return;
+        capped = { from, to: valued(valuation) };
+      }
+      const capital = onTestnet ? Number(fromUnits(valued(valuation), 7)) : closeValues.reduce((sum, v) => sum + v, 0);
       const result = await quantRequest('builder/targets', { assets: allocationCoins.map(c => c.id), portfolio_value_usdc: capital, annual_volatility_budget: Number(budget) / 100, ...(reserveKey === 'ustry' ? {} : { cash_reserves: cashReserves }) }, controller.signal);
       if (controller.signal.aborted) return;
       if (result.status !== 'valid' || !result.positions) {
         setBuildError(`Allocation blocked: ${result.diagnostics?.join(' · ') || 'Required inputs are unavailable'}`);
         return;
       }
-      setAllocation({ ...result, owner: address, sources: parts, valuation, usdcUsd: bySymbol.USDC.price }); setPhase('allocated');
+      setAllocation({ ...result, owner: address, sources: sourced, valuation, usdcUsd: bySymbol.USDC.price, ...(capped && { capped }) }); setPhase('allocated');
     } catch (error) {
       if (!controller.signal.aborted) setBuildError(error.message);
     } finally {

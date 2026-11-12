@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 export const dynamic = "force-dynamic";
 const TOKEN = "(?:xlm|aqua|eth|btc|shx|usdc|eurc|ustry|etesia-tf)";
 const GET_PATH = new RegExp(`^(tokens|market-caps|tokens/${TOKEN}/(?:last-close|sharpe))$`);
-const POST_PATH = /^(correlations|basket\/analytics|builder\/(?:targets|simulation)|quotes)$/;
+const POST_PATH = /^(correlations|basket\/analytics|builder\/(?:targets|simulation)|quotes|testnet\/liquidity)$/;
 
 const REPORT_PATH = /^vault\/backtests\/([a-f0-9]{20})\/files\/(pdf|xlsx)$/;
 // D5-05 indexed vault metrics; their query string (kind, limit) is forwarded.
@@ -17,11 +17,15 @@ async function proxy(request: NextRequest, context: { params: Promise<{ path: st
   if (!report && !vault && !(request.method === "GET" ? GET_PATH : POST_PATH).test(endpoint)) {
     return NextResponse.json({ error: "Unknown quant endpoint" }, { status: 404 });
   }
+  // A98 testnet liquidity top-up: its own bearer key, and the client's first
+  // forwarded hop for the quant service's per-client limits.
+  const liquidity = endpoint === "testnet/liquidity";
   const configured = process.env.ETESIA_API_URL?.trim();
-  const key = process.env.ETESIA_API_KEY;
+  const key = liquidity ? process.env.ETESIA_LIQUIDITY_API_KEY : process.env.ETESIA_API_KEY;
   if (!configured || !key) {
-    return NextResponse.json({ error: "Quant API is not configured" }, { status: 503 });
+    return NextResponse.json({ error: liquidity ? "Testnet liquidity is not configured" : "Quant API is not configured" }, { status: 503 });
   }
+  const client = liquidity ? request.headers.get("x-forwarded-for")?.split(",")[0].trim() : undefined;
   let body: string | undefined;
   if (request.method === "POST") {
     try {
@@ -35,14 +39,15 @@ async function proxy(request: NextRequest, context: { params: Promise<{ path: st
     const base = new URL(configured.includes("://") ? configured : `https://${configured}`);
     const response = await fetch(new URL(`/v1/${endpoint}${vault ? request.nextUrl.search : ""}`, base), {
       method: request.method,
-      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json", ...(client ? { "X-Etesia-Client": client } : {}) },
       body,
       cache: "no-store",
       redirect: "error",
       signal: AbortSignal.timeout(35000),
     });
     if (!response.ok) {
-      const error = response.status === 422 ? "The quant API does not accept this selection or amount. Check that the expanded Builder API is deployed."
+      const error = liquidity && (response.status === 409 || response.status === 429) ? "Testnet liquidity is busy; retry"
+        : response.status === 422 ? "The quant API does not accept this selection or amount. Check that the expanded Builder API is deployed."
         : response.status === 401 ? "Quant API authentication failed"
         : response.status === 404 ? "Quant data is unavailable"
         : "Quant service is temporarily unavailable";
