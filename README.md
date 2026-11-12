@@ -135,8 +135,11 @@ Same wallet setup, with test USDC from the Blend faucet. Expected page text is q
    reach about 16.6% volatility fully invested, so the 95% gross allocation cap
    binds, the page shows "No USTRY reserve: …" and the run has no tRESERVE legs;
    a budget below the level that note reports keeps a reserve. The capital line
-   reads "Valued at testnet Soroswap quotes and the vault's share value when
-   built". An invalid percentage (below 1, above 100 or more than two decimals)
+   reads "Valued at testnet Soroswap spot rates (one-unit quotes) and the
+   vault's share value when built": XLM and tRESERVE are valued at a quote of
+   one whole unit, not of the whole holding. The testnet pools are shallow
+   (XLM/USDC about 65,000 / 8,850, tRESERVE/USDC about 1,000 / 1,000), so use
+   small percentages: a few hundred XLM or tens of USDC per trade. An invalid percentage (below 1, above 100 or more than two decimals)
    reads "Enter a percentage from 1 to 100, with at most two decimals." and
    blocks the build.
 3. Under "Execution — Stellar testnet transactions signed by your wallet · test
@@ -144,11 +147,18 @@ Same wallet setup, with test USDC from the Blend faucet. Expected page text is q
    selected quantity and USDC value, its target and its trade. Check every leg
    before signing: amount in, expected and minimum out (a swap's minimum is the
    Soroswap API quote's `otherAmountThreshold`; a sell also shows the USDC the
-   plan counts on, which its minimum must cover), and the contract (the router
+   plan counts on, 0.5% below the quote of the amount it sells, which its
+   minimum must cover), each swap's "price impact X.XX%" against a one-unit
+   reference quote, and the contract (the router
    `CCJUD55A…E7BRD`, which every API-built swap invokes, the tRESERVE asset, the
    vault). With only USDC selected there is no sell: "tRESERVE trustline ·
    changeTrust", "Buy · USDC → XLM", "Buy · USDC → tRESERVE · USTRY stand-in on
-   testnet", then "Deposit · ETESIA-TF deposit_bounded".
+   testnet", then "Deposit · ETESIA-TF deposit_bounded". A swap above the 2%
+   price impact limit cannot be signed: the page reads, for example, "Sell ·
+   XLM → USDC: price impact 12.07% is above the 2% limit of the shallow testnet
+   pool. Lower the XLM source's percentage and rebuild." (a buy: "Lower the
+   sources' percentages and rebuild."), and the run checks it again with fresh
+   quotes before the first signature.
 4. Press **Sign and execute** and approve each leg in the wallet: the tRESERVE
    `changeTrust` (skipped as "Trustline already present" when the account has
    it), the USDC → XLM and USDC → tRESERVE swaps, then the `deposit_bounded`.

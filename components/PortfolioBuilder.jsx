@@ -409,7 +409,7 @@ function FundingPanel({ coins, allocationCoins, network = 'mainnet', testnet, so
         <div className="note">
           <div>{allocationCoins.length ? `Allocation products: ${allocationCoins.map(c => c.tk).join(', ')}.` : 'Select a product with an available allocation model.'}</div>
           {unsupported.length > 0 && <div>Allocation API update required for {unsupported.map(c => c.tk).join(', ')}.</div>}
-          <div>{network === 'testnet' ? "Valued at testnet Soroswap quotes and the vault's share value when built, including reserves and buffers."
+          <div>{network === 'testnet' ? "Valued at testnet Soroswap spot rates (one-unit quotes) and the vault's share value when built, including reserves and buffers."
             : capital == null ? 'A fresh source close and matching USDC/USD close are required.' : `Hypothetical capital: ${capital.toLocaleString(undefined, { maximumFractionDigits: 2 })} USDC, including reserves and buffers.`}</div>
           {error && <div role="alert" style={{ color: 'var(--bad)' }}>{error}</div>}
         </div>

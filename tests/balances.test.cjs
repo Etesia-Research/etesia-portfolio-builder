@@ -221,7 +221,7 @@ test("testnet holdings: XLM less the most a run keeps back, USDC, tRESERVE as th
   // 100% of XLM is the balance less the keep-back; 50% of the shares.
   assert.match(text(tree), /94 XLM/);
   assert.match(text(tree), /40\.665 shares/);
-  assert.match(text(tree), /Valued at testnet Soroswap quotes and the vault's share value when built/);
+  assert.match(text(tree), /Valued at testnet Soroswap spot rates \(one-unit quotes\) and the vault's share value when built/);
   assert.ok(!/Hypothetical capital|daily close/.test(text(tree)));
   assert.equal(buildButton(tree).props.disabled, false);
   // Before the testnet account is read, the XLM maximum is 0 and the vault row is absent.

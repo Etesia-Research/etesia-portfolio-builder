@@ -13,9 +13,11 @@ export function tokenUnits(amount: string | bigint): string {
 // A source is the selected part of one holding: percent of it, quantity in its
 // units (seven decimals; vault shares twelve). Its valuation is the selected
 // part's USDC value when built (units): expected value, the minimum it sells
-// for, and for vault shares the owner's max withdraw.
+// for (on testnet, XLM and tRESERVE count it at the reference rate until the
+// run quotes their sells), for vault shares the owner's max withdraw, and for
+// XLM and tRESERVE on testnet the reference quote they were valued at.
 export type Source = { symbol: string; percent: number; quantity: bigint };
-export type Valuation = { quantity: bigint; value: bigint; minOut: bigint; maxWithdraw?: bigint };
+export type Valuation = { quantity: bigint; value: bigint; minOut: bigint; maxWithdraw?: bigint; ref?: { amountIn: bigint; amountOut: bigint } };
 export type Sourced = Allocation & { sources: Source[]; valuation: Record<string, Valuation> };
 
 // Smaller differences between a bucket's current value and its target are not traded.
@@ -159,14 +161,15 @@ export type Leg = {
 // from USDC, then the vault deposit). Buckets: USDC (usdc, usdc_reserve), XLM
 // (xlm, xlm_buffer), the market asset of each other position (ustry →
 // tRESERVE) and the vault. kept is the USDC left in the wallet with no transaction.
-export function testnetLegs(allocation: Sourced, net: VaultNetworkConfig) {
+// sold, when given, sets the sells' minimums (rebalance).
+export function testnetLegs(allocation: Sourced, net: VaultNetworkConfig, sold: Record<string, bigint> = {}) {
   const positions = Object.entries(allocation.positions ?? {}).filter(([, p]) => p.allocation_fraction > 0);
   const blocked = positions.map(([id]) => id).filter((id) => !testnetSelectable(id, net));
   if (blocked.length) throw new Error(`Not selectable on ${net.label}: ${blocked.map((id) => baseId(id).toUpperCase()).join(", ")} (no Soroswap testnet market).`);
   const plan = rebalance(allocation, (id) => {
     const base = baseId(id);
     return base === "usdc" ? "USDC" : net.markets[base] ?? base.toUpperCase();
-  });
+  }, sold);
   const leg = (key: string, kind: Leg["kind"], symbol: string, ids: string[], path: string[] = []): Leg => ({ key, kind, symbol, ids, amountIn: BigInt(0), path, minOut: BigInt(0) });
   const trustlines: Leg[] = [], sells: Leg[] = [], exits: Leg[] = [], buys: Leg[] = [], deposits: Leg[] = [];
   for (const r of plan.rows) {
@@ -181,6 +184,20 @@ export function testnetLegs(allocation: Sourced, net: VaultNetworkConfig) {
     }
   }
   return { legs: [...trustlines, ...sells, ...exits, ...buys, ...deposits], kept: plan.kept, rows: plan.rows, capital: plan.capital };
+}
+
+// Price impact guard. A swap's reference rate is a Soroswap API quote of one
+// whole unit (or of the swap's amount, if smaller) of the same pair and
+// direction. The pool fee is in both quotes, so their ratio isolates the
+// price impact. The testnet pools are shallow: a swap above the limit is not signed.
+export const IMPACT_LIMIT_BPS = 200;
+export const referenceIn = (amount: bigint) => amount < SCALE ? amount : SCALE;
+
+// 1 − (amountOut / amountIn) / (refOut / refIn) in basis points, rounded up;
+// 0 when the swap does at least as well as its reference.
+export function priceImpactBps(amountIn: bigint, amountOut: bigint, refIn: bigint, refOut: bigint): number {
+  const ratio = amountOut * refIn * BigInt(10000) / (amountIn * refOut);
+  return ratio >= BigInt(10000) ? 0 : 10000 - Number(ratio);
 }
 
 // XLM kept back for the account's minimum balance and the run's fees: two base

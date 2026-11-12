@@ -175,8 +175,9 @@ const ALLOCATION = { owner: OWNER, generated_at: "2026-11-11T12:00:00Z", ...usdc
 const POSITION = { shares: 0n, value: 0n, maxWithdraw: 0n, liquid: 0n, paused: false };
 const symbolOf = (contract) => Object.values(TESTNET.assets).find(a => a.address === contract).symbol;
 // A scripted client: each signing call reports its envelope, then confirms, fails or ends unknown.
-function client({ outcomes = {}, checks = [], account = ACCOUNT, noQuote = [], limited = [], position = POSITION } = {}) {
-  const log = [];
+// quote(amountIn, from, to) is a quote's expected output (twice the input by default); quoted lists the quotes asked.
+function client({ outcomes = {}, checks = [], account = ACCOUNT, noQuote = [], limited = [], position = POSITION, quote = (amountIn) => amountIn * 2n } = {}) {
+  const log = [], quoted = [];
   let n = 0;
   const sign = (name, onSigned) => {
     const signed = { hash: String(++n).repeat(64).slice(0, 64), maxTime: 1000 };
@@ -187,12 +188,14 @@ function client({ outcomes = {}, checks = [], account = ACCOUNT, noQuote = [], l
     if (outcome === "unknown") throw Object.assign(new Error(`Transaction ${signed.hash} outcome unknown`), { unknown: signed });
     return { action: name, hash: signed.hash, ledger: 50 + n, returned: `${n} units` };
   };
-  return { log, net: TESTNET, SHARES: vaultLib.vaultClient(TESTNET).SHARES, swapReturns: (p) => ({ decimals: 7, unit: symbolOf(p.at(-1)) }),
+  return { log, quoted, net: TESTNET, SHARES: vaultLib.vaultClient(TESTNET).SHARES, swapReturns: (p) => ({ decimals: 7, unit: symbolOf(p.at(-1)) }),
     vaultError: (err) => err.message, readUsdcLine: async () => account,
     quoteSwap: async (amountIn, p) => { log.push(`quote ${p.map(symbolOf).join("→")}`);
       if (noQuote.includes(symbolOf(p.at(-1)))) throw Object.assign(new Error(`No Soroswap testnet quote for ${p.map(symbolOf).join(" → ")}: Soroswap API 400: No path found`), { noPath: true });
       if (limited.includes(symbolOf(p.at(-1)))) throw Object.assign(new Error(`No Soroswap testnet quote for ${p.map(symbolOf).join(" → ")}: The Soroswap API rate limit was reached. Try again in 1 seconds.`), { noPath: false });
-      return { amountOut: amountIn * 2n, minOut: amountIn * 2n * 9950n / 10000n, quote: {} }; },
+      const amountOut = quote(amountIn, symbolOf(p[0]), symbolOf(p.at(-1)));
+      quoted.push([amountIn, symbolOf(p[0]), symbolOf(p.at(-1))]);
+      return { amountOut, minOut: amountOut * 9950n / 10000n, quote: {} }; },
     preview: async () => 1000000000000n,
     // lib/vault.ts quotes and builds through the Soroswap API inside swapExactIn (tests/vault.test.cjs).
     swapExactIn: async (owner, amountIn, p, onSigned, floor) => { log.push({ amountIn, floor, to: owner });
@@ -419,7 +422,8 @@ test("after a reload, legs an earlier allocation executed (or may have) block th
 });
 
 test("an XLM sell keeps the run's XLM back, and section 05 shows the rebalance, current vs target, above the legs", async () => {
-  const c = client({ account: { ...ACCOUNT, xlm: "100.0000000" } });
+  // XLM quoted at 0.2 USDC, linear: no price impact.
+  const c = client({ account: { ...ACCOUNT, xlm: "100.0000000" }, quote: (amountIn, from) => from === "XLM" ? amountIn / 5n : amountIn * 2n });
   const prepared = await panel.prepareRun(c, XLM_SOURCE, TESTNET, null);
   const sell = prepared.plan.legs.find(l => l.key === "sell:XLM");
   // Two base reserves, the USDC line, the tRESERVE line and four transactions: 6 XLM kept back.
@@ -427,9 +431,9 @@ test("an XLM sell keeps the run's XLM back, and section 05 shows the rebalance, 
   assert.equal(prepared.plan.check, null);
   const html = render({ plan: prepared.plan, states: {} });
   assert.ok(html.includes("67.5000000 XLM · keeps 6.0000000 XLM back for fees and the account reserve"));
-  // The sell shows the fresh quote's minimum, which is what is signed, and the USDC the plan counts on.
-  assert.deepEqual(prepared.plan.quotes["sell:XLM"], { amountOut: 1350000000n, minOut: 1343250000n, budgeted: 134325000n });
-  assert.ok(html.includes("expected 135 USDC · minimum 134.325 USDC · budgeted 13.4325 USDC"));
+  // The sell shows its quote's minimum, which is what is signed, the USDC the plan counts on (0.5% below) and its price impact.
+  assert.deepEqual(prepared.plan.quotes["sell:XLM"], { amountOut: 135000000n, minOut: 134325000n, impactBps: 0, budgeted: 133653375n });
+  assert.ok(html.includes("expected 13.5 USDC · minimum 13.4325 USDC · budgeted 13.3653375 USDC · price impact 0.00%"));
   assert.ok(html.indexOf("Rebalance — current vs target") < html.indexOf("Sell · XLM → USDC"));
   assert.ok(html.includes("Current 100 XLM · 20.0000000 USDC → target 6.5000000 USDC") && html.includes("Sell 67.5000000 XLM"));
   assert.ok(html.includes("Buy · USDC → tRESERVE · USTRY stand-in on testnet") && html.includes("Deposit · ETESIA-TF deposit_bounded"));
@@ -482,7 +486,149 @@ test("testnet sources are valued at testnet prices, and a sell counts on 0.5% be
   const valuation = await panel.valueSources(c, [{ symbol: "USDC", percent: 100, quantity: 50000000n }, { symbol: "XLM", percent: 50, quantity: 1000000000n }], null);
   // The scripted quote returns 2× the input with a 0.5% minimum; the sell counts on 0.5% below that minimum.
   assert.deepEqual(valuation.USDC, { quantity: 50000000n, value: 50000000n, minOut: 50000000n });
-  assert.deepEqual(valuation.XLM, { quantity: 1000000000n, value: 2000000000n, minOut: 1990000000n * 9950n / 10000n });
+  // Valued at a one-XLM reference quote, kept with the valuation.
+  assert.deepEqual(valuation.XLM, { quantity: 1000000000n, value: 2000000000n, minOut: 1990000000n * 9950n / 10000n, ref: { amountIn: 10000000n, amountOut: 20000000n } });
+  assert.deepEqual(c.quoted, [[10000000n, "XLM", "USDC"]]);
+});
+
+// ---------- Price impact (shallow testnet pools) ----------
+
+// Constant-product pools with the 0.3% fee, reserves in units: quote(amountIn, from, to).
+const XLM = 10000000n;
+const pools = (...pairs) => (amountIn, from, to) => {
+  const pool = pairs.find(p => from in p && to in p);
+  return amountIn * 997n * pool[to] / (pool[from] * 1000n + amountIn * 997n);
+};
+// The dry run's testnet pools: XLM/USDC 65,166 / 8,850 and tRESERVE/USDC about 1,000 / 1,000.
+const SHALLOW = pools({ XLM: 65166n * XLM, USDC: 8850n * XLM }, { tRESERVE: 1000n * XLM, USDC: 1000n * XLM });
+const DEEP = pools({ XLM: 4500n * XLM, USDC: 900n * XLM }, { tRESERVE: 1000000n * XLM, USDC: 1000000n * XLM });
+// An allocation from an XLM source, valued as the build values it.
+async function xlmAllocation(c, quantity, fractions) {
+  const sources = [{ symbol: "XLM", percent: 100, quantity }];
+  return { owner: OWNER, generated_at: ALLOCATION.generated_at, sources, valuation: await panel.valueSources(c, sources, null),
+    positions: Object.fromEntries(Object.entries(fractions).map(([id, f]) => [id, { allocation_fraction: f }])) };
+}
+const RICH = { ...ACCOUNT, xlm: "10115.0000000", lines: { ...ACCOUNT.lines, tRESERVE: "0" } };
+
+test("price impact is 1 − (out/in) / (refOut/refIn) in basis points, rounded up, and only a swap above 2% is refused", () => {
+  // Reference 10 XLM → 1.3537369 USDC; 8975.516397 XLM → 1068.5082724 USDC: 12.0605%, shown as 12.07%.
+  assert.equal(execution.priceImpactBps(89755163970n, 10685082724n, 100000000n, 13537369n), 1207);
+  assert.equal(execution.priceImpactBps(1000n, 980n, 10n, 10n), 200);
+  assert.equal(execution.priceImpactBps(1000n, 979n, 10n, 10n), 210);
+  assert.equal(execution.priceImpactBps(1000n, 1001n, 10n, 10n), 0); // better than the reference
+  assert.deepEqual([execution.referenceIn(5n), execution.referenceIn(10000000n), execution.referenceIn(99999999n)], [5n, 10000000n, 10000000n]);
+  const legs = [{ key: "sell:XLM", kind: "sell", symbol: "XLM" }, { key: "swap:tRESERVE", kind: "swap", symbol: "tRESERVE" }];
+  assert.equal(panel.impactProblem(legs, { "sell:XLM": { impactBps: 200 }, "swap:tRESERVE": { impactBps: 0 } }), null);
+  assert.equal(panel.impactProblem(legs, { "sell:XLM": { impactBps: 1205 }, "swap:tRESERVE": { impactBps: 3300 } }),
+    "Sell · XLM → USDC: price impact 12.05% is above the 2% limit of the shallow testnet pool. Lower the XLM source's percentage and rebuild. "
+    + "Buy · USDC → tRESERVE · USTRY stand-in on testnet: price impact 33.00% is above the 2% limit of the shallow testnet pool. Lower the sources' percentages and rebuild.");
+});
+
+test("XLM is valued at the one-XLM reference rate, so the XLM kept is no longer undervalued by the impact of selling all of it", async () => {
+  const c = client({ quote: SHALLOW });
+  const quantity = 10115n * XLM;
+  const { XLM: valued } = await panel.valueSources(c, [{ symbol: "XLM", percent: 100, quantity }], null);
+  const ref = SHALLOW(XLM, "XLM", "USDC");
+  assert.deepEqual(c.quoted, [[XLM, "XLM", "USDC"]]);
+  assert.deepEqual([valued.value, valued.ref], [quantity * ref / XLM, { amountIn: XLM, amountOut: ref }]);
+  // A quote of the whole holding is about 13% lower.
+  assert.ok(valued.value * 100n > SHALLOW(quantity, "XLM", "USDC") * 113n);
+  // Below one unit, the reference quote is of the selected quantity.
+  const small = client({ quote: SHALLOW });
+  await panel.valueSources(small, [{ symbol: "XLM", percent: 1, quantity: 5000000n }], null);
+  assert.deepEqual(small.quoted, [[5000000n, "XLM", "USDC"]]);
+});
+
+test("prepareRun quotes each sell at the amount it sells, counts 0.5% below its minimum, sizes the buys on that and signs the sell with it as its floor", async () => {
+  const c = client({ quote: DEEP, account: RICH });
+  const allocation = await xlmAllocation(c, 100n * XLM, { xlm: .3, xlm_buffer: .025, "etesia-tf": .35, ustry: .3, usdc: .025 });
+  c.quoted.length = 0;
+  const { plan } = await panel.prepareRun(c, allocation, TESTNET, null);
+  const sell = plan.legs.find(l => l.key === "sell:XLM");
+  const quoteMin = DEEP(sell.amountIn, "XLM", "USDC") * 9950n / 10000n;
+  assert.deepEqual(c.quoted[0], [sell.amountIn, "XLM", "USDC"]);
+  assert.equal(sell.minOut, quoteMin * 9950n / 10000n);
+  // The buys are the rebalance with that minimum, not with the valuation's.
+  assert.deepEqual(plan.legs, execution.testnetLegs(allocation, TESTNET, { XLM: sell.minOut }).legs);
+  assert.notDeepEqual(plan.legs, execution.testnetLegs(allocation, TESTNET).legs);
+  const spent = plan.legs.filter(l => l.kind === "swap" || l.kind === "vault").reduce((sum, l) => sum + l.amountIn, 0n);
+  assert.equal(spent + plan.kept, sell.minOut);
+  // The sell is valued against the build's reference quote, not quoted for one again; the buys against fresh ones.
+  assert.ok(!c.quoted.some(([amountIn, from]) => amountIn === XLM && from === "XLM"));
+  assert.ok(c.quoted.some(([amountIn, from, to]) => amountIn === XLM && from === "USDC" && to === "tRESERVE"));
+  assert.ok(plan.quotes["sell:XLM"].impactBps > 0 && plan.quotes["sell:XLM"].impactBps <= 200, String(plan.quotes["sell:XLM"].impactBps));
+  assert.equal(plan.impact, null);
+  // A leg at or below 2% runs, the sell signed with its minimum as its floor.
+  const html = render({ plan, states: {} });
+  assert.ok(!runButton(html)[1] && html.includes(`price impact ${(plan.quotes["sell:XLM"].impactBps / 100).toFixed(2)}%`));
+  const states = {};
+  const ok = await panel.runLegs({ client: c, owner: OWNER, generatedAt: ALLOCATION.generated_at, legs: plan.legs, states, store: null, update: (key, state) => { states[key] = state; } });
+  assert.equal(ok, true);
+  assert.deepEqual(c.log.find(e => typeof e === "object"), { amountIn: sell.amountIn, floor: sell.minOut, to: OWNER });
+  // The account already holds the tRESERVE line: its leg needs no transaction.
+  assert.deepEqual(signedCalls(c), ["swap USDC", "swap tRESERVE", `deposit ${vaultLib.fromUnits(plan.legs.at(-1).amountIn, 7)}`]);
+});
+
+test("a swap above 2% price impact blocks the run with a message naming it, and nothing is signed", async () => {
+  // The dry run: 10,115 XLM into XLM and the vault, with a USTRY reserve.
+  const c = client({ quote: SHALLOW, account: RICH });
+  const allocation = await xlmAllocation(c, 10115n * XLM, { xlm: .1, xlm_buffer: .025, "etesia-tf": .45, ustry: .4, usdc: .025 });
+  const { plan } = await panel.prepareRun(c, allocation, TESTNET, null);
+  const sell = plan.quotes["sell:XLM"].impactBps, buy = plan.quotes["swap:tRESERVE"].impactBps;
+  assert.ok(sell > 1000 && buy > 200, `${sell} ${buy}`);
+  assert.match(plan.impact, new RegExp(`^Sell · XLM → USDC: price impact ${(sell / 100).toFixed(2)}% is above the 2% limit of the shallow testnet pool\\. Lower the XLM source's percentage and rebuild\\. Buy · USDC → tRESERVE · USTRY stand-in on testnet: price impact ${(buy / 100).toFixed(2)}% is above the 2% limit of the shallow testnet pool\\. Lower the sources' percentages and rebuild\\.$`));
+  const html = render({ plan, states: {} });
+  assert.ok(runButton(html)[1], "run disabled above the limit");
+  assert.ok(html.includes(`role="alert" class="data-note" style="color:var(--bad)">Sell · XLM → USDC: price impact ${(sell / 100).toFixed(2)}% is above the 2% limit`));
+  assert.ok(html.includes(`· price impact ${(sell / 100).toFixed(2)}%</span>`) && html.includes(`· price impact ${(buy / 100).toFixed(2)}%</span>`));
+  // runLegs refuses it too, before any signature.
+  const states = {};
+  await assert.rejects(panel.runLegs({ client: c, owner: OWNER, generatedAt: ALLOCATION.generated_at, legs: plan.legs, states, store: null, update: (key, state) => { states[key] = state; } }),
+    (err) => err.message === plan.impact);
+  assert.deepEqual([signedCalls(c), states], [[], {}]);
+});
+
+test("the run-start re-check stops before signing when a swap's fresh quote is now above 2%", async () => {
+  let quote = DEEP;
+  const c = client({ quote: (...args) => quote(...args), account: RICH });
+  const allocation = await xlmAllocation(c, 100n * XLM, { xlm: .3, xlm_buffer: .025, "etesia-tf": .35, ustry: .3, usdc: .025 });
+  const { plan } = await panel.prepareRun(c, allocation, TESTNET, null);
+  assert.equal(plan.impact, null);
+  // The XLM pool drained meanwhile: the fresh quotes, with fresh reference quotes, find the sell above the limit.
+  quote = pools({ XLM: 450n * XLM, USDC: 90n * XLM }, { tRESERVE: 1000000n * XLM, USDC: 1000000n * XLM });
+  c.quoted.length = 0;
+  const states = {};
+  await assert.rejects(panel.runLegs({ client: c, owner: OWNER, generatedAt: ALLOCATION.generated_at, legs: plan.legs, states, store: null, update: (key, state) => { states[key] = state; } }),
+    /^Error: Sell · XLM → USDC: price impact \d+\.\d\d% is above the 2% limit of the shallow testnet pool\. Lower the XLM source's percentage and rebuild\.$/);
+  assert.ok(c.quoted.some(([amountIn, from]) => amountIn === XLM && from === "XLM"), "a fresh XLM reference quote");
+  assert.deepEqual([signedCalls(c), states], [[], {}]);
+});
+
+test("a sell whose prepareRun quote fails blocks the plan, so no run starts on a floor from the spot rate", async () => {
+  // 1,000 XLM into the shallow XLM pool: the 400 XLM sell is about 0.6% impact, within the limit,
+  // but its spot-rate placeholder floor is above what its quote's minimum can meet.
+  let fail = false;
+  const c = client({ account: RICH, quote: (amountIn, from, to) => {
+    if (fail && from === "XLM") { fail = false; throw Object.assign(new Error("The Soroswap API rate limit was reached. Try again in 1 seconds."), { noPath: false }); }
+    return SHALLOW(amountIn, from, to); } });
+  c.swapExactIn = ((swap) => async (owner, amountIn, p, onSigned, floor) => {
+    const minOut = SHALLOW(amountIn, symbolOf(p[0]), symbolOf(p.at(-1))) * 9950n / 10000n;
+    if (minOut < floor) throw new Error(`The quote's minimum ${minOut} is now below ${floor}. Rebuild the allocation.`);
+    return swap(owner, amountIn, p, onSigned, floor);
+  })(c.swapExactIn);
+  const allocation = await xlmAllocation(c, 1000n * XLM, { xlm: .575, xlm_buffer: .025, "etesia-tf": .35, ustry: .025, usdc: .025 });
+  fail = true;
+  await assert.rejects(panel.prepareRun(c, allocation, TESTNET, null),
+    { message: "Sell · XLM → USDC has no quote (The Soroswap API rate limit was reached. Try again in 1 seconds.), and the buys are sized on it. Nothing was signed; rebuild the allocation once the Soroswap API answers." });
+  assert.deepEqual(signedCalls(c), []);
+  // Once the API answers, the sell's floor comes from its own quote and the run signs it.
+  const { plan } = await panel.prepareRun(c, allocation, TESTNET, null);
+  const sell = plan.legs.find(l => l.key === "sell:XLM");
+  assert.ok(plan.quotes["sell:XLM"].impactBps > 50 && plan.impact === null, String(plan.quotes["sell:XLM"].impactBps));
+  assert.equal(sell.minOut, plan.quotes["sell:XLM"].budgeted);
+  const states = {};
+  assert.equal(await panel.runLegs({ client: c, owner: OWNER, generatedAt: ALLOCATION.generated_at, legs: plan.legs, states, store: null, update: (key, state) => { states[key] = state; } }), true);
+  assert.equal(states["sell:XLM"].status, "confirmed");
 });
 
 test("a wallet network mismatch or another account blocks signing", () => {

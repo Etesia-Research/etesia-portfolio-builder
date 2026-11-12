@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import useStellarWalletStore from "@/stores/useStellarWalletStore";
 import { API_TX_SECONDS, DEADLINE_SECONDS, SHARE_DECIMALS, fromUnits, minBound, vaultClient } from "@/lib/vault";
-import { TOLERANCE, runKeep, testnetCheck, testnetLegs, tokenUnits } from "@/lib/execution";
+import { IMPACT_LIMIT_BPS, TOLERANCE, priceImpactBps, referenceIn, runKeep, testnetCheck, testnetLegs, tokenUnits } from "@/lib/execution";
 
 // Testnet execution of a Builder allocation: the rebalance of the selected
 // sources to the allocation's targets, where every leg is a real Stellar testnet
@@ -55,11 +55,33 @@ export function legLabel(leg) {
 const returnsFor = (client, leg) => leg.kind === "vault" || leg.kind === "withdraw" ? client.SHARES : leg.kind === "redeem" ? { decimals: client.net.usdc.decimals, unit: "USDC" }
   : leg.kind === "trustline" ? { decimals: 7, unit: leg.symbol } : client.swapReturns(leg.path);
 
+// A swap's price impact (basis points) against a reference quote of the same
+// pair and direction: ref when given (the rate its source was valued at),
+// else a fresh one-unit quote, needed only when the swap is larger than that.
+async function impactOf(client, leg, amountOut, ref) {
+  if (!ref) {
+    const amountIn = referenceIn(leg.amountIn);
+    ref = { amountIn, amountOut: amountIn === leg.amountIn ? amountOut : (await client.quoteSwap(amountIn, leg.path)).amountOut };
+  }
+  return priceImpactBps(leg.amountIn, amountOut, ref.amountIn, ref.amountOut);
+}
+
+const percentText = (bps) => `${(bps / 100).toFixed(2)}%`;
+
+// The swaps whose price impact is above the limit, named with their impact
+// and what to lower; null when none is. impacts: { [leg key]: { impactBps } }.
+export function impactProblem(legs, impacts) {
+  const steep = legs.filter((leg) => impacts[leg.key]?.impactBps > IMPACT_LIMIT_BPS);
+  return steep.length ? steep.map((leg) => `${legLabel(leg)}: price impact ${percentText(impacts[leg.key].impactBps)} is above the ${IMPACT_LIMIT_BPS / 100}% limit of the shallow testnet pool. ${leg.kind === "sell" ? `Lower the ${leg.symbol} source's percentage and rebuild.` : "Lower the sources' percentages and rebuild."}`).join(" ") : null;
+}
+
 // Expected and minimum output of each leg before signing: Soroswap API quotes
-// for swaps, with the API's otherAmountThreshold as the minimum (a sell also
-// shows the USDC the plan counts on, the least minimum it is signed with), the
-// vault's previews for the deposit and the redeem; a withdraw receives its exact USDC.
-export async function quoteLegs(client, legs) {
+// for swaps, with the API's otherAmountThreshold as the minimum and their
+// price impact (refOf(leg): a sell's reference quote, if any), the vault's
+// previews for the deposit and the redeem; a withdraw receives its exact USDC.
+// A sell also gets the USDC the plan counts on: 0.5% below its quote's
+// minimum, the least minimum it is signed with.
+export async function quoteLegs(client, legs, refOf = () => undefined) {
   const entries = await Promise.all(legs.map(async (leg) => {
     try {
       if (leg.kind === "trustline") return [leg.key, null];
@@ -69,7 +91,7 @@ export async function quoteLegs(client, legs) {
         return [leg.key, { amountOut: out, minOut: minBound(out) }];
       }
       const { amountOut, minOut } = await client.quoteSwap(leg.amountIn, leg.path);
-      return [leg.key, { amountOut, minOut, ...(leg.kind === "sell" && { budgeted: leg.minOut }) }];
+      return [leg.key, { amountOut, minOut, impactBps: await impactOf(client, leg, amountOut, refOf(leg)), ...(leg.kind === "sell" && { budgeted: minBound(minOut) }) }];
     } catch (err) {
       return [leg.key, { error: client.vaultError(err) }];
     }
@@ -89,9 +111,9 @@ export async function resolveRecord(client, store, owner, record) {
 const VAULT_LEGS = new Set(["vault", "withdraw", "redeem"]);
 
 // The selected sources valued at testnet execution prices (USDC units): USDC
-// 1:1, XLM and tRESERVE at a Soroswap API quote to USDC (its minimum kept: a
-// sell is signed only above its share of it), vault shares at their value
-// from readPosition times the percent, with the redeem preview's 0.5% bound as
+// 1:1, XLM and tRESERVE at their reference rate to USDC (a Soroswap API quote
+// of one whole unit, kept as ref), vault shares at their value from
+// readPosition times the percent, with the redeem preview's 0.5% bound as
 // their minimum and the owner's max withdraw. A failed quote throws, which
 // blocks the build. Few quotes (at most two), within the API's burst; the
 // client waits out a 429.
@@ -100,10 +122,12 @@ export async function valueSources(client, sources, position) {
   return Object.fromEntries(await Promise.all(sources.map(async ({ symbol, percent, quantity }) => {
     if (symbol === "USDC") return [symbol, { quantity, value: quantity, minOut: quantity }];
     if (net.assets[symbol]) {
-      // Counted 0.5% below the quote's minimum, so the sell's re-quote at signing
-      // may be up to 0.5% lower and still meet the floor the buys were sized on.
-      const { amountOut, minOut } = await client.quoteSwap(quantity, [net.assets[symbol].address, net.usdc.contract]);
-      return [symbol, { quantity, value: amountOut, minOut: minBound(minOut) }];
+      // Not a quote of the whole quantity: on a shallow testnet pool its price
+      // impact would undervalue the part kept. The minimum counts the
+      // reference quote's minimum 0.5% below until prepareRun quotes the sell.
+      const amountIn = referenceIn(quantity);
+      const { amountOut, minOut } = await client.quoteSwap(amountIn, [net.assets[symbol].address, net.usdc.contract]);
+      return [symbol, { quantity, value: quantity * amountOut / amountIn, minOut: minBound(quantity * minOut / amountIn), ref: { amountIn, amountOut } }];
     }
     const redeem = await client.preview("redeem", fromUnits(quantity, SHARE_DECIMALS));
     return [symbol, { quantity, value: position.value * BigInt(Math.round(percent * 100)) / BigInt(10000), minOut: minBound(redeem), maxWithdraw: position.maxWithdraw }];
@@ -114,7 +138,11 @@ export async function valueSources(client, sources, position) {
 // unresolved one blocks the run; one that may have executed is listed as an
 // earlier allocation's), read the account (and the vault position for vault
 // legs), plan the rebalance from the valuation fixed when the allocation was
-// built, and quote the legs.
+// built, and quote the legs: first the sells at the amounts they sell (against
+// the reference rate their source was valued at), whose minimums, 0.5% below
+// the quotes', size the buys; then the other legs. A sell without a quote
+// throws, so the run cannot start on buys sized without it. A swap above the
+// price impact limit blocks the run (plan.impact).
 export async function prepareRun(client, allocation, net, store) {
   const { owner } = allocation;
   const open = [], earlier = [];
@@ -130,10 +158,15 @@ export async function prepareRun(client, allocation, net, store) {
     else earlier.push({ record, result });
   }
   const account = await client.readUsdcLine(owner);
-  const { legs, kept, rows, capital } = testnetLegs(allocation, net);
+  const sellLegs = testnetLegs(allocation, net).legs.filter((leg) => leg.kind === "sell");
+  const sells = await quoteLegs(client, sellLegs, (leg) => allocation.valuation[leg.symbol]?.ref);
+  const unquoted = sellLegs.find((leg) => sells[leg.key].error);
+  if (unquoted) throw new Error(`${legLabel(unquoted)} has no quote (${sells[unquoted.key].error}), and the buys are sized on it. Nothing was signed; rebuild the allocation once the Soroswap API answers.`);
+  const sold = Object.fromEntries(sellLegs.map((leg) => [leg.symbol, sells[leg.key].budgeted]));
+  const { legs, kept, rows, capital } = testnetLegs(allocation, net, sold);
   const position = legs.some((leg) => VAULT_LEGS.has(leg.kind)) ? await client.readPosition(owner) : null;
-  const quotes = await quoteLegs(client, legs);
-  return { plan: { legs, kept, rows, capital, quotes, check: testnetCheck(legs, account, position), xlmKept: runKeep(legs, account) }, open, earlier };
+  const quotes = { ...await quoteLegs(client, legs.filter((leg) => leg.kind !== "sell")), ...sells };
+  return { plan: { legs, kept, rows, capital, quotes, check: testnetCheck(legs, account, position), impact: impactProblem(legs, quotes), xlmKept: runKeep(legs, account) }, open, earlier };
 }
 
 async function executeLeg(client, owner, leg, account, onSigned) {
@@ -153,17 +186,19 @@ async function executeLeg(client, owner, leg, account, onSigned) {
 // unknown outcome. A buy the Soroswap API finds no path for is not executed,
 // nor its trustline, and the other legs still run; a sell without a quote,
 // or any other quote failure (rate limit, API outage, missing key), stops the
-// run, because the buys spend its USDC. Before each leg the run stops when
+// run, because the buys spend its USDC. A swap whose fresh quote is above the
+// price impact limit stops the run before anything is signed. Before each leg the run stops when
 // it is no longer active (the panel left or the allocation changed) and refuses
 // while the store holds a record from outside this run. update(key, state)
 // records each leg's state.
 export async function runLegs({ client, owner, generatedAt, legs, states, store, update, active = () => true }) {
   const account = await client.readUsdcLine(owner);
   const pending = legs.filter((leg) => !DONE.has(states[leg.key]?.status));
-  const unquoted = new Set();
+  const unquoted = new Set(), impacts = {};
   for (const leg of pending.filter((l) => l.kind === "sell" || l.kind === "swap")) {
     try {
-      await client.quoteSwap(leg.amountIn, leg.path);
+      const { amountOut } = await client.quoteSwap(leg.amountIn, leg.path);
+      impacts[leg.key] = { impactBps: await impactOf(client, leg, amountOut) };
     } catch (err) {
       if (!err?.noPath || leg.kind === "sell") throw new Error(`${client.vaultError(err)} Nothing was signed; run again once the Soroswap API answers.`);
       unquoted.add(leg.symbol);
@@ -172,6 +207,8 @@ export async function runLegs({ client, owner, generatedAt, legs, states, store,
   }
   for (const leg of pending.filter((l) => l.kind === "trustline" && unquoted.has(l.symbol)))
     update(leg.key, { status: "unavailable", error: `not added: the USDC → ${leg.symbol} swap has no quote` });
+  const steep = impactProblem(pending, impacts);
+  if (steep) throw new Error(steep);
   const remaining = pending.filter((leg) => !((leg.kind === "swap" || leg.kind === "trustline") && unquoted.has(leg.symbol)));
   const position = remaining.some((leg) => VAULT_LEGS.has(leg.kind)) ? await client.readPosition(owner) : null;
   const problem = testnetCheck(remaining, account, position);
@@ -246,11 +283,11 @@ export function ExecutionPanel({ net, owner, plan, states, open, earlier, prepEr
   const started = plan ? plan.legs.some((leg) => states[leg.key]) : false;
   const finished = plan ? plan.legs.every((leg) => DONE.has(states[leg.key]?.status)) : false;
   const repeats = earlier.filter(({ result, acknowledged }) => !acknowledged && MAY_HAVE_EXECUTED.has(result.status));
-  const blocked = running || !plan || finished || open.length > 0 || unknown.length > 0 || repeats.length > 0 || !!networkError || wrongAccount;
+  const blocked = running || !plan || finished || !!plan.impact || open.length > 0 || unknown.length > 0 || repeats.length > 0 || !!networkError || wrongAccount;
   const contract = (leg) => VAULT_LEGS.has(leg.kind) ? net.vault : leg.kind === "trustline" ? net.assets[leg.symbol].classic : net.router;
   return <section className="execution-routes">
     <h4>Execution — Stellar testnet transactions signed by your wallet · test funds only</h4>
-    <p className="data-note">One transaction per leg, each signed in your wallet: trustlines for bought assets, the sells of the selected sources (Soroswap swaps to USDC, then the vault withdraw or redeem), then the buys (Soroswap swaps from USDC, then the vault deposit). Every swap is quoted and built by the Soroswap Aggregator API on its testnet Soroswap pools (each invokes the router {net.router}). Soroswap testnet pool quote; testnet prices are not market prices. A swap's minimum output is the API's minimum at {net.soroswap.slippageBps / 100}% slippage (a sell is signed only while that minimum covers the USDC the plan counts on) and the vault calls allow 0.5% against their previews. Each swap is quoted and built again right before its signature and expires {API_TX_SECONDS} seconds after it is built; the other transactions expire after {DEADLINE_SECONDS} seconds.</p>
+    <p className="data-note">One transaction per leg, each signed in your wallet: trustlines for bought assets, the sells of the selected sources (Soroswap swaps to USDC, then the vault withdraw or redeem), then the buys (Soroswap swaps from USDC, then the vault deposit). Every swap is quoted and built by the Soroswap Aggregator API on its testnet Soroswap pools (each invokes the router {net.router}). Soroswap testnet pool quote; testnet prices are not market prices. A swap's minimum output is the API's minimum at {net.soroswap.slippageBps / 100}% slippage (a sell is signed only while that minimum covers the USDC the plan counts on) and the vault calls allow 0.5% against their previews. The testnet pools are shallow: a swap whose price impact against a one-unit reference quote is above {IMPACT_LIMIT_BPS / 100}% is not signed. Each swap is quoted and built again right before its signature and expires {API_TX_SECONDS} seconds after it is built; the other transactions expire after {DEADLINE_SECONDS} seconds.</p>
     {!storageOk && <p role="alert" className="data-note" style={{ color: 'var(--warn)' }}>Browser storage is unavailable, so a reload cannot recover a transaction that is still pending. Check your account on the explorer (<a href={`${net.explorerUrl}/account/${owner}`} target="_blank" rel="noreferrer">{owner}</a>) before running again.</p>}
     {networkError && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>{networkError}</p>}
     {wrongAccount && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>The connected account is not the one this allocation was built for. Rebuild it to execute.</p>}
@@ -267,7 +304,7 @@ export function ExecutionPanel({ net, owner, plan, states, open, earlier, prepEr
     {repeats.length > 0 && <p role="alert" className="data-note" style={{ color: 'var(--warn)' }}>{repeats.length === 1 ? 'A transaction' : `${repeats.length} transactions`} of an earlier allocation executed or may have executed: {repeats.map(({ record }) => record.action).join(' · ')}. They are not deducted from this allocation, so running it executes its legs in full again. <button className="btn ghost" disabled={running} onClick={onAcknowledge}>Acknowledge and allow this run</button></p>}
     {plan && <>
       <div className="execution-quote-list" data-table="rebalance">
-        <div className="execution-quote"><strong>Rebalance — current vs target</strong><span className="data-note">The selected parts of your holdings, valued when built at Soroswap testnet quotes and the vault's share value, against the model targets of their value. Unselected holdings are untouched.</span></div>
+        <div className="execution-quote"><strong>Rebalance — current vs target</strong><span className="data-note">The selected parts of your holdings, valued when built at Soroswap testnet spot rates (one-unit quotes) and the vault's share value, against the model targets of their value. Unselected holdings are untouched.</span></div>
         {plan.rows.map((row) => <div className="execution-quote" key={row.symbol} data-bucket={row.symbol}>
           <strong>{row.symbol}{standIn(row.symbol)}</strong>
           <span>Current {units(row.quantity, net.assets[row.symbol] ? 7 : SHARE_DECIMALS)} {net.assets[row.symbol] ? row.symbol : 'shares'} · {tokenUnits(row.current)} USDC → target {tokenUnits(row.target)} USDC</span>
@@ -275,6 +312,7 @@ export function ExecutionPanel({ net, owner, plan, states, open, earlier, prepEr
         </div>)}
       </div>
       {plan.check && <p role="alert" className="data-note" style={{ color: 'var(--warn)' }}>{plan.check}</p>}
+      {plan.impact && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>{plan.impact}</p>}
       <div className="execution-quote-list">{plan.legs.map((leg, index) => {
         const quote = plan.quotes[leg.key], state = states[leg.key];
         const decimals = leg.kind === "vault" ? SHARE_DECIMALS : 7, unit = leg.kind === "vault" ? "shares" : leg.kind === "swap" ? leg.symbol : "USDC";
@@ -283,7 +321,7 @@ export function ExecutionPanel({ net, owner, plan, states, open, earlier, prepEr
           : leg.kind === "redeem" ? `${units(leg.amountIn, SHARE_DECIMALS)} shares, every share held`
           : leg.kind === "withdraw" ? `${tokenUnits(leg.amountIn)} USDC from the vault${leg.cap != null ? ` · capped at the vault's max withdraw ${tokenUnits(leg.cap)} USDC` : ''}`
           : `${tokenUnits(leg.amountIn)} USDC`;
-        const output = leg.kind === "trustline" ? null : quote?.error ? `Unavailable · ${quote.error}` : quote ? `expected ${units(quote.amountOut, decimals)} ${unit} · minimum ${units(quote.minOut, decimals)} ${unit}${quote.budgeted != null ? ` · budgeted ${units(quote.budgeted, decimals)} ${unit}` : ''}` : 'Quoting…';
+        const output = leg.kind === "trustline" ? null : quote?.error ? `Unavailable · ${quote.error}` : quote ? `expected ${units(quote.amountOut, decimals)} ${unit} · minimum ${units(quote.minOut, decimals)} ${unit}${quote.budgeted != null ? ` · budgeted ${units(quote.budgeted, decimals)} ${unit}` : ''}${quote.impactBps != null ? ` · price impact ${percentText(quote.impactBps)}` : ''}` : 'Quoting…';
         const note = leg.kind === "swap" || leg.kind === "sell" ? ' · Soroswap testnet pool quote; testnet prices are not market prices'
           : leg.kind === "vault" ? ' · shares from preview_deposit, read again at signing' : leg.kind === "redeem" ? ' · USDC from preview_redeem, read again at signing'
           : leg.kind === "withdraw" ? ' · exact USDC; shares burned bounded by preview_withdraw, read again at signing' : '';
