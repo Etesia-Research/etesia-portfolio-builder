@@ -659,9 +659,16 @@ test("prepareRun asks for the testnet liquidity top-up of the planned swaps afte
     // On the deeper pools the dry run's swaps are within the 2% limit.
     assert.equal(plan.impact, null);
     const html = render({ plan, states: {} });
-    assert.ok(html.includes("Before quoting, Etesia&#x27;s quant service may add testnet liquidity from its own float (account etesia-liquidity) to the Soroswap pools at their current price, so that each swap&#x27;s impact is at most 1%."));
+    assert.ok(html.includes("Before quoting, Etesia&#x27;s quant service may add testnet liquidity from its own float (account etesia-liquidity) to the Soroswap pools at their current price, so that each swap&#x27;s impact is at most 1%. When a pool&#x27;s price is more than 1% off the oracle price against a swap, it first trades that pool back to the oracle price from the same float (a realign, at most 1,000 USDC a day for Builder runs)."));
     assert.ok(html.includes(`Testnet liquidity · Etesia-supplied, not market depth: <span>added 1050.0000000 USDC + 7731.0000000 XLM to XLM/USDC (tx <a href="${TESTNET.explorerUrl}/tx/${"a".repeat(64)}"`));
     assert.ok(render({ plan: { ...plan, liquidity: { status: "ready", additions: [] } }, states: {} }).includes("Testnet liquidity · Etesia-supplied, not market depth: pools deep enough"));
+    // A realign (A102) is labelled as Etesia's own trade to the oracle price, with its transaction, before the additions.
+    const realign = { pair: require(path.join(root, "data/testnet-manifest.json")).pairs[0].address /* XLM/USDC */, sold: TESTNET.usdc.contract, bought: TESTNET.assets.XLM.address, amount_in: "1490000000", amount_out: "5990000000", deviation_bps_before: -300, deviation_bps_after: 0, tx_hash: "b".repeat(64), ledger: 6 };
+    const realignText = `Etesia&#x27;s testnet realign of the XLM/USDC pool to the oracle price (not market activity): sold 149.0000000 USDC for 599.0000000 XLM, -300 → 0 bps from the oracle price (tx <a href="${TESTNET.explorerUrl}/tx/${"b".repeat(64)}" target="_blank" rel="noreferrer">${"b".repeat(64)}</a>)`;
+    const both = render({ plan: { ...plan, liquidity: { ...reply, realigns: [realign] } }, states: {} });
+    assert.ok(both.includes(`Testnet liquidity · Etesia-supplied, not market depth: <span>${realignText}</span>; <span>added 1050.0000000 USDC`), both);
+    const short = render({ plan: { ...plan, liquidity: { status: "partial", additions: [], realigns: [realign], reason: "pair: realign scaled to 40.0% by the float" } }, states: {} });
+    assert.ok(short.includes(`<span>${realignText}</span> · partial: pair: realign scaled to 40.0% by the float; the 2% limit still applies.`), short);
   } finally {
     liquidity.reply = async () => ({ status: "ready", additions: [] });
   }

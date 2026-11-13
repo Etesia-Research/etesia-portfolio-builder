@@ -137,7 +137,8 @@ export async function valueSources(client, sources, position) {
 }
 
 // The quant service's testnet liquidity top-up (A98) for the planned swaps:
-// it may add Etesia-supplied liquidity to their Soroswap pools so that each
+// it may realign a pool more than 1% off the oracle price against a swap (A102)
+// and add Etesia-supplied liquidity to their Soroswap pools so that each
 // swap's impact is at most 1%. It never throws: a failure is reported as
 // unavailable, and the price impact limit still decides. null without swaps.
 async function topUp(owner, build, legs) {
@@ -286,18 +287,24 @@ function Receipt({ net, label, receipt }) {
 
 // The testnet liquidity top-up's outcome (prepareRun), labelled as
 // Etesia-supplied testnet liquidity, not market depth. An addition's amounts
-// are keyed by asset contract, in units.
+// are keyed by asset contract, in units. A realign (A102) is Etesia's own
+// trade moving a pool back to the oracle price, not market activity.
 function LiquidityStatus({ net, liquidity }) {
   const symbol = (address) => Object.values(net.assets).find((a) => a.address === address)?.symbol ?? address;
+  const realigned = (liquidity.realigns ?? []).map((r, i) => {
+    const tokens = [symbol(r.sold), symbol(r.bought)];
+    return <span key={r.tx_hash ?? i}>{i ? '; ' : ''}Etesia's testnet realign of the {[...tokens.filter((s) => s !== 'USDC'), 'USDC'].join('/')} pool to the oracle price (not market activity): sold {tokenUnits(r.amount_in)} {tokens[0]} for {r.amount_out ? tokenUnits(r.amount_out) : '…'} {tokens[1]}, {r.deviation_bps_before} → {r.deviation_bps_after} bps from the oracle price (tx <a href={`${net.explorerUrl}/tx/${r.tx_hash}`} target="_blank" rel="noreferrer">{r.tx_hash}</a>)</span>;
+  });
   const added = (liquidity.additions ?? []).map((addition, i) => {
     const amounts = Object.entries(addition.amounts ?? {}).map(([asset, amount]) => [symbol(asset), amount]);
     const others = amounts.filter(([s]) => s !== 'USDC');
     return <span key={addition.tx_hash ?? i}>{i ? '; ' : ''}added {[...amounts.filter(([s]) => s === 'USDC'), ...others].map(([s, amount]) => `${tokenUnits(amount)} ${s}`).join(' + ')} to {[...others.map(([s]) => s), 'USDC'].join('/')} (tx <a href={`${net.explorerUrl}/tx/${addition.tx_hash}`} target="_blank" rel="noreferrer">{addition.tx_hash}</a>)</span>;
   });
   const limit = `; the ${IMPACT_LIMIT_BPS / 100}% limit still applies.`;
+  const done = <>{realigned}{realigned.length && added.length ? '; ' : ''}{added}</>;
   const outcome = liquidity.status === 'ready' ? 'pools deep enough'
-    : liquidity.status === 'topped_up' ? added
-    : liquidity.status === 'partial' ? <>{added}{added.length ? ' · ' : ''}partial{liquidity.reason ? `: ${liquidity.reason}` : ''}{limit}</>
+    : liquidity.status === 'topped_up' ? done
+    : liquidity.status === 'partial' ? <>{done}{realigned.length || added.length ? ' · ' : ''}partial{liquidity.reason ? `: ${liquidity.reason}` : ''}{limit}</>
     : `unavailable${liquidity.reason ? `: ${liquidity.reason}` : ''}${limit}`;
   return <p role="status" className="data-note" data-liquidity={liquidity.status}>Testnet liquidity · Etesia-supplied, not market depth: {outcome}</p>;
 }
@@ -328,7 +335,7 @@ export function ExecutionPanel({ net, owner, plan, states, open, earlier, prepEr
   return <section className="execution-routes">
     <h4>Execution — Stellar testnet transactions signed by your wallet · test funds only</h4>
     <p className="data-note">One transaction per leg, each signed in your wallet: trustlines for bought assets, the sells of the selected sources (Soroswap swaps to USDC, then the vault withdraw or redeem), then the buys (Soroswap swaps from USDC, then the vault deposit). Every swap is quoted and built by the Soroswap Aggregator API on its testnet Soroswap pools (each invokes the router {net.router}). Soroswap testnet pool quote; testnet prices are not market prices. A swap's minimum output is the API's minimum at {net.soroswap.slippageBps / 100}% slippage (a sell is signed only while that minimum covers the USDC the plan counts on) and the vault calls allow 0.5% against their previews. The testnet pools are shallow: a swap whose price impact against a one-unit reference quote is above {IMPACT_LIMIT_BPS / 100}% is not signed. Each swap is quoted and built again right before its signature and expires {API_TX_SECONDS} seconds after it is built; the other transactions expire after {DEADLINE_SECONDS} seconds.</p>
-    <p className="data-note">Before quoting, Etesia's quant service may add testnet liquidity from its own float (account etesia-liquidity) to the Soroswap pools at their current price, so that each swap's impact is at most 1%.</p>
+    <p className="data-note">Before quoting, Etesia's quant service may add testnet liquidity from its own float (account etesia-liquidity) to the Soroswap pools at their current price, so that each swap's impact is at most 1%. When a pool's price is more than 1% off the oracle price against a swap, it first trades that pool back to the oracle price from the same float (a realign, at most 1,000 USDC a day for Builder runs).</p>
     {!storageOk && <p role="alert" className="data-note" style={{ color: 'var(--warn)' }}>Browser storage is unavailable, so a reload cannot recover a transaction that is still pending. Check your account on the explorer (<a href={`${net.explorerUrl}/account/${owner}`} target="_blank" rel="noreferrer">{owner}</a>) before running again.</p>}
     {networkError && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>{networkError}</p>}
     {wrongAccount && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>The connected account is not the one this allocation was built for. Rebuild it to execute.</p>}

@@ -154,27 +154,31 @@ Same wallet setup, with test USDC from the Blend faucet. Expected page text is q
    funds only", the page reads "Before quoting, Etesia's quant service may add
    testnet liquidity from its own float (account etesia-liquidity) to the
    Soroswap pools at their current price, so that each swap's impact is at most
-   1%." Before the quotes, the Builder asks the quant service's testnet
-   liquidity top-up for the run's swaps; its outcome reads "Testnet liquidity ·
-   Etesia-supplied, not market depth: pools deep enough", "… added A USDC + B
-   XLM to XLM/USDC (tx …)" with the explorer link, or "… unavailable: reason;
-   the 2% limit still applies." (a failed request never blocks the run by
-   itself). The "Rebalance — current vs target" rows show each bucket's
-   selected quantity and USDC value, its target and its trade. Check every leg
-   before signing: amount in, expected and minimum out (a swap's minimum is the
-   Soroswap API quote's `otherAmountThreshold`; a sell also shows the USDC the
-   plan counts on, 0.5% below the quote of the amount it sells, which its
-   minimum must cover), each swap's "price impact X.XX%" against a one-unit
-   reference quote, and the contract (the router
-   `CCJUD55A…E7BRD`, which every API-built swap invokes, the tRESERVE asset, the
-   vault). With only USDC selected there is no sell: "tRESERVE trustline ·
-   changeTrust", "Buy · USDC → XLM", "Buy · USDC → tRESERVE · USTRY stand-in on
-   testnet", then "Deposit · ETESIA-TF deposit_bounded". A swap above the 2%
-   price impact limit cannot be signed: the page reads, for example, "Sell ·
-   XLM → USDC: price impact 12.07% is above the 2% limit of the shallow testnet
-   pool. Lower the XLM source's percentage and rebuild." (a buy: "Lower the
-   sources' percentages and rebuild."), and the run checks it again with fresh
-   quotes before the first signature.
+   1%. When a pool's price is more than 1% off the oracle price against a swap,
+   it first trades that pool back to the oracle price from the same float (a
+   realign, at most 1,000 USDC a day for Builder runs)." Before the quotes, the
+   Builder asks the quant service's testnet liquidity top-up for the run's
+   swaps; its outcome reads "Testnet liquidity · Etesia-supplied, not market
+   depth: pools deep enough", "… Etesia's testnet realign of the XLM/USDC pool
+   to the oracle price (not market activity): sold A USDC for B XLM, -300 → 0
+   bps from the oracle price (tx …)" and "… added A USDC + B XLM to XLM/USDC (tx
+   …)" with the explorer links, or "… unavailable: reason; the 2% limit still
+   applies." (a failed request never blocks the run by itself). The "Rebalance —
+   current vs target" rows show each bucket's selected quantity and USDC value,
+   its target and its trade. Check every leg before signing: amount in, expected
+   and minimum out (a swap's minimum is the Soroswap API quote's
+   `otherAmountThreshold`; a sell also shows the USDC the plan counts on, 0.5%
+   below the quote of the amount it sells, which its minimum must cover), each
+   swap's "price impact X.XX%" against a one-unit reference quote, and the
+   contract (the router `CCJUD55A…E7BRD`, which every API-built swap invokes,
+   the tRESERVE asset, the vault). With only USDC selected there is no sell:
+   "tRESERVE trustline · changeTrust", "Buy · USDC → XLM", "Buy · USDC →
+   tRESERVE · USTRY stand-in on testnet", then "Deposit · ETESIA-TF
+   deposit_bounded". A swap above the 2% price impact limit cannot be signed:
+   the page reads, for example, "Sell · XLM → USDC: price impact 12.07% is above
+   the 2% limit of the shallow testnet pool. Lower the XLM source's percentage
+   and rebuild." (a buy: "Lower the sources' percentages and rebuild."), and the
+   run checks it again with fresh quotes before the first signature.
 4. Press **Sign and execute** and approve each leg in the wallet: the tRESERVE
    `changeTrust` (skipped as "Trustline already present" when the account has
    it), the USDC → XLM and USDC → tRESERVE swaps, then the `deposit_bounded`.
