@@ -279,7 +279,7 @@ export default function VaultDesk({ slug, network }) {
       <div className="left">
         <div className="row"><a href={builderHref(network)}>← Portfolio Atelier</a></div>
         <div className="row" style={{ marginTop: 6 }}><NetworkSwitch active={network} href={(next) => vaultHref(vault, next)} /></div>
-        <div className="row" style={{ marginTop: 6 }}><span>{net.label} · vault {truncateAddr(net.vault)}</span></div>
+        <div className="row" style={{ marginTop: 6 }}><span style={{ overflowWrap: 'anywhere' }}>{net.label} · vault <a href={`${net.explorerUrl}/contract/${net.vault}`} target="_blank" rel="noreferrer">{net.vault}</a></span></div>
       </div>
       <div className="center">
         <div className="eyebrow">— Etesia Research Bulletin —</div>
