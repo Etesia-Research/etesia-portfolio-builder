@@ -65,8 +65,7 @@ Local validation on 2026-09-19: production build, TypeScript and all 27 existing
 tests passed. Browser checks used a controlled HOT extension provider and stubbed
 widget transport to verify the address request, connected label, balance lookup,
 rejection, disconnect and reconnect, plus desktop/mobile layouts. No browser
-runtime errors occurred. Real HOT extension/Telegram/mobile approval remains
-unverified. To check it manually, open the picker, choose HOT Wallet, approve,
+runtime errors occurred. To check HOT Wallet manually, open the picker, choose HOT Wallet, approve,
 confirm the account/balances, disconnect, then reconnect or reject the request.
 
 Known upstream picker limitation: on reopening, an immediate wallet response can

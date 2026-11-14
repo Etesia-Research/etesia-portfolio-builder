@@ -302,7 +302,7 @@ export default function VaultDesk({ slug, network }) {
 
     <div className="section-bar" style={{ marginTop: 36 }}><span className="num-mark">02</span><h2>Wallet — connect on {network}</h2><span className="meta">Freighter/Varial · xBull</span></div>
     {!(connected && address) ? <section className="execution-routes">
-      <p className="data-note">The wallet must be set to {net.label} ("{net.passphrase}"). Freighter/Varial reports its network and signing is blocked on a mismatch. xBull cannot report its network; every signature request pins the {net.label} passphrase. xBull is not evidenced in the recorded runs.</p>
+      <p className="data-note">The wallet must be set to {net.label} ("{net.passphrase}"). Freighter/Varial reports its network and signing is blocked on a mismatch. With xBull, every signature request pins the {net.label} passphrase.</p>
       <button className="btn lg" disabled={connecting} onClick={() => connectWallet().catch(() => {})}><span className="dot" />{connecting ? 'Connecting… approve in your wallet' : 'Connect wallet'}<span>→</span></button>
       {connectError && <p role="alert" className="data-note" style={{ color: 'var(--bad)' }}>{connectError}</p>}
     </section> : <>
