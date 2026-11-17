@@ -1,44 +1,73 @@
 # Etesia Portfolio Builder
 
-Next.js frontend for the Etesia quant API. Use pnpm and the committed lockfile.
+A web app for building a risk-balanced portfolio of Stellar assets and Etesia-TF, a trend-following vault on Stellar. It also has a vault page for deposits, withdrawals and indexed vault metrics, and a strategy factsheet.
 
-## License
+Live on testnet: https://portfolioatelier.etesiar.com/?network=testnet
 
-Copyright (c) 2026 Etesia Research Inc. All rights reserved.
-Etesia-owned materials are available for inspection of the implementation and
-demonstrations under the [Proprietary Source Inspection License](LICENSE).
-Running, building, testing, copying, modifying, distributing or deploying them
-requires prior written authorization and a separate agreement signed by both
-parties, subject to the license's platform, third-party and legal exceptions.
-The setup and verification instructions below are for authorized users.
-Dependencies, fonts and third-party logos retain their own licenses and ownership;
-see also [logo sources](public/logos/README.md). GitHub's public-repository viewing
-and forking rights remain unaffected.
+Vault contracts, testnet deployment and transaction archive: https://github.com/Etesia-Research/stellar_vault
 
-## Configuration
+<img src="docs/screenshots/builder-testnet.png" width="600" alt="Portfolio Builder in testnet mode with the Etesia-TF vault and XLM selected and the working basket metrics">
 
-Set these **server-only** variables in the ignored `.env.local`:
+*Portfolio Builder in testnet mode: the product universe with the Etesia-TF testnet vault and XLM selected, and the working basket's correlation and risk metrics.*
 
-```dotenv
-ETESIA_API_URL=https://your-quant-api.example
-ETESIA_API_KEY=your-private-server-key
-ETESIA_LIQUIDITY_API_KEY=your-private-liquidity-key
-SOROSWAP_API_KEY=sk_your-soroswap-key
-```
+## Try it on testnet
 
-A hostname without a scheme is interpreted as HTTPS. The browser calls the
-allowlisted `/api/quant/` proxy; the bearer key never enters browser requests.
-Its `testnet/liquidity` path (the quant service's A98 testnet liquidity top-up)
-sends `ETESIA_LIQUIDITY_API_KEY` instead, forwards the first `X-Forwarded-For`
-hop as `X-Etesia-Client` for the service's per-client limits, and reports a busy
-or rate-limited top-up (409, 429) as "Testnet liquidity is busy; retry".
-No Soroswap credential is needed in the frontend. The quant service owns the
-mainnet quotes. Testnet allocation swaps call the allowlisted
-`/api/soroswap/quote` and `/api/soroswap/build` route, which holds
-`SOROSWAP_API_KEY`, accepts only testnet manifest assets, forces the Soroswap
-venue and the 0.5% slippage on `/quote`, and builds on `/build` only a Soroswap
-router quote on that venue whose minimum is the API's at that slippage; the
-browser signs the built transaction and submits it through Stellar RPC itself.
+No login or credentials are needed, only Freighter or xBull set to Testnet, with test XLM from Friendbot (Freighter offers it when the account is new).
+
+1. Open https://portfolioatelier.etesiar.com/stellar_tf_vault/testnet and connect your wallet.
+2. Click "Sign & add USDC trustline".
+3. Go to https://portfolioatelier.etesiar.com/?network=testnet and select XLM and ETESIA-TF.
+4. Under Funding, pick your XLM and set its amount to 500 XLM. Set the risk cap to 10% and keep the USTRY reserve.
+5. Click "Build risk-parity portfolio", review the legs, then "Sign and execute". Approve each transaction in your wallet.
+6. Return to the vault page. Your shares appear under Position. Try a deposit and a partial withdrawal: "Preview", then sign.
+
+A build is capped at 100 USDC, and a swap that would move the pool price by more than 2% is blocked. Both limits protect the small testnet pools. Every receipt links to Stellar Expert.
+
+The full manual scripts, with the expected page text, are in [docs/testnet-walkthrough.md](docs/testnet-walkthrough.md).
+
+## What it does
+
+- Lists Stellar assets and the Etesia-TF vault with daily prices, market caps, Sharpe ratios and correlations from the Etesia quant service.
+- Shows return, Sharpe, drawdown and correlation for the selected basket.
+- Takes wallet holdings as funding, a risk cap and a cash reserve, and returns a risk-balanced allocation with a three-year historical simulation.
+- Executes or simulates that allocation, depending on the network (see the table).
+- On testnet, shows the vault's share price, TVL, NAV and allocation history, performance, Blend yield and rebalance events, read from the Etesia indexer ([screenshots](docs/testnet-walkthrough.md#what-the-vault-page-shows)).
+
+| | Testnet | Mainnet |
+|---|---|---|
+| Wallets (Stellar Wallets Kit) | Freighter, xBull | Freighter, Albedo, xBull, Lobstr Vault, HOT Wallet |
+| Products you can allocate | XLM, Etesia-TF | XLM, AQUA, ETH, BTC, SHX, Etesia-TF |
+| Cash reserves | USDC, and USTRY through its stand-in tRESERVE | USDC, EURC, USTRY |
+| Builder execution | Wallet-signed transactions: trustlines, Soroswap swaps, vault deposit, withdrawal or redemption | Simulated with quotes; nothing is signed |
+| Vault page | Live: deposit, withdraw, indexed metrics | Not deployed |
+
+Market data comes from mainnet daily closes on both networks.
+
+<img src="docs/screenshots/vault-testnet.png" width="900" alt="Etesia-TF testnet vault page with the indexed metrics">
+
+*Etesia-TF testnet vault: indexed share price, TVL, allocation against target, last rebalance, Blend yield, return and drawdown.*
+
+## Pages
+
+| Route | Page |
+|---|---|
+| `/` | Builder, mainnet mode |
+| `/?network=testnet` | Builder, testnet mode |
+| `/stellar_tf_vault/testnet` | Vault page on testnet; `?amount=<USDC>` prefills a deposit |
+| `/stellar_tf_vault/mainnet` | Vault page on mainnet, shown as not deployed |
+| `/stellar_tf_vault` | Etesia-TF strategy factsheet; no wallet needed |
+| `/testnet` | Redirects to `/stellar_tf_vault/testnet` |
+
+## Run locally
+
+Requires Node 22.12 or later and pnpm. Copy `.env.example` to `.env.local` and fill in these server-only variables:
+
+| Variable | Used for |
+|---|---|
+| `ETESIA_API_URL` | Base URL of the Etesia quant service |
+| `ETESIA_API_KEY` | Every quant service call except the testnet liquidity top-up |
+| `ETESIA_LIQUIDITY_API_KEY` | The quant service's testnet liquidity top-up |
+| `SOROSWAP_API_KEY` | Testnet swap quotes and builds from the Soroswap API |
 
 ```sh
 pnpm install --frozen-lockfile
@@ -48,304 +77,36 @@ pnpm build
 pnpm exec tsc --noEmit
 ```
 
-Development uses `.next-dev`; production builds and `pnpm start` use `.next`.
-This keeps `pnpm build` from overwriting chunks loaded by an active dev server.
-Both generated directories are ignored by Git.
+`tests/` holds 164 tests in 11 files.
 
-## Wallets
+The app has two server proxies. `/api/quant` forwards an allowlist of paths to the Etesia quant service. `/api/soroswap` is a testnet-only quote and build proxy to the Soroswap API.
 
-The connection screen and Stellar Wallets Kit picker support Freighter, Albedo,
-xBull, Lobstr Vault and HOT Wallet on Stellar mainnet. Select HOT Wallet in the
-picker, then approve in its extension or Telegram/mobile widget. Kit 2.8.0
-includes `HotWalletModule`; no extra dependency or API key is required.
-See the [HOT SDK Stellar integration](https://github.com/hot-dao/hot-sdk-js#stellar-connect).
-Connecting reads balances; mainnet execution remains simulated and requests no signatures.
+Keys never reach the browser. On testnet the wallet signs each transaction and the browser submits it: trustlines through Horizon, swaps and vault calls through Stellar RPC.
 
-Local validation on 2026-09-19: production build, TypeScript and all 27 existing
-tests passed. Browser checks used a controlled HOT extension provider and stubbed
-widget transport to verify the address request, connected label, balance lookup,
-rejection, disconnect and reconnect, plus desktop/mobile layouts. No browser
-runtime errors occurred. To check HOT Wallet manually, open the picker, choose HOT Wallet, approve,
-confirm the account/balances, disconnect, then reconnect or reject the request.
+## Code map
 
-Known upstream picker limitation: on reopening, an immediate wallet response can
-arrive before the kit finishes availability checks and installs its modal event
-listeners, leaving the connection pending. Controlled checks wait for those
-checks before selecting the wallet. Reloading restores the connection screen.
+| Path | Purpose |
+|---|---|
+| `app/page.tsx`, `components/PortfolioBuilder.jsx` | Builder: catalog, basket, funding, reserves, allocation |
+| `components/TestnetExecution.jsx`, `lib/execution.ts` | Testnet legs, the 100 USDC cap and the 2% price impact limit |
+| `components/ExecutionSimulation.jsx` | Mainnet simulated execution |
+| `app/[vault]/[network]/page.tsx`, `components/VaultDesk.jsx` | Vault pages: indexed metrics, trustline, deposit, withdraw |
+| `app/stellar_tf_vault/page.tsx` | Strategy factsheet |
+| `app/api/quant/`, `app/api/soroswap/` | Server proxies |
+| `lib/network.ts`, `lib/vaults.ts`, `lib/vault.ts` | Network settings, vault registry, vault contract client |
+| `components/stellar/walletKit.ts` | Stellar Wallets Kit setup and network checks |
+| `data/testnet-manifest.json` | Testnet deployment manifest |
 
-## Vault pages (`/<vault>/<network>`)
+## Related
 
-Each vault has one page per network, listed in `lib/vaults.ts`: today
-`/stellar_tf_vault/testnet` and `/stellar_tf_vault/mainnet`. A new vault is one
-registry entry. The masthead switch (Mainnet | Testnet, `?network=testnet` on `/`)
-selects which network's vault the Builder shows; the two are never mixed. The old
-`/testnet` URL redirects to `/stellar_tf_vault/testnet`.
+- `data/testnet-manifest.json` is a copy of `deploy/testnet/pre-2026-12-16-reset.json` in [stellar_vault](https://github.com/Etesia-Research/stellar_vault).
+- The Etesia quant service (allocation, indexer, metrics API) is a separate private service.
 
-`/stellar_tf_vault/testnet` signs real Stellar testnet transactions against the
-flagship vault of the pre-reset deployment (`data/testnet-manifest.json`, copied
-from `etesia-vault/deploy/testnet/pre-2026-12-16-reset.json`). It offers
-Freighter/Varial and xBull only. The mainnet Builder signs nothing. In testnet
-mode the Builder reads balances from testnet Horizon, offers only the products
-with a Soroswap testnet market for the same asset (XLM, the Etesia-TF vault, USDC
-and the USTRY reserve through its labelled stand-in tRESERVE; AQUA, ETH, BTC, SHX
-and EURC are shown as not selectable), and rebalances the selected holdings to
-the allocation, every trade a wallet-signed testnet transaction (see the
-allocation and rebalance run below).
-`/stellar_tf_vault/testnet?amount=<USDC>` still prefills a deposit. `/stellar_tf_vault/mainnet`
-shows the vault as not deployed, with every control disabled, until a mainnet
-manifest is added to the registry.
+## More detail
 
-### Testnet wallet check (manual script)
+- [docs/testnet-walkthrough.md](docs/testnet-walkthrough.md): manual testnet scripts with the expected page text.
+- [docs/data-and-allocation.md](docs/data-and-allocation.md): data sources, allocation, simulation, execution and the factsheet.
 
-Use a throwaway testnet account funded with Friendbot, with Freighter/Varial set
-to Testnet. Expected page text is quoted.
+## License
 
-1. Open `/stellar_tf_vault/testnet`, press **Connect wallet**, pick Freighter, approve. The
-   masthead shows "CONNECTED — Freighter"; Onboarding shows "Funded · … XLM" and
-   "USDC trustline Missing".
-2. Press **Sign & add USDC trustline**, approve. A receipt "Testnet transaction,
-   not a simulation · Add USDC trustline" shows the ledger and hash.
-3. Start a vault action (for example a deposit after **Preview**) and reject it in
-   the wallet: "Signature request was rejected in the wallet. Nothing was
-   submitted."
-4. Switch the wallet to Mainnet, then return to the tab: the banner "Wallet
-   network mismatch: switch your wallet to Stellar testnet …" appears and the
-   sign buttons are disabled. Switch back to Testnet and return to the tab: the
-   banner clears.
-5. Press **↪ disconnect**: the masthead shows "UNCONNECTED".
-
-Vault flow (D5-03): claim test USDC from the Blend faucet link, **Refresh**,
-then **Preview** and **Sign & deposit**; the receipt shows the shares the
-contract returned. Then a partial **Sign & withdraw** within "Max withdraw" and
-**Sign & redeem all shares**. An unconfirmed transaction is reported with its
-hash as an unknown outcome; check the explorer before retrying.
-
-### Testnet allocation and rebalance run (manual script)
-
-Same wallet setup, with test USDC from the Blend faucet. Expected page text is quoted.
-
-1. Open `/?network=testnet`. The banner reads "Testnet mode · market data from
-   mainnet daily closes · balances, quotes and execution on Stellar testnet, test
-   funds only". The AQUA, ETH, BTC and SHX cards read "Not selectable on testnet ·
-   no Soroswap testnet market for …" and ignore clicks.
-2. Connect. Section 03 lists "① Your holdings — select the sources to allocate or
-   rebalance": XLM ("MAX keeps … XLM back for fees and the account reserve"),
-   USDC, tRESERVE ("USTRY stand-in on testnet") and ETESIA-TF ("Vault shares · …
-   USDC"), each only when held. The EURC reserve reads "Not selectable on testnet
-   · no Soroswap testnet market for EURC" and the USTRY reserve reads "USTRY
-   stand-in on testnet: Etesia-issued tRESERVE …". Select XLM and ETESIA-TF with
-   the USTRY reserve, click the USDC holding (it starts at 100%, MAX), set the
-   volatility budget to 10%, and build. At the default 25% these two products
-   reach about 16.6% volatility fully invested, so the 95% gross allocation cap
-   binds, the page shows "No USTRY reserve: …" and the run has no tRESERVE legs;
-   a budget below the level that note reports keeps a reserve. The capital line
-   reads "Valued at testnet Soroswap spot rates (one-unit quotes) and the
-   vault's share value when built": XLM and tRESERVE are valued at a quote of
-   one whole unit, not of the whole holding. It also reads "Testnet builds use
-   at most 100 USDC of the selected value; a larger selection is scaled down
-   proportionally."; a larger selection builds with every source's percentage
-   scaled down, and section 05 reads "Capped: X USDC selected, scaled to 100
-   USDC (Y% of each source)." The testnet pools are shallow (XLM/USDC about
-   65,000 / 8,850, tRESERVE/USDC about 1,000 / 1,000). An invalid percentage (below 1, above 100 or more than two decimals)
-   reads "Enter a percentage from 1 to 100, with at most two decimals." and
-   blocks the build.
-3. Under "Execution — Stellar testnet transactions signed by your wallet · test
-   funds only", the page reads "Before quoting, Etesia's quant service may add
-   testnet liquidity from its own float (account etesia-liquidity) to the
-   Soroswap pools at their current price, so that each swap's impact is at most
-   1%. When a pool's price is more than 1% off the oracle price against a swap,
-   it first trades that pool back to the oracle price from the same float (a
-   realign, at most 1,000 USDC a day for Builder runs)." Before the quotes, the
-   Builder asks the quant service's testnet liquidity top-up for the run's
-   swaps; its outcome reads "Testnet liquidity · Etesia-supplied, not market
-   depth: pools deep enough", "… Etesia's testnet realign of the XLM/USDC pool
-   to the oracle price (not market activity): sold A USDC for B XLM, -300 → 0
-   bps from the oracle price (tx …)" and "… added A USDC + B XLM to XLM/USDC (tx
-   …)" with the explorer links, or "… unavailable: reason; the 2% limit still
-   applies." (a failed request never blocks the run by itself). The "Rebalance —
-   current vs target" rows show each bucket's selected quantity and USDC value,
-   its target and its trade. Check every leg before signing: amount in, expected
-   and minimum out (a swap's minimum is the Soroswap API quote's
-   `otherAmountThreshold`; a sell also shows the USDC the plan counts on, 0.5%
-   below the quote of the amount it sells, which its minimum must cover), each
-   swap's "price impact X.XX%" against a one-unit reference quote, and the
-   contract (the router `CCJUD55A…E7BRD`, which every API-built swap invokes,
-   the tRESERVE asset, the vault). With only USDC selected there is no sell:
-   "tRESERVE trustline · changeTrust", "Buy · USDC → XLM", "Buy · USDC →
-   tRESERVE · USTRY stand-in on testnet", then "Deposit · ETESIA-TF
-   deposit_bounded". A swap above the 2% price impact limit cannot be signed:
-   the page reads, for example, "Sell · XLM → USDC: price impact 12.07% is above
-   the 2% limit of the shallow testnet pool. Lower the XLM source's percentage
-   and rebuild." (a buy: "Lower the sources' percentages and rebuild."), and the
-   run checks it again with fresh quotes before the first signature.
-4. Press **Sign and execute** and approve each leg in the wallet: the tRESERVE
-   `changeTrust` (skipped as "Trustline already present" when the account has
-   it), the USDC → XLM and USDC → tRESERVE swaps, then the `deposit_bounded`.
-   Each confirmed leg shows "Stellar testnet transaction, not a simulation · …"
-   with its ledger, returned amount and explorer link. Once the button reads
-   "All legs executed", sections 02–04 unlock, the holdings are read again
-   (tRESERVE and the vault shares now listed), and section 05 keeps its receipts
-   until the next **Build risk-parity portfolio**; that build lists them as the
-   earlier allocation's receipts until **Acknowledge and allow this run**.
-5. Rebalance: select XLM, USDC, tRESERVE and ETESIA-TF as sources (each at
-   100%, or lower one, for example the shares to 50%), change the volatility
-   budget or the products, and build again. The rebalance rows net each bucket:
-   above its target it sells only the excess ("Sell · XLM → USDC", "Sell ·
-   tRESERVE → USDC · USTRY stand-in on testnet", "Withdraw · ETESIA-TF
-   withdraw_bounded", capped at the vault's max withdraw, or "Redeem all ·
-   ETESIA-TF redeem_bounded" when the vault leaves the basket and every share is
-   selected); below it buys with the USDC; within 0.01 USDC it reads "Within
-   tolerance, no trade". Sells run before buys, and buys are scaled down when
-   the sells' minimums fall short. Acknowledge the earlier receipts, then sign.
-   Unselected holdings are not touched.
-6. Reject one signature: the run stops with "Signature request was rejected in
-   the wallet. Nothing was submitted." and **Continue with the remaining legs**
-   quotes the rest again. A sell whose quote fails stops the run before any buy.
-7. Reload while a leg is "Submitted · confirming onchain…": after rebuilding, the
-   page lists it as "Pending transaction" and nothing can be signed until
-   **Check status** resolves it. Legs confirmed before the reload, and one that
-   resolves as confirmed, are listed as the earlier allocation's receipts; they
-   are not deducted from the rebuilt allocation, so its run stays blocked until
-   **Acknowledge and allow this run**, after which it executes every leg again.
-8. Open `/stellar_tf_vault/testnet`: the contract-read and indexed shares match.
-9. Switch to Mainnet: the holdings list allows several sources the same way;
-   "Simulate execution" shows the same net trades (sells quoted to USDC, buys
-   from USDC, current values at the daily close, the vault at a simulated $1 per
-   share) and nothing is signed.
-
-## Data and allocation
-
-- Product cards come from the quant catalog: XLM, AQUA, ETH, BTC, SHX and the
-  Etesia TF vault. USDC/EURC/USTRY are reserve assets, absent from the product grid.
-- Prices are dated daily USD closes, not live swap marks. The price band shows
-  the completed candle day: a September 19 midnight UTC boundary is labeled
-  September 18. Analytics show their actual start/end candle dates;
-  raw timestamps and freshness checks remain unchanged. Market caps, annualized
-  Sharpe over up to three years and basket correlations come from the API. Missing values remain
-  unavailable; no static numerical fallback or browser allocation solver exists.
-- Working basket shows average signed pairwise correlation (distinct pairs only)
-  and annualized return, Sharpe, maximum drawdown and Calmar together from one
-  `POST /v1/basket/analytics` response. The basket starts
-  with equal capital per selected product and holds quantities fixed for up to three
-  years (available common history, minimum one year), in USD with a 0% risk-free rate. Funding, reserves and allocator weights
-  do not affect these selection metrics. Single-product correlation and missing
-  data show an em dash with a reason; simulated vault returns remain labeled.
-- Product icons use locally served official project assets and the supplied
-  Etesia mark; see [logo sources](public/logos/README.md).
-- After allocation, one `POST /v1/builder/simulation` request returns return,
-  Sharpe, annualized volatility, max drawdown, Calmar and both portfolio/XLM equity curves. All calculated
-  weights, including buffers and reserves, span the full trailing three years. Each
-  allocation stays in USD cash at 0% until its first available close, then buys and
-  holds the asset without rebalancing. Later start dates are shown; all metrics use
-  the full curve. Both USD curves start at 100;
-  pointer and keyboard controls expose daily values. Today's weights applied to
-  the past are a retrospective illustration, excluding trading costs. Internal gaps,
-  stale tails, entirely missing history or a changed market snapshot show an explicit unavailable state.
-- **Simulate execution** nets the selected sources against the model targets
-  (current values at the daily close) and uses actual-size quotes for each net
-  trade: a source above its target sells the excess to USDC, a position below
-  it buys from USDC (the sells are quoted first, and the buys spend only the
-  USDC those quotes return at least, scaled down together when short), and a
-  difference under 0.01 USDC is not traded. Atomic
-  rounding dust stays in the USDC buffer. Cash is retained without a swap. The vault needs no swap quote: shares assume $1 USD, using the
-  reference USDC/USD conversion. Each row shows quoted output, minimum output,
-  and quote time; failed or 60-second-old quotes block simulation. Refresh obtains
-  a new complete quote set and clears any prior completion. No wallet signature,
-  transaction, invented receipt hash or balance mutation occurs. Network/vault
-  fees are excluded; fills are assumed at quoted outputs.
-- The vault remains **Under construction**, but a selected vault participates in
-  covariance allocation through its simulated equity history. Allocation and
-  historical simulation retain `vault_run_id`; a report change requires rebuilding.
-  Its $1 share price is an explicit sizing assumption, not a published live mark.
-- Quotes appear only after allocation. Product/reserve selection and allocation
-  construction do not depend on quotes. ETH/BTC analytics use underlying histories,
-  while quoted Stellar instruments are the identified Ultra Capital wrappers.
-- Funding lists the wallet's holdings (actual Horizon balances; on testnet also
-  tRESERVE and the vault shares). Several can be selected as sources; each starts
-  at 100% (MAX) and takes 1–100% with up to two decimals. The hypothetical USDC
-  capital is the sum over the selected parts of
-  `quantity × source USD close / USDC USD close`, with fresh matching timestamps.
-  On testnet the parts are valued instead at testnet Soroswap quotes to USDC and
-  the vault's share value, and the XLM maximum leaves the most a run keeps back
-  for fees and the account reserve.
-  The displayed catalog value is a daily-reference estimate, not full-wallet NAV.
-- Funding includes a **Risk cap** slider, default **25%**, sent as the annual
-  allocated-sleeve volatility budget. It does not change the reserve/buffer fractions
-  or promise realized whole-portfolio volatility.
-- Builder preserves equal-risk proportions by scaling all selected products down
-  to the 40% portfolio-capital cap for non-vault products. Etesia vault alone is
-  exempt; common volatility/gross limits and buffers remain. The product sleeve may be smaller
-  than the available capital. Residual cash goes to the selected reserves.
-- **Cash reserve** appears after Funding. USTRY is selected by default; select
-  USDC, EURC and/or USTRY to split residual cash equally by USDC notional. EURC
-  uses aligned EURC/USD and USDC/USD closes and remains reserve-only. The 2.5% USDC and 2.5% XLM buffers are
-  separate from this selection.
-- The API returns target quantities, USDC notionals, reserve positions, annual
-  allocated-sleeve volatility and binding constraints. Blocked calculations retain
-  diagnostics. Execution remains a preview; no transaction is signed or submitted.
-
-The expanded backend advertises `allocation_supported` for each token and
-`cash_reserve_assets` in the catalog. The prepared backend update was deployed on September 19, 2026 as
-`3fada63c-9489-40c5-84a8-832c5a237dbf`, enabling SHX allocation, USDC/EURC/USTRY reserves, EURC daily collection and token APIs. Against the older API, the frontend exposes
-its four supported allocation products and default USTRY reserve, labeling the
-additional capabilities unavailable. The expanded Builder does not change
-vault strategy or historical replay universes.
-
-## Manual verification
-
-Load the universe without connecting a wallet, select the vault, and verify that
-correlation labels identify simulated returns. Connect a wallet, select a source
-balance and products, choose cash reserves, and
-calculate. Check that positions sum to the supplied USDC capital and show each
-buffer separately. Empty reserve selections, stale/missing reference prices,
-failed balance refreshes must prevent construction. Unavailable routes must not
-block allocation. Confirm there are no quote requests before allocation and that
-refreshing quotes uses current actual amounts and clears the previous receipt.
-Check quote failures, expiry, vault $1 share sizing, all three reserve logos,
-and three-year/shorter available-history metrics and date labels.
-Changing inputs or wallets must invalidate a pending result. EURC requires published
-history and API reserve support before selection.
-Missing or invalid EURC closes block a selected EURC reserve without affecting
-other reserve choices or vault targets.
-
-EURC uses [Circle’s published Stellar issuer](https://developers.circle.com/stablecoins/eurc-contract-addresses), with its mainnet asset contract derived using the Stellar SDK. Its API proxy routes and reserve selection passed frontend regression tests, TypeScript checks and the production build on September 19, 2026.
-
-
-Allocation totals include the vault. The preview separately labels selected-product
-allocation and estimated annual product volatility (one-year risk model, excluding
-reserves/buffers). The performance table shows historical annualized volatility
-for the entire portfolio and XLM over the same three-year curve used for Sharpe.
-ERC balances modeled risk contributions; it does not maximize historical Sharpe.
-
-Return labels explicitly identify CAGR. Sharpe uses annualized arithmetic daily
-mean divided by annualized sample volatility at a 0% risk-free rate; CAGR divided
-by volatility is not the displayed Sharpe. The one-year covariance model estimate
-and full three-year historical portfolio volatility use different windows, weights
-and scopes and are labeled separately.
-
-
-## Etesia-TF factsheet
-
-The Etesia-TF product's info link opens `/stellar_tf_vault`, a public, responsive
-strategy factsheet requiring no wallet. It shows the fixed XLM/AQUA/ETH/BTC
-universe, monthly risk-parity weights, daily target capital allocations including
-reserves/buffers, and the latest published backtest metrics. Trend signals are
-omitted by user request. Investor copy describes the approach without formulas
-or calibration parameters; allocations and performance are explicitly simulated.
-
-The server reads authenticated `vault/weights` and `vault/backtests/latest` using
-the existing configuration, without exposing their full research payloads.
-Missing/blocked allocations remain unavailable; report availability is independent
-and stale reports retain their dates and warning. PDF and XLSX downloads use
-`/api/quant/vault/backtests/{run_id}/files/{pdf|xlsx}`. This GET-only proxy validates
-the 20-character hexadecimal run ID and format, streams the original binary,
-and keeps the bearer key server-side. Both links are bound to the displayed run.
-
-Local verification on 2026-09-19: production build, TypeScript and 30 tests passed.
-Desktop (1440px) and mobile (390px) browser checks passed selection/info navigation,
-layout without horizontal overflow, binary PDF/XLSX downloads, unknown-run and
-invalid-path rejection, with no browser runtime errors. Tests cover blocked and
-unavailable allocations, zero holdings, null metrics, stale reports, independent
-report failures and private-payload exclusion. Real report `70c32c0f372438da9738`
-was read through the existing backend; no backend change or frontend deployment
-was performed.
+Copyright (c) 2026 Etesia Research Inc. All rights reserved. The source is published for inspection under the [Proprietary Source Inspection License](LICENSE).
