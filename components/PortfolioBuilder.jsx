@@ -13,7 +13,7 @@ import AllocationSimulation from "@/components/AllocationSimulation";
 import useBalanceStore from "@/stores/useBalanceStore";
 import { fetchHoldings } from "@/lib/balances";
 import { TESTNET_CAPITAL_CAP, testnetSelectable, tokenUnits, xlmSourceKeep } from "@/lib/execution";
-import { SHARE_DECIMALS, fromUnits, vaultClient } from "@/lib/vault";
+import { SHARE_DECIMALS, fromUnits, toUnits, vaultClient } from "@/lib/vault";
 import { MAINNET, TESTNET } from "@/lib/network";
 import { VAULTS, builderHref, builderNetwork, vaultHref } from "@/lib/vaults";
 import NetworkSwitch from "@/components/NetworkSwitch";
@@ -26,6 +26,8 @@ const RESERVE_IDS = new Set(['usdc', 'eurc', 'ustry']);
 // On testnet only products with a Soroswap testnet market for the same asset,
 // the testnet vault and USDC can be selected (lib/execution.ts testnetSelectable).
 const selectableOn = (network, id) => network !== 'testnet' || testnetSelectable(id, TESTNET);
+// The risk cap (percent annual volatility) until the slider is moved; switching networks resets it.
+const defaultBudget = (network) => network === 'testnet' ? '15' : '25';
 const notSelectable = (tk) => `Not selectable on testnet · no Soroswap testnet market for ${tk}`;
 
 // Existing truncation style, e.g. GA7Q…3K2M (4 + … + 4).
@@ -305,9 +307,27 @@ function holdingRows(network, coins, balByTk, testnet) {
   ].filter(row => row && row.held > BigInt(0));
 }
 
-// A source's percent: 1 to 100, at most two decimals.
-const validPercent = (percent) => /^\d{1,3}(?:\.\d{1,2})?$/.test(percent) && Number(percent) >= 1 && Number(percent) <= 100;
-const sourcePart = (row, percent) => ({ symbol: row.symbol, percent: Number(percent), quantity: row.max * BigInt(Math.round(Number(percent) * 100)) / BigInt(10000) });
+// A selected source is a preset { percent } of the holding's selectable maximum
+// (it follows the maximum as it changes) or a typed { amount } in its units;
+// value, when present, is the USDC value the amount was typed as (amount null
+// when that is not a valid value), shown while it still converts to the amount.
+const unitsOf = (text, decimals) => { try { return toUnits(text, decimals); } catch { return null; } };
+// Each selected holding's part as the build takes it, or the error that blocks
+// the build. A typed amount's percent is 100 only at the maximum.
+const sourceParts = (rows, sources) => rows.filter(r => r.symbol in sources).map(r => {
+  const { percent, amount } = sources[r.symbol];
+  const quantity = percent != null ? r.max * BigInt(percent) / BigInt(100) : unitsOf(amount, r.decimals);
+  const error = quantity == null || (percent == null && quantity <= BigInt(0)) ? `Enter an amount above 0, with at most ${amount == null ? 7 : r.decimals} decimals.`
+    : quantity <= BigInt(0) ? `Nothing to allocate: no ${r.symbol} is selectable.`
+    : quantity > r.max ? `Above the selectable maximum of ${fromUnits(r.max, r.decimals)} ${r.symbol}.` : null;
+  // Below the maximum the share is taken in bigint, so it stays below 100 (no full exit).
+  return { row: r, error, part: { symbol: r.symbol, percent: percent ?? (quantity === r.max ? 100 : error ? 0 : Number(quantity * BigInt(1e12) / r.max) / 1e10), quantity } };
+});
+// USDC value per unit: value = units × out / in, rounded down (7 decimals).
+const closeRate = (value) => value == null ? null : { out: BigInt(Math.round(value * 1e12)), in: BigInt(1e12) };
+const ONE_UNIT = BigInt(10000000);
+// A derived USDC value as its field shows it: two decimals, rounded down, so typing it back stays within the amount.
+const usdcValue = (units) => { const cents = units / BigInt(100000); return `${cents / BigInt(100)}.${String(cents % BigInt(100)).padStart(2, '0')}`; };
 // A testnet build needs the vault position only when the vault is a selected source or in the basket.
 const needsPosition = (sources, allocationCoins) => 'ETESIA-TF' in sources || allocationCoins.some(c => c.tk === 'ETESIA-TF');
 const amountOf = (quantity, decimals) => Number(fromUnits(quantity, decimals)).toLocaleString(undefined, { maximumFractionDigits: 4 });
@@ -321,17 +341,33 @@ function FundingPanel({ coins, allocationCoins, network = 'mainnet', testnet, so
   const balError = useBalanceStore(s => s.address === address ? s.error : null);
   const account = testnet?.owner === address ? testnet : null;
   const rows = useMemo(() => holdingRows(network, coins, balByTk, account), [network, coins, balByTk, account]);
-  const selected = rows.filter(r => r.symbol in sources);
-  const parts = selected.map(r => validPercent(sources[r.symbol]) ? sourcePart(r, sources[r.symbol]) : null);
-  const partsValid = parts.length > 0 && parts.every(p => p && p.quantity > BigInt(0));
+  const entries = sourceParts(rows, sources);
+  const parts = entries.map(e => e.error ? null : e.part);
+  const partsValid = parts.length > 0 && parts.every(Boolean);
+  // Testnet: an XLM or tRESERVE source's rate is a Soroswap testnet quote of one
+  // whole unit to USDC, as valueSources values it, quoted once when it is selected.
+  // A request is held as its own pending marker: deselecting drops it, so a late
+  // result (or one after an owner change, which clears the sources) is ignored.
+  const [quotes, setQuotes] = useState({});
+  const quoting = network === 'testnet' ? entries.map(e => e.row.symbol).filter(s => s !== 'USDC' && TESTNET.assets[s]) : [];
+  useEffect(() => {
+    const asked = Object.fromEntries(quoting.filter(s => !(s in quotes)).map(s => [s, { pending: true }]));
+    setQuotes(current => ({ ...Object.fromEntries(quoting.filter(s => s in current).map(s => [s, current[s]])), ...asked }));
+    const client = vaultClient(TESTNET);
+    for (const [symbol, marker] of Object.entries(asked)) client.quoteSwap(ONE_UNIT, [TESTNET.assets[symbol].address, TESTNET.usdc.contract])
+      .then(({ amountOut }) => ({ out: amountOut, in: ONE_UNIT }), err => ({ error: client.vaultError(err) }))
+      .then(rate => setQuotes(current => current[symbol] === marker ? { ...current, [symbol]: rate } : current));
+  }, [address, quoting.join(',')]);
+  const rateOf = (r) => network !== 'testnet' ? closeRate(fundingValue(bySymbol, r.symbol, 1)) : r.value != null ? { out: r.value, in: r.held } : quotes[r.symbol];
   // Mainnet: the hypothetical capital is the daily-close value of every selected part.
   const closeValues = network === 'testnet' ? [] : parts.map(p => p && fundingValue(bySymbol, p.symbol, Number(fromUnits(p.quantity, 7))));
   const capital = closeValues.some(v => v == null) ? null : closeValues.reduce((sum, v) => sum + v, 0);
   const unsupported = allocationCoins.filter(c => c.allocationSupported === false);
   const canBuild = !unsupported.length && balLoaded && !balError && partsValid && (network === 'testnet' ? !!account?.position || !needsPosition(sources, allocationCoins) : capital != null) && allocationCoins.length > 0 && Number(budget) > 0 && Number.isFinite(Number(budget)) && !building && reserveValid;
-  const setPercent = (symbol, percent) => setSources(current => ({ ...current, [symbol]: percent }));
+  const setSource = (symbol, source) => setSources(current => ({ ...current, [symbol]: source }));
+  const digits = (e) => e.target.value.replace(/[^0-9.]/g, '');
   const toggle = (symbol) => setSources(current => {
-    if (!(symbol in current)) return { ...current, [symbol]: '100' };
+    if (!(symbol in current)) return { ...current, [symbol]: { percent: 100 } };
     const { [symbol]: _, ...rest } = current;
     return rest;
   });
@@ -369,32 +405,35 @@ function FundingPanel({ coins, allocationCoins, network = 'mainnet', testnet, so
         </div>
       </div>
       <div className="col">
-        <h5>② Share of each source</h5>
+        <h5>② Amount from each source</h5>
         <div className="amount-block">
-          {!selected.length && <div className="data-note">Select one or more holdings. Each starts at 100% (MAX) and can be adjusted.</div>}
-          {selected.map((r, index) => {
-            const part = parts[index];
-            const value = network === 'testnet' ? null : closeValues[index];
+          {!entries.length && <div className="data-note">Select one or more holdings. Each starts at MAX and can be adjusted.</div>}
+          {entries.map(({ row: r, part, error }) => {
+            const source = sources[r.symbol], rate = rateOf(r), priced = rate?.out > BigInt(0);
+            const amountAt = (value) => { const units = unitsOf(value, 7); return units == null ? null : fromUnits(units * rate.in / rate.out, r.decimals); };
             return <div key={r.symbol} className="amount-block" data-source={r.symbol}>
-              <div className="amount-input-wrap">
-                <span className="pre">{r.symbol}</span>
-                <input type="text" inputMode="decimal" aria-label={`Percent of ${r.symbol}`} value={sources[r.symbol]} onChange={e => setPercent(r.symbol, e.target.value.replace(/[^0-9.]/g, ''))} />
-                <span className="unit">%</span>
-              </div>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <div className="quick-amounts">
-                  {['25', '50', '75', '100'].map(p => (
-                    <button key={p} className="qa" onClick={() => setPercent(r.symbol, p)}>{p === '100' ? 'MAX' : `${p}%`}</button>
-                  ))}
+              <div className="amount-pair">
+                <div className="amount-input-wrap">
+                  <span className="pre">{r.symbol}</span>
+                  <input type="text" inputMode="decimal" aria-label={`Amount of ${r.symbol}`} value={source.percent != null ? fromUnits(part.quantity, r.decimals) : source.amount ?? ''} onChange={e => setSource(r.symbol, { amount: digits(e) })} />
                 </div>
-                <div className="mono" style={{ fontSize: 12, color: part && part.quantity > BigInt(0) ? 'var(--ink-2)' : 'var(--bad)' }}>
-                  {!part ? 'Enter a percentage from 1 to 100, with at most two decimals.'
-                    : part.quantity <= BigInt(0) ? `Nothing to allocate: no ${r.symbol} is selectable at this percentage.`
-                    : `${fromUnits(part.quantity, r.decimals)} ${r.symbol === 'ETESIA-TF' ? 'shares' : r.symbol}${network === 'testnet' ? '' : ` ≈ ${fmtUsd(value)} · daily close`}`}
-                </div>
+                {r.symbol !== 'USDC' && <div className="amount-input-wrap">
+                  <span className="pre">USDC</span>
+                  <input type="text" inputMode="decimal" aria-label={`USDC value of ${r.symbol}`} disabled={!priced} placeholder={rate === undefined || rate?.pending ? 'quoting…' : '—'}
+                    value={!priced ? '' : source.value != null && amountAt(source.value) === source.amount ? source.value : part.quantity == null ? '' : usdcValue(part.quantity * rate.out / rate.in)}
+                    onChange={e => { const value = digits(e); setSource(r.symbol, { amount: amountAt(value), value }); }} />
+                </div>}
               </div>
+              <div className="quick-amounts">
+                {[25, 50, 75, 100].map(p => (
+                  <button key={p} className={`qa${source.percent === p ? ' active' : ''}`} aria-pressed={source.percent === p} onClick={() => setSource(r.symbol, { percent: p })}>{p === 100 ? 'MAX' : `${p}%`}</button>
+                ))}
+              </div>
+              {error && <div className="data-note" role="alert" style={{ color: 'var(--bad)' }}>{error}</div>}
+              {rate?.error && <div className="data-note" role="alert" style={{ color: 'var(--warn)' }}>{rate.error}</div>}
             </div>;
           })}
+          <div className="data-note">{network === 'testnet' ? "USDC value at testnet Soroswap spot rates (one-unit quotes) and the vault's share value, valued again when built." : 'USDC value at the daily close.'}</div>
         </div>
       </div>
 
@@ -483,7 +522,7 @@ function AllocStage({ allocation, coins, onReset, network, onExecuted }) {
 
 export default function PortfolioBuilder() {
   const [basket, setBasket] = useState([]);
-  // Selected sources: holding symbol -> percent of it (text, as typed).
+  // Selected sources: holding symbol -> a preset percent or a typed amount (sourceParts).
   const [sources, setSources] = useState({});
   // Testnet: the connected owner's account and vault position, or the error reading them.
   const [testnet, setTestnet] = useState(null);
@@ -494,7 +533,7 @@ export default function PortfolioBuilder() {
   const [loading, setLoading] = useState(true);
   const [refresh, setRefresh] = useState(0);
   const [correlations, setCorrelations] = useState({ key: '', values: {} });
-  const [budget, setBudget] = useState('25');
+  const [budgetChoice, setBudget] = useState(null);
   const [building, setBuilding] = useState(false);
   const [buildError, setBuildError] = useState(null);
   const [cashReserves, setCashReserves] = useState(['ustry']);
@@ -502,9 +541,11 @@ export default function PortfolioBuilder() {
   const [basketAnalytics, setBasketAnalytics] = useState({ key: '', value: null });
   // Mainnet | Testnet mode, kept in the URL (?network=testnet) so links share it.
   const [network, setNetwork] = useState(() => builderNetwork(window.location.search));
+  const budget = budgetChoice ?? defaultBudget(network);
   // Products and reserves without a testnet market leave the selection in testnet mode.
   const selectNetwork = (next) => {
     setNetwork(next);
+    setBudget(null);
     setBasket(current => current.filter(tk => { const coin = coins.find(c => c.tk === tk); return !coin || selectableOn(next, coin.id); }));
     setCashReserves(current => current.filter(id => selectableOn(next, id)));
     window.history.replaceState(null, '', builderHref(next));
@@ -677,8 +718,8 @@ export default function PortfolioBuilder() {
       return;
     }
     const onTestnet = network === 'testnet', account = testnet?.owner === address ? testnet : null;
-    const parts = holdingRows(network, coins, balByTk, account).filter(r => r.symbol in sources && validPercent(sources[r.symbol]))
-      .map(r => sourcePart(r, sources[r.symbol])).filter(p => p.quantity > BigInt(0));
+    const entries = sourceParts(holdingRows(network, coins, balByTk, account), sources), parts = entries.map(e => e.part);
+    if (entries.some(e => e.error)) return;
     const closeValues = onTestnet ? [] : parts.map(p => fundingValue(bySymbol, p.symbol, Number(fromUnits(p.quantity, 7))));
     if (!reserveValid || !parts.length || closeValues.some(v => !v || !Number.isFinite(v)) || (onTestnet && !account?.position && needsPosition(sources, allocationCoins)) || !allocationCoins.length || !balLoaded || balError) return;
     buildRequest.current?.abort();

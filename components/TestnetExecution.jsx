@@ -74,7 +74,7 @@ const percentText = (bps) => `${(bps / 100).toFixed(2)}%`;
 // and what to lower; null when none is. impacts: { [leg key]: { impactBps } }.
 export function impactProblem(legs, impacts) {
   const steep = legs.filter((leg) => impacts[leg.key]?.impactBps > IMPACT_LIMIT_BPS);
-  return steep.length ? steep.map((leg) => `${legLabel(leg)}: price impact ${percentText(impacts[leg.key].impactBps)} is above the ${IMPACT_LIMIT_BPS / 100}% limit of the shallow testnet pool. ${leg.kind === "sell" ? `Lower the ${leg.symbol} source's percentage and rebuild.` : "Lower the sources' percentages and rebuild."}`).join(" ") : null;
+  return steep.length ? steep.map((leg) => `${legLabel(leg)}: price impact ${percentText(impacts[leg.key].impactBps)} is above the ${IMPACT_LIMIT_BPS / 100}% limit of the shallow testnet pool. ${leg.kind === "sell" ? `Lower the ${leg.symbol} source's amount and rebuild.` : "Lower the sources' amounts and rebuild."}`).join(" ") : null;
 }
 
 // Expected and minimum output of each leg before signing: Soroswap API quotes
@@ -115,13 +115,13 @@ const VAULT_LEGS = new Set(["vault", "withdraw", "redeem"]);
 // The selected sources valued at testnet execution prices (USDC units): USDC
 // 1:1, XLM and tRESERVE at their reference rate to USDC (a Soroswap API quote
 // of one whole unit, kept as ref), vault shares at their value from
-// readPosition times the percent, with the redeem preview's 0.5% bound as
-// their minimum and the owner's max withdraw. A failed quote throws, which
-// blocks the build. Few quotes (at most two), within the API's burst; the
-// client waits out a 429.
+// readPosition in proportion to the shares selected, with the redeem
+// preview's 0.5% bound as their minimum and the owner's max withdraw. A failed
+// quote throws, which blocks the build. Few quotes (at most two), within the
+// API's burst; the client waits out a 429.
 export async function valueSources(client, sources, position) {
   const net = client.net;
-  return Object.fromEntries(await Promise.all(sources.map(async ({ symbol, percent, quantity }) => {
+  return Object.fromEntries(await Promise.all(sources.map(async ({ symbol, quantity }) => {
     if (symbol === "USDC") return [symbol, { quantity, value: quantity, minOut: quantity }];
     if (net.assets[symbol]) {
       // Not a quote of the whole quantity: on a shallow testnet pool its price
@@ -132,7 +132,7 @@ export async function valueSources(client, sources, position) {
       return [symbol, { quantity, value: quantity * amountOut / amountIn, minOut: minBound(quantity * minOut / amountIn), ref: { amountIn, amountOut } }];
     }
     const redeem = await client.preview("redeem", fromUnits(quantity, SHARE_DECIMALS));
-    return [symbol, { quantity, value: position.value * BigInt(Math.round(percent * 100)) / BigInt(10000), minOut: minBound(redeem), maxWithdraw: position.maxWithdraw }];
+    return [symbol, { quantity, value: position.value * quantity / position.shares, minOut: minBound(redeem), maxWithdraw: position.maxWithdraw }];
   })));
 }
 

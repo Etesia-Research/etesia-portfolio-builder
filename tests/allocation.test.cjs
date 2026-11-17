@@ -495,6 +495,13 @@ test("testnet sources are valued at testnet prices, and a sell counts on 0.5% be
   assert.deepEqual(c.quoted, [[10000000n, "XLM", "USDC"]]);
 });
 
+test("vault shares are valued in proportion to the shares selected, not a rounded percent", async () => {
+  // 10 of 81.33 shares worth 81.85 USDC: 10.063937 USDC (12.30% of the value would give 10.067550).
+  const position = { shares: 81330000000000n, value: 818500000n, maxWithdraw: 818500000n };
+  const { "ETESIA-TF": vault } = await panel.valueSources(client(), [{ symbol: "ETESIA-TF", percent: 10 / 81.33 * 100, quantity: 10000000000000n }], position);
+  assert.deepEqual([vault.quantity, vault.value, vault.maxWithdraw], [10000000000000n, 100639370n, 818500000n]);
+});
+
 // ---------- Price impact (shallow testnet pools) ----------
 
 // Constant-product pools with the 0.3% fee, reserves in units: quote(amountIn, from, to).
@@ -524,8 +531,8 @@ test("price impact is 1 − (out/in) / (refOut/refIn) in basis points, rounded u
   const legs = [{ key: "sell:XLM", kind: "sell", symbol: "XLM" }, { key: "swap:tRESERVE", kind: "swap", symbol: "tRESERVE" }];
   assert.equal(panel.impactProblem(legs, { "sell:XLM": { impactBps: 200 }, "swap:tRESERVE": { impactBps: 0 } }), null);
   assert.equal(panel.impactProblem(legs, { "sell:XLM": { impactBps: 1205 }, "swap:tRESERVE": { impactBps: 3300 } }),
-    "Sell · XLM → USDC: price impact 12.05% is above the 2% limit of the shallow testnet pool. Lower the XLM source's percentage and rebuild. "
-    + "Buy · USDC → tRESERVE · USTRY stand-in on testnet: price impact 33.00% is above the 2% limit of the shallow testnet pool. Lower the sources' percentages and rebuild.");
+    "Sell · XLM → USDC: price impact 12.05% is above the 2% limit of the shallow testnet pool. Lower the XLM source's amount and rebuild. "
+    + "Buy · USDC → tRESERVE · USTRY stand-in on testnet: price impact 33.00% is above the 2% limit of the shallow testnet pool. Lower the sources' amounts and rebuild.");
 });
 
 test("XLM is valued at the one-XLM reference rate, so the XLM kept is no longer undervalued by the impact of selling all of it", async () => {
@@ -580,7 +587,7 @@ test("a swap above 2% price impact blocks the run with a message naming it, and 
   const { plan } = await panel.prepareRun(c, allocation, TESTNET, null);
   const sell = plan.quotes["sell:XLM"].impactBps, buy = plan.quotes["swap:tRESERVE"].impactBps;
   assert.ok(sell > 1000 && buy > 200, `${sell} ${buy}`);
-  assert.match(plan.impact, new RegExp(`^Sell · XLM → USDC: price impact ${(sell / 100).toFixed(2)}% is above the 2% limit of the shallow testnet pool\\. Lower the XLM source's percentage and rebuild\\. Buy · USDC → tRESERVE · USTRY stand-in on testnet: price impact ${(buy / 100).toFixed(2)}% is above the 2% limit of the shallow testnet pool\\. Lower the sources' percentages and rebuild\\.$`));
+  assert.match(plan.impact, new RegExp(`^Sell · XLM → USDC: price impact ${(sell / 100).toFixed(2)}% is above the 2% limit of the shallow testnet pool\\. Lower the XLM source's amount and rebuild\\. Buy · USDC → tRESERVE · USTRY stand-in on testnet: price impact ${(buy / 100).toFixed(2)}% is above the 2% limit of the shallow testnet pool\\. Lower the sources' amounts and rebuild\\.$`));
   const html = render({ plan, states: {} });
   assert.ok(runButton(html)[1], "run disabled above the limit");
   assert.ok(html.includes(`role="alert" class="data-note" style="color:var(--bad)">Sell · XLM → USDC: price impact ${(sell / 100).toFixed(2)}% is above the 2% limit`));
@@ -603,7 +610,7 @@ test("the run-start re-check stops before signing when a swap's fresh quote is n
   c.quoted.length = 0;
   const states = {};
   await assert.rejects(panel.runLegs({ client: c, owner: OWNER, generatedAt: ALLOCATION.generated_at, legs: plan.legs, states, store: null, update: (key, state) => { states[key] = state; } }),
-    /^Error: Sell · XLM → USDC: price impact \d+\.\d\d% is above the 2% limit of the shallow testnet pool\. Lower the XLM source's percentage and rebuild\.$/);
+    /^Error: Sell · XLM → USDC: price impact \d+\.\d\d% is above the 2% limit of the shallow testnet pool\. Lower the XLM source's amount and rebuild\.$/);
   assert.ok(c.quoted.some(([amountIn, from]) => amountIn === XLM && from === "XLM"), "a fresh XLM reference quote");
   assert.deepEqual([signedCalls(c), states], [[], {}]);
 });

@@ -101,7 +101,7 @@ function harness(initialState = [], registry = vaults, testnet = {}) {
   const render = () => { effects.length = 0; state.length = 0; return mod.exports.default(); };
   const poll = () => { render(); return effects.at(-1)(); };
   const panel = (overrides = {}) => mod.exports.FundingPanel({
-    coins: [{ tk: "USDC", name: "USD Coin" }], allocationCoins: [{ tk: "XLM" }], reserveValid: true, budget: "20", sources: { USDC: "100" }, setSources() {}, ...overrides,
+    coins: [{ tk: "USDC", name: "USD Coin" }], allocationCoins: [{ tk: "XLM" }], reserveValid: true, budget: "20", sources: { USDC: { percent: 100 } }, setSources() {}, ...overrides,
   });
   return { ...mod.exports, wallet, balances, requests, quantRequests, prices, buildRef, effects, intervals, state, render, poll, panel };
 }
@@ -116,7 +116,7 @@ const buildButton = (tree) => nodes(tree).find((node) => node.type === "button" 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 test("account switch hides old holdings before the effect and clears allocation state", async () => {
-  const h = harness([["XLM", "USDC"], { USDC: "100" }, null, "allocated", null, []]);
+  const h = harness([["XLM", "USDC"], { USDC: { percent: 100 } }, null, "allocated", null, []]);
   h.wallet.address = "B";
   assert.equal(buildButton(h.panel()).props.disabled, true);
   assert.ok(!text(h.panel()).includes("1.2357"));
@@ -158,42 +158,118 @@ test("disconnect clears balances and returns to the connection screen", () => {
   assert.equal(h.requests.length, 0);
 });
 
-test("multi-source holdings: selecting a holding sets it to 100% (MAX); each source's percent adjusts, rounds down, and an invalid one blocks the build", () => {
+// A mainnet funding panel over USDC and XLM (daily close 0.3 USDC), with its sources kept between renders.
+function mainnetSources() {
   const h = harness();
   h.balances.byTk = { USDC: 1.2356789, XLM: 10 };
-  h.prices.bySymbol.XLM = { price: .2, ts: "2026-09-19T00:00:00Z", stale: false };
+  h.prices.bySymbol.XLM = { price: .3, ts: "2026-09-19T00:00:00Z", stale: false };
   const coins = [{ tk: "USDC", name: "USD Coin" }, { tk: "XLM", name: "Stellar Lumens" }];
-  let sources = {};
-  const setSources = (next) => { sources = typeof next === "function" ? next(sources) : next; };
-  const tree = () => h.panel({ coins, sources, setSources });
-  const rows = (t) => nodes(t).filter((node) => node.props?.className?.startsWith("holding-row"));
-  const quick = (t, symbol) => nodes(nodes(t).find((node) => node.props?.["data-source"] === symbol)).filter((node) => node.type === "button");
-  assert.match(text(tree()), /Your holdings — select the sources to allocate or rebalance/);
-  assert.deepEqual(rows(tree()).map((row) => row.props["aria-checked"]), [false, false]);
-  assert.equal(buildButton(tree()).props.disabled, true);
-  rows(tree())[0].props.onClick();
-  rows(tree())[1].props.onClick();
-  assert.deepEqual(sources, { USDC: "100", XLM: "100" });
-  assert.match(text(tree()), /1\.2356789 USDC ≈ \$1\.24 · daily close/);
-  assert.match(text(tree()), /10 XLM ≈ \$2\.00 · daily close/);
-  assert.match(text(tree()), /Hypothetical capital: 3\.24 USDC/);
-  assert.equal(buildButton(tree()).props.disabled, false);
-  quick(tree(), "USDC")[0].props.onClick();
-  assert.equal(sources.USDC, "25");
-  assert.match(text(tree()), /0\.3089197 USDC/); // 25% of 1.2356789, rounded down to the stroop
-  quick(tree(), "USDC")[3].props.onClick();
-  assert.equal(sources.USDC, "100");
-  const input = nodes(tree()).find((node) => node.type === "input" && node.props["aria-label"] === "Percent of XLM");
-  for (const bad of ["0", "0.5", "100.5", "12.345", "", "."]) {
-    input.props.onChange({ target: { value: bad } });
-    assert.match(text(tree()), /Enter a percentage from 1 to 100, with at most two decimals\./, bad);
-    assert.equal(buildButton(tree()).props.disabled, true, bad);
+  const page = { h, sources: {} };
+  page.setSources = (next) => { page.sources = typeof next === "function" ? next(page.sources) : next; };
+  page.tree = () => h.panel({ coins, sources: page.sources, setSources: page.setSources });
+  page.rows = (t) => nodes(t).filter((node) => node.props?.className?.startsWith("holding-row"));
+  page.block = (t, symbol) => nodes(t).find((node) => node.props?.["data-source"] === symbol);
+  page.quick = (t, symbol) => nodes(page.block(t, symbol)).filter((node) => node.type === "button");
+  page.input = (t, label) => nodes(t).find((node) => node.type === "input" && node.props["aria-label"] === label);
+  page.values = (symbol) => nodes(page.block(page.tree(), symbol)).filter((node) => node.type === "input").map((node) => node.props.value);
+  return page;
+}
+
+test("multi-source holdings: a selected holding starts at MAX and shows its amount and its USDC value, with no percent; USDC has a single input", () => {
+  const p = mainnetSources();
+  assert.match(text(p.tree()), /Your holdings — select the sources to allocate or rebalance/);
+  assert.match(text(p.tree()), /② Amount from each source/);
+  assert.deepEqual(p.rows(p.tree()).map((row) => row.props["aria-checked"]), [false, false]);
+  assert.equal(buildButton(p.tree()).props.disabled, true);
+  p.rows(p.tree())[0].props.onClick();
+  p.rows(p.tree())[1].props.onClick();
+  assert.deepEqual(p.sources, { USDC: { percent: 100 }, XLM: { percent: 100 } });
+  // USDC is its own value: one input. XLM: 10 XLM and 3 USDC at the daily close.
+  assert.deepEqual(p.values("USDC"), ["1.2356789"]);
+  assert.deepEqual(p.values("XLM"), ["10", "3.00"]);
+  assert.deepEqual(nodes(p.block(p.tree(), "XLM")).filter((node) => node.props?.className === "pre").map(text), ["XLM", "USDC"]);
+  for (const symbol of ["USDC", "XLM"]) assert.ok(!/%|≈|daily close/.test(text(p.block(p.tree(), symbol)).replace("25%50%75%MAX", "")), symbol);
+  assert.match(text(p.tree()), /USDC value at the daily close\./);
+  assert.match(text(p.tree()), /Hypothetical capital: 4\.24 USDC/);
+  assert.equal(buildButton(p.tree()).props.disabled, false);
+  p.rows(p.tree())[1].props.onClick();
+  assert.deepEqual(p.sources, { USDC: { percent: 100 } });
+});
+
+test("the 25% / 50% / 75% / MAX presets set a share of the maximum, rounded down, and show which is active", () => {
+  const p = mainnetSources();
+  p.rows(p.tree())[0].props.onClick();
+  const pressed = () => p.quick(p.tree(), "USDC").map((button) => [text(button), button.props["aria-pressed"], button.props.className.includes("active")]);
+  assert.deepEqual(pressed(), [["25%", false, false], ["50%", false, false], ["75%", false, false], ["MAX", true, true]]);
+  p.quick(p.tree(), "USDC")[0].props.onClick();
+  assert.deepEqual(p.sources.USDC, { percent: 25 });
+  assert.deepEqual(p.values("USDC"), ["0.3089197"]); // 25% of 1.2356789, rounded down to the stroop
+  assert.deepEqual(pressed().map(([, on]) => on), [true, false, false, false]);
+  // A typed amount is no preset.
+  p.input(p.tree(), "Amount of USDC").props.onChange({ target: { value: "1" } });
+  assert.deepEqual(pressed().map(([, on]) => on), [false, false, false, false]);
+  p.quick(p.tree(), "USDC")[3].props.onClick();
+  assert.deepEqual(p.sources.USDC, { percent: 100 });
+});
+
+test("typing units sets a fixed amount and its value follows; typing a value converts to units rounded down and keeps the typed text while its rate holds", () => {
+  const p = mainnetSources();
+  p.rows(p.tree())[1].props.onClick();
+  // The typed text stays as typed, so a decimal point or a trailing zero can be entered.
+  for (const typed of ["2.", "2.50", "02"]) {
+    p.input(p.tree(), "Amount of XLM").props.onChange({ target: { value: typed } });
+    assert.equal(p.values("XLM")[0], typed);
   }
-  input.props.onChange({ target: { value: "12.5" } });
-  assert.match(text(tree()), /1\.25 XLM/);
-  assert.equal(buildButton(tree()).props.disabled, false);
-  rows(tree())[1].props.onClick();
-  assert.deepEqual(sources, { USDC: "100" });
+  p.input(p.tree(), "Amount of XLM").props.onChange({ target: { value: "2.5" } });
+  assert.deepEqual(p.sources.XLM, { amount: "2.5" });
+  assert.deepEqual(p.values("XLM"), ["2.5", "0.75"]);
+  // A typed amount does not follow the balance.
+  p.h.balances.byTk = { ...p.h.balances.byTk, XLM: 20 };
+  assert.deepEqual(p.values("XLM"), ["2.5", "0.75"]);
+  // 1 USDC at 0.3 is 3.33333333… XLM: 3.3333333, rounded down. The field shows "1" while typed.
+  const value = p.input(p.tree(), "USDC value of XLM");
+  value.props.onChange({ target: { value: "1" } });
+  assert.deepEqual(p.sources.XLM, { amount: "3.3333333", value: "1" });
+  assert.deepEqual(p.values("XLM"), ["3.3333333", "1"]);
+  // 2 USDC at 0.3 is 6.66666666… XLM: rounded down, not half-up (6.6666667).
+  p.input(p.tree(), "USDC value of XLM").props.onChange({ target: { value: "2" } });
+  assert.deepEqual(p.sources.XLM, { amount: "6.6666666", value: "2" });
+  // When the close changes, the value shown is that of the amount, to two decimals rounded down, which typed back stays within it.
+  p.input(p.tree(), "USDC value of XLM").props.onChange({ target: { value: "1" } });
+  p.h.prices.bySymbol.XLM = { price: .6, ts: "2026-09-20T00:00:00Z", stale: false };
+  assert.deepEqual(p.values("XLM"), ["3.3333333", "1.99"]);
+  p.input(p.tree(), "USDC value of XLM").props.onChange({ target: { value: "1.99" } });
+  assert.equal(p.sources.XLM.amount, "3.3166666");
+  assert.equal(buildButton(p.tree()).props.disabled, false);
+  // An invalid value stays as typed beside the error.
+  p.input(p.tree(), "USDC value of XLM").props.onChange({ target: { value: "1.12345678" } });
+  assert.deepEqual(p.values("XLM"), ["", "1.12345678"]);
+  assert.equal(buildButton(p.tree()).props.disabled, true);
+  // Mainnet without a usable daily close: the value field is disabled and empty, units still work, the build stays blocked.
+  p.h.prices.bySymbol.XLM = { price: null };
+  const blocked = p.input(p.tree(), "USDC value of XLM");
+  assert.deepEqual([blocked.props.disabled, blocked.props.value, blocked.props.placeholder], [true, "", "—"]);
+  p.input(p.tree(), "Amount of XLM").props.onChange({ target: { value: "4" } });
+  assert.deepEqual(p.values("XLM"), ["4", ""]);
+  assert.match(text(p.tree()), /A fresh source close and matching USDC\/USD close are required\./);
+  assert.equal(buildButton(p.tree()).props.disabled, true);
+});
+
+test("a malformed, zero or above-maximum amount shows an error under its source and blocks the build", () => {
+  const p = mainnetSources();
+  p.rows(p.tree())[1].props.onClick();
+  const error = () => text(nodes(p.block(p.tree(), "XLM")).find((node) => node.props?.role === "alert"));
+  for (const [field, bad, message] of [["Amount of XLM", "0", "Enter an amount above 0, with at most 7 decimals."], ["Amount of XLM", "", "Enter an amount above 0, with at most 7 decimals."],
+    ["Amount of XLM", ".", "Enter an amount above 0, with at most 7 decimals."], ["Amount of XLM", "1.2.3", "Enter an amount above 0, with at most 7 decimals."],
+    ["Amount of XLM", "1.12345678", "Enter an amount above 0, with at most 7 decimals."], ["Amount of XLM", "10.0000001", "Above the selectable maximum of 10 XLM."],
+    ["USDC value of XLM", "0.12345678", "Enter an amount above 0, with at most 7 decimals."], ["USDC value of XLM", "3.0000001", "Above the selectable maximum of 10 XLM."]]) {
+    p.input(p.tree(), field).props.onChange({ target: { value: bad } });
+    assert.equal(error(), message, `${field} ${bad}`);
+    assert.equal(buildButton(p.tree()).props.disabled, true, `${field} ${bad}`);
+  }
+  p.input(p.tree(), "Amount of XLM").props.onChange({ target: { value: "10" } });
+  assert.equal(error(), "");
+  assert.equal(buildButton(p.tree()).props.disabled, false);
 });
 
 // The connected owner's testnet account and vault position, as the Builder reads them.
@@ -206,36 +282,119 @@ const testnetPage = (sources = {}, testnet = {}, account = TESTNET_ACCOUNT) => {
   state[0] = ["XLM"]; state[1] = sources; state[2] = account; state[3] = "select"; state[5] = TESTNET_COINS; state[16] = "testnet";
   const h = harness(state, vaults, testnet);
   h.balances.byTk = { XLM: 100, USDC: 50, tRESERVE: 3 };
-  const props = nodes(h.render()).find((node) => node.type === h.FundingPanel).props;
-  return { h, props, tree: h.FundingPanel(props) };
+  // Each render reads the page's state from init (the panel's quotes are init[17]).
+  const page = () => { const props = nodes(h.render()).find((node) => node.type === h.FundingPanel).props; return { props, tree: h.FundingPanel(props) }; };
+  return { h, init: state, page, ...page() };
 };
+const valueInput = (tree, symbol) => nodes(tree).find((node) => node.type === "input" && node.props["aria-label"] === `USDC value of ${symbol}`);
+const amountInput = (tree, symbol) => nodes(tree).find((node) => node.type === "input" && node.props["aria-label"] === `Amount of ${symbol}`);
 
 test("testnet holdings: XLM less the most a run keeps back, USDC, tRESERVE as the USTRY stand-in and the vault's shares with their USDC value", () => {
-  const { tree } = testnetPage({ XLM: "100", "ETESIA-TF": "50" });
+  const { tree } = testnetPage({ XLM: { percent: 100 }, "ETESIA-TF": { percent: 50 } });
   const rows = nodes(tree).filter((node) => node.props?.className?.startsWith("holding-row")).map(text);
   assert.equal(rows.length, 4);
   assert.match(rows[0], /^XLMStellar Lumens · MAX keeps 6\.0000000 XLM back for fees and the account reserve100/);
   assert.match(rows[1], /^USDCUSD Coin50/);
   assert.match(rows[2], /^tRESERVEUSTRY stand-in on testnet3/);
   assert.match(rows[3], /^ETESIA-TFVault shares · 81\.85 USDC81\.33\$81\.85$/);
-  // 100% of XLM is the balance less the keep-back; 50% of the shares.
-  assert.match(text(tree), /94 XLM/);
-  assert.match(text(tree), /40\.665 shares/);
+  // MAX of XLM is the balance less the keep-back; 50% of the shares, valued at the vault's share value.
+  assert.equal(amountInput(tree, "XLM").props.value, "94");
+  assert.deepEqual([amountInput(tree, "ETESIA-TF").props.value, valueInput(tree, "ETESIA-TF").props.value], ["40.665", "40.92"]);
+  // The XLM rate waits for its testnet quote.
+  assert.deepEqual([valueInput(tree, "XLM").props.disabled, valueInput(tree, "XLM").props.placeholder], [true, "quoting…"]);
+  assert.match(text(tree), /USDC value at testnet Soroswap spot rates \(one-unit quotes\) and the vault's share value, valued again when built\./);
   assert.match(text(tree), /Valued at testnet Soroswap spot rates \(one-unit quotes\) and the vault's share value when built/);
   assert.ok(!/Hypothetical capital|daily close/.test(text(tree)));
   assert.equal(buildButton(tree).props.disabled, false);
   // Before the testnet account is read, the XLM maximum is 0 and the vault row is absent.
-  const { tree: tree2 } = testnetPage({ XLM: "100" }, {}, null);
+  const { tree: tree2 } = testnetPage({ XLM: { percent: 100 } }, {}, null);
   assert.ok(!text(tree2).includes("ETESIA-TF"));
   assert.match(text(tree2), /reading the testnet account…/);
-  assert.match(text(tree2), /Nothing to allocate: no XLM is selectable at this percentage\./);
+  assert.match(text(tree2), /Nothing to allocate: no XLM is selectable\./);
   assert.equal(buildButton(tree2).props.disabled, true);
+});
+
+test("testnet: an XLM source's USDC value uses a one-unit Soroswap testnet quote, fetched once when selected; a late result is ignored and a failure leaves the amount and the build usable", async () => {
+  const replies = [];
+  const client = { quoteSwap: (amountIn, path) => new Promise((resolve, reject) => replies.push({ amountIn, path, resolve, reject })), vaultError: (err) => err.message };
+  const { h, init, page } = testnetPage({ XLM: { percent: 100 } }, { vaultClient: () => client });
+  h.effects.at(-1)();
+  assert.deepEqual(replies.map((r) => [r.amountIn, r.path]), [[10000000n, [network.TESTNET.assets.XLM.address, network.TESTNET.usdc.contract]]]);
+  replies[0].resolve({ amountOut: 1500000n, minOut: 1492500n });
+  await flush();
+  assert.deepEqual(h.state[17], { XLM: { out: 1500000n, in: 10000000n } });
+  // 94 XLM at 0.15 USDC is 14.1 USDC; typing 1.5 USDC selects 10 XLM.
+  init[17] = h.state[17];
+  const { tree } = page();
+  assert.deepEqual([valueInput(tree, "XLM").props.disabled, valueInput(tree, "XLM").props.value], [false, "14.10"]);
+  valueInput(tree, "XLM").props.onChange({ target: { value: "1.5" } });
+  assert.deepEqual(h.state[1].XLM, { amount: "10", value: "1.5" });
+  // Quoted once: running the effect again with the quote held asks for nothing.
+  page();
+  h.effects.at(-1)();
+  assert.equal(replies.length, 1);
+  // A result arriving after deselection (an owner change clears the sources) is ignored.
+  const late = testnetPage({ XLM: { percent: 100 } }, { vaultClient: () => client });
+  late.h.effects.at(-1)();
+  late.init[1] = {}; late.init[17] = late.h.state[17];
+  late.page(); late.h.effects.at(-1)();
+  replies[1].resolve({ amountOut: 1500000n, minOut: 1492500n });
+  await flush();
+  assert.deepEqual(late.h.state[17], {});
+  // Selecting tRESERVE while the XLM quote is pending asks only for tRESERVE, and the XLM result still lands.
+  const both = testnetPage({ XLM: { percent: 100 } }, { vaultClient: () => client });
+  both.h.effects.at(-1)();
+  both.init[1] = { XLM: { percent: 100 }, tRESERVE: { percent: 100 } }; both.init[17] = both.h.state[17];
+  both.page(); both.h.effects.at(-1)();
+  assert.deepEqual(replies.slice(2).map((r) => r.path[0]), [network.TESTNET.assets.XLM.address, network.TESTNET.assets.tRESERVE.address]);
+  replies[2].resolve({ amountOut: 1500000n, minOut: 1492500n });
+  await flush();
+  assert.deepEqual(both.h.state[17].XLM, { out: 1500000n, in: 10000000n });
+  // A failed quote: the value field is disabled with the reason; the amount and the build still work.
+  const failed = testnetPage({ XLM: { percent: 100 } }, { vaultClient: () => client });
+  failed.h.effects.at(-1)();
+  replies[4].reject(new Error("No Soroswap testnet quote for XLM → USDC: Soroswap API 503"));
+  await flush();
+  failed.init[17] = failed.h.state[17];
+  const after = failed.page().tree;
+  assert.deepEqual([valueInput(after, "XLM").props.disabled, valueInput(after, "XLM").props.value], [true, ""]);
+  assert.match(text(after), /No Soroswap testnet quote for XLM → USDC: Soroswap API 503/);
+  assert.equal(buildButton(after).props.disabled, false);
+  amountInput(after, "XLM").props.onChange({ target: { value: "5" } });
+  assert.deepEqual(failed.h.state[1].XLM, { amount: "5" });
+  // Deselected and selected again, it is quoted again.
+  failed.init[1] = {}; failed.init[17] = failed.h.state[17];
+  failed.page(); failed.h.effects.at(-1)();
+  failed.init[1] = { XLM: { percent: 100 } }; failed.init[17] = failed.h.state[17];
+  failed.page(); failed.h.effects.at(-1)();
+  assert.equal(replies.length, 6);
+});
+
+test("a typed amount builds as { symbol, percent, quantity }: percent 100 exactly at the maximum (a full vault exit), its share below it; above the maximum nothing is built", async () => {
+  const build = async (amount, account = TESTNET_ACCOUNT) => {
+    const valued = [];
+    const { h, props } = testnetPage({ "ETESIA-TF": { amount } }, { vaultClient: () => "client", valueSources: async (...args) => { valued.push(args); return { "ETESIA-TF": { quantity: 1n, value: 10000000n, minOut: 1n, maxWithdraw: 1n } }; } }, account);
+    const pending = props.onBuild();
+    await flush();
+    h.quantRequests[0]?.resolve({ status: "valid", positions: { xlm: {} } });
+    await pending;
+    return { sources: valued[0]?.[1], requests: h.quantRequests.length, disabled: buildButton(h.FundingPanel(props)).props.disabled };
+  };
+  assert.deepEqual(await build("81.33"), { sources: [{ symbol: "ETESIA-TF", percent: 100, quantity: 81330000000000n }], requests: 1, disabled: false });
+  const part = (await build("40")).sources[0];
+  assert.deepEqual([part.quantity, part.percent], [40000000000000n, 49.1823435386]);
+  // One unit below a 10,000-share maximum stays below 100, where a float share would round it to 100 (a full exit).
+  const large = { ...TESTNET_ACCOUNT, position: { ...TESTNET_ACCOUNT.position, shares: 10000000000000000n } };
+  assert.equal(Number(9999999999999999n) / Number(10000000000000000n) * 100, 100);
+  assert.deepEqual((await build("9999.999999999999", large)).sources, [{ symbol: "ETESIA-TF", percent: 99.9999999999, quantity: 9999999999999999n }]);
+  assert.deepEqual(await build("81.330000000001"), { sources: undefined, requests: 0, disabled: true });
+  assert.deepEqual(await build("1.0000000000001"), { sources: undefined, requests: 0, disabled: true }); // 13 decimals: shares have 12
 });
 
 test("a testnet build values the selected sources at testnet execution prices, sends their sum as the capital and stores sources and valuation; a failed quote blocks it", async () => {
   const valued = [];
   const valuation = { XLM: { quantity: 940000000n, value: 150000000n, minOut: 149250000n }, "ETESIA-TF": { quantity: 40665000000000n, value: 409250000n, minOut: 407000000n, maxWithdraw: 818500000n } };
-  const { h, props } = testnetPage({ XLM: "100", "ETESIA-TF": "50" }, { vaultClient: () => "client", valueSources: async (...args) => { valued.push(args); return valuation; } });
+  const { h, props } = testnetPage({ XLM: { percent: 100 }, "ETESIA-TF": { percent: 50 } }, { vaultClient: () => "client", valueSources: async (...args) => { valued.push(args); return valuation; } });
   const pending = props.onBuild();
   await flush();
   assert.deepEqual(valued, [["client", [{ symbol: "XLM", percent: 100, quantity: 940000000n }, { symbol: "ETESIA-TF", percent: 50, quantity: 40665000000000n }], TESTNET_ACCOUNT.position]]);
@@ -243,7 +402,7 @@ test("a testnet build values the selected sources at testnet execution prices, s
   h.quantRequests[0].resolve({ status: "valid", positions: { xlm: {} } });
   await pending;
   assert.deepEqual([h.state[4].sources, h.state[4].valuation, h.state[4].owner, "funding" in h.state[4]], [valued[0][1], valuation, "A", false]);
-  const failed = testnetPage({ XLM: "100" }, { vaultClient: () => "client", valueSources: async () => { throw new Error("No Soroswap testnet quote for XLM → USDC: Soroswap API 503"); } });
+  const failed = testnetPage({ XLM: { percent: 100 } }, { vaultClient: () => "client", valueSources: async () => { throw new Error("No Soroswap testnet quote for XLM → USDC: Soroswap API 503"); } });
   await failed.props.onBuild();
   assert.equal(failed.h.state[12], "No Soroswap testnet quote for XLM → USDC: Soroswap API 503");
   assert.equal(failed.h.quantRequests.length, 0);
@@ -256,7 +415,7 @@ test("a testnet selection worth more than 100 USDC is scaled down: every source'
     { XLM: { quantity: 940000000n, value: 1500000000n, minOut: 1492500000n }, "ETESIA-TF": { quantity: 40665000000000n, value: 2500000000n, minOut: 2487500000n, maxWithdraw: 818500000n } },
     { XLM: { quantity: 235000000n, value: 375000000n, minOut: 373125000n }, "ETESIA-TF": { quantity: 10166250000000n, value: 625000000n, minOut: 621875000n, maxWithdraw: 818500000n } },
   ];
-  const { h, props, tree } = testnetPage({ XLM: "100", "ETESIA-TF": "50" }, { vaultClient: () => "client", valueSources: async (...args) => { valued.push(args); return replies[valued.length - 1]; } });
+  const { h, props, tree } = testnetPage({ XLM: { percent: 100 }, "ETESIA-TF": { percent: 50 } }, { vaultClient: () => "client", valueSources: async (...args) => { valued.push(args); return replies[valued.length - 1]; } });
   assert.match(text(tree), /Testnet builds use at most 100 USDC of the selected value; a larger selection is scaled down proportionally\./);
   const pending = props.onBuild();
   await flush();
@@ -270,7 +429,7 @@ test("a testnet selection worth more than 100 USDC is scaled down: every source'
   assert.ok(stage({ from: 4000000000n, to: 1000000000n }).includes("Capped: 400 USDC selected, scaled to 100 USDC (25.00% of each source)."));
   assert.ok(!stage(null).includes("Capped"));
   // At or below the cap: valued once, nothing scaled or stored.
-  const below = testnetPage({ XLM: "100" }, { vaultClient: () => "client", valueSources: async (...args) => { valued.push(args); return { XLM: { quantity: 940000000n, value: 1000000000n, minOut: 995000000n } }; } });
+  const below = testnetPage({ XLM: { percent: 100 } }, { vaultClient: () => "client", valueSources: async (...args) => { valued.push(args); return { XLM: { quantity: 940000000n, value: 1000000000n, minOut: 995000000n } }; } });
   valued.length = 0;
   const done = below.props.onBuild();
   await flush();
@@ -314,7 +473,7 @@ test("a failed vault read keeps the testnet account and blocks only builds that 
   const read = page.state[2];
   assert.deepEqual([read.owner, read.account, read.position, read.accountError, read.positionError], ["A", TESTNET_ACCOUNT.account, undefined, null, "RPC 503"]);
   // USDC for an XLM basket never needs the vault: Build stays enabled and builds.
-  const usdc = testnetPage({ USDC: "100" }, { vaultClient: () => "client", valueSources: async () => ({ USDC: { quantity: 500000000n, value: 500000000n, minOut: 500000000n } }) }, read);
+  const usdc = testnetPage({ USDC: { percent: 100 } }, { vaultClient: () => "client", valueSources: async () => ({ USDC: { quantity: 500000000n, value: 500000000n, minOut: 500000000n } }) }, read);
   assert.match(text(usdc.tree), /Could not read the vault position \(RPC 503\)\./);
   assert.match(text(usdc.tree), /MAX keeps 6\.0000000 XLM back/);
   assert.equal(buildButton(usdc.tree).props.disabled, false);
@@ -324,11 +483,11 @@ test("a failed vault read keeps the testnet account and blocks only builds that 
   usdc.h.quantRequests[0].resolve({ status: "valid", positions: { xlm: {} } });
   await pending;
   // The vault in the basket, or its shares selected, needs the position.
-  const basket = testnetPage({ USDC: "100" }, {}, read);
+  const basket = testnetPage({ USDC: { percent: 100 } }, {}, read);
   assert.equal(buildButton(basket.h.FundingPanel({ ...basket.props, allocationCoins: [{ tk: "XLM" }, { tk: "ETESIA-TF" }] })).props.disabled, true);
-  assert.equal(buildButton(testnetPage({ USDC: "100", "ETESIA-TF": "100" }, {}, read).tree).props.disabled, true);
+  assert.equal(buildButton(testnetPage({ USDC: { percent: 100 }, "ETESIA-TF": { percent: 100 } }, {}, read).tree).props.disabled, true);
   // A failed account read: the XLM row says so instead of "reading".
-  const { tree } = testnetPage({ XLM: "100" }, {}, { owner: "A", account: undefined, position: TESTNET_ACCOUNT.position, accountError: "Horizon 503", positionError: null });
+  const { tree } = testnetPage({ XLM: { percent: 100 } }, {}, { owner: "A", account: undefined, position: TESTNET_ACCOUNT.position, accountError: "Horizon 503", positionError: null });
   assert.match(text(tree), /Could not read the testnet account \(Horizon 503\)\./);
   assert.match(text(tree), /Stellar Lumens · could not read the testnet account/);
   assert.ok(!/reading the testnet account…/.test(text(tree)));
@@ -402,7 +561,7 @@ test("reserve products are absent from the initial product selection", () => {
 test("allocation requests carry selected products and reserves, and cancelled responses are ignored", async () => {
   const state = [];
   state[0] = ["XLM", "ETESIA-TF"];
-  state[1] = { USDC: "100" };
+  state[1] = { USDC: { percent: 100 } };
   state[2] = null;
   state[3] = "select";
   state[5] = [{ id: "xlm", tk: "XLM", allocationSupported: true }, { id: "usdc", tk: "USDC" },
@@ -421,6 +580,15 @@ test("allocation requests carry selected products and reserves, and cancelled re
   assert.equal(h.state[3], "select");
 });
 
+
+test("the risk cap starts at 25% on mainnet and 15% on testnet until the slider is moved", () => {
+  const budget = (state) => nodes(harness(state).render()).find((node) => node.type === harness().FundingPanel || node.type?.name === "FundingPanel").props.budget;
+  assert.equal(budget([]), "25");
+  const testnet = []; testnet[16] = "testnet";
+  assert.equal(budget(testnet), "15");
+  testnet[10] = "40";
+  assert.equal(budget(testnet), "40");
+});
 
 test("funding risk-cap slider displays its percentage and updates the calculator budget", () => {
   const h = harness();

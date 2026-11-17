@@ -836,6 +836,10 @@
     cursor: pointer; letter-spacing: 0.06em;
   }
   .quick-amounts .qa:hover, .quick-amounts .qa.active { background: var(--rule); color: var(--paper); }
+  .funding-panel .amount-pair { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 8px; }
+  .funding-panel .amount-input-wrap { padding: 10px 12px; gap: 8px; }
+  .funding-panel .amount-input-wrap .pre { font-size: 14px; font-weight: 500; color: var(--ink); letter-spacing: 0.04em; white-space: nowrap; }
+  .funding-panel .amount-input-wrap input { font-size: 26px; min-width: 0; }
   .build-cta {
     margin-top: 28px;
     border-top: 1px solid var(--rule);
@@ -973,6 +977,7 @@ button.coin-card:focus-visible { outline: 2px solid var(--accent); outline-offse
   .masthead .center { grid-row: 1; }
   .masthead .right { text-align: left; }
 }
+@media (max-width: 1200px) { .funding-panel .amount-pair { grid-auto-flow: row; } }
 @media (max-width: 600px) {
   #root { padding: 20px 16px 48px; }
   .connect-stage, .funding-panel { grid-template-columns: minmax(0, 1fr); }
